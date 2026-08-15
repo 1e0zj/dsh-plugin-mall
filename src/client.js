@@ -44,6 +44,10 @@ window.__ModuleLoader__.load({
       ".mkt_ok{color:var(--dsw-alias-state-success-primary,#2f855a)}",
       ".mkt_badge{display:inline-block;border-radius:999px;padding:1px 8px;font-size:11px;border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-tertiary)}",
       ".mkt_link{color:var(--dsw-alias-state-business-primary);font-size:12px;text-decoration:none;cursor:pointer}",
+      ".mkt_installedHead{display:flex;align-items:center;gap:8px;width:100%;background:none;border:0;padding:0;margin:0;cursor:pointer;font:inherit;text-align:left}",
+      ".mkt_installedHead:hover .mkt_panelTitle{color:var(--dsw-alias-state-business-primary)}",
+      ".mkt_depList{display:flex;flex-direction:column;gap:6px;margin-top:8px}",
+      ".mkt_depRow{display:flex;justify-content:space-between;align-items:center;gap:8px}",
     ].join("\n");
     var tagId = "@1e0zj/dsh-plugin-mall/market-tab.css";
     if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId) + "]") === null) {
@@ -78,7 +82,7 @@ window.__ModuleLoader__.load({
     }
 
     // ── job polling ─────────────────────────────────────────────────────────
-    function useJobPolling(call) {
+    function useJobPolling(call, onSettled) {
       var jobsRef = useRef({});
       var _jobs = useState({});
       var jobs = _jobs[0];
@@ -94,20 +98,24 @@ window.__ModuleLoader__.load({
           running.forEach(function (id) {
             call("job", { jobId: id }).then(function (value) {
               var snapshot = value.snapshot || {};
-              setJobs(function (prev) {
-                var old = prev[id] || {};
-                var output = (old.output || "") + (value.output || "");
-                return Object.assign({}, prev, { [id]: Object.assign({}, old, {
-                  status: snapshot.status,
-                  detail: snapshot.detail,
-                  output: output,
-                }) });
-              });
+              var old = jobsRef.current[id] || {};
+              var wasTerminal = old.status === "completed" || old.status === "failed" || old.status === "killed";
+              var nowTerminal = snapshot.status === "completed" || snapshot.status === "failed" || snapshot.status === "killed";
+              if (!wasTerminal && nowTerminal && onSettled) {
+                try { onSettled(id); } catch (e) { /* best effort */ }
+              }
+              var output = (old.output || "") + (value.output || "");
+              jobsRef.current = Object.assign({}, jobsRef.current, { [id]: Object.assign({}, old, {
+                status: snapshot.status,
+                detail: snapshot.detail,
+                output: output,
+              }) });
+              setJobs(Object.assign({}, jobsRef.current));
             }).catch(function () { /* keep polling */ });
           });
         }, 1200);
         return function () { clearInterval(timer); };
-      }, [call]);
+      }, [call, onSettled]);
       var track = useCallback(function (id, spec) {
         jobsRef.current = Object.assign({}, jobsRef.current, { [id]: { status: "running", spec: spec, output: "" } });
         setJobs(Object.assign({}, jobsRef.current));
@@ -191,21 +199,35 @@ window.__ModuleLoader__.load({
       );
     }
 
-    // ── installed panel ─────────────────────────────────────────────────────
+    // ── installed panel (collapsible summary) ───────────────────────────────
     function InstalledPanel(props) {
       var installed = props.installed;
+      var _open = useState(false);
+      var open = _open[0];
+      var setOpen = _open[1];
       if (!installed) return null;
+      var count = installed.error ? 0 : (installed.deps || []).length;
       return h("div", { className: "mkt_card" },
-        h("p", { className: "mkt_panelTitle" }, "已装插件"),
+        h("button", {
+          type: "button",
+          className: "mkt_installedHead",
+          onClick: function () { setOpen(!open); },
+          "aria-expanded": open ? "true" : "false",
+        },
+          h("span", { className: "mkt_panelTitle" }, "已装插件"),
+          h("span", { className: "mkt_badge" }, count + " 个"),
+          h("span", { className: "mkt_meta" }, open ? "收起 ▲" : "展开 ▼")
+        ),
         installed.error
           ? h("div", { className: "mkt_error" }, installed.error)
-          : installed.deps && installed.deps.length === 0
+          : !open ? null
+          : (installed.deps || []).length === 0
             ? h("div", { className: "mkt_meta" }, "还没有装过插件")
-            : (installed.deps || []).map(function (dep) {
-              return h("div", { key: dep.name, style: { display: "flex", justifyContent: "space-between", gap: "8px" } },
+            : h("div", { className: "mkt_depList" }, (installed.deps || []).map(function (dep) {
+              return h("div", { key: dep.name, className: "mkt_depRow" },
                 h("span", { className: "mkt_desc" }, dep.name + "@" + dep.version),
                 h("span", { className: "mkt_badge" }, kindLabel(dep.kind)));
-            })
+            }))
       );
     }
 
@@ -265,9 +287,23 @@ window.__ModuleLoader__.load({
         });
       }, [call]);
 
-      var polling = useJobPolling(call);
+      var refreshInstalled = useCallback(function () {
+        call("installed", {}).then(function (value) {
+          setInstalled(value);
+        }).catch(function (e) {
+          setInstalled({ error: errorText(e) });
+        });
+      }, [call]);
+
+      // 点开即自动搜索（空关键词 = 最热插件），安装任务结束自动刷新已装列表。
+      var polling = useJobPolling(call, refreshInstalled);
       var track = polling.track;
       var jobs = polling.jobs;
+
+      useEffect(function () {
+        doSearch();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, []);
 
       var doInstall = useCallback(function (repo) {
         var spec = "github:" + repo;
@@ -288,14 +324,6 @@ window.__ModuleLoader__.load({
           });
         });
       }, [call, track]);
-
-      var refreshInstalled = useCallback(function () {
-        call("installed", {}).then(function (value) {
-          setInstalled(value);
-        }).catch(function (e) {
-          setInstalled({ error: errorText(e) });
-        });
-      }, [call]);
 
       useEffect(function () {
         refreshInstalled();
@@ -330,7 +358,7 @@ window.__ModuleLoader__.load({
         h("div", { className: "mkt_columns" },
           h("div", { className: "mkt_list" },
             results == null
-              ? h("div", { className: "mkt_meta" }, "输入关键词点搜索，或直接搜索浏览最热插件。")
+              ? h("div", { className: "mkt_meta" }, loading ? "正在加载最热插件…" : "—")
               : results.items.length === 0
                 ? h("div", { className: "mkt_meta" }, "没有匹配的仓库。")
                 : h(React.Fragment, null,
@@ -347,9 +375,9 @@ window.__ModuleLoader__.load({
                 )
           ),
           h("div", { className: "mkt_rail" },
+            h(InstalledPanel, { installed: installed }),
             h(InfoPanel, { info: info, onInstall: doInstall }),
-            h(JobsPanel, { jobs: jobs }),
-            h(InstalledPanel, { installed: installed })
+            h(JobsPanel, { jobs: jobs })
           )
         )
       );
