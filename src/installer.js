@@ -187,6 +187,34 @@ export function ensureClientRow(profileDir, packageName) {
   return { added: true, rowId };
 }
 
+/**
+ * Remove the cordis.patch.yml loader row `ensureClientRow` registered for a
+ * package. Textual and idempotent: only the exact block the register emitted
+ * is spliced out, so user-authored rows survive byte-for-byte. An emptied
+ * file falls back to the stock `[]` template.
+ * @returns {{ removed: boolean, rowId?: string }}
+ */
+export function removeClientRow(profileDir, packageName) {
+  const patchPath = join(profileDir, PROFILE_PATCH_FILENAME);
+  if (!existsSync(patchPath)) return { removed: false };
+  const content = readFileSync(patchPath, "utf8");
+  const rowId = clientRowId(packageName);
+  const lines = content.split("\n");
+  let removed = false;
+  for (let index = 0; index < lines.length - 2; index++) {
+    if (lines[index] !== "- insert:") continue;
+    if (lines[index + 1] !== `    - id: ${rowId}`) continue;
+    if (lines[index + 2] !== `      name: '${packageName}'`) continue;
+    lines.splice(index, 3);
+    removed = true;
+    break;
+  }
+  if (!removed) return { removed: false };
+  const next = lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  writeFileSync(patchPath, next.length === 0 ? "[]\n" : `${next}\n`);
+  return { removed: true, rowId };
+}
+
 // ── build-script allow-listing ──────────────────────────────────────────────
 
 /** Extract package names from pnpm's "Ignored build scripts: ..." output. */
@@ -250,8 +278,12 @@ function ensureAllowBuilds(profileDir, names) {
 
 let trackerCounter = 0;
 
-/** Create a tracker for browser-started installs (see runInstall). */
-export function createInstallTracker() {
+/**
+ * Create a tracker for browser-started install/uninstall jobs (see runInstall
+ * and runRemove). Same producer shape as the jobs registry ({cancel, done,
+ * readOutput}), just an independent registry.
+ */
+export function createJobTracker() {
   const records = new Map();
   const prune = () => {
     const now = Date.now();
@@ -268,12 +300,14 @@ export function createInstallTracker() {
     }
   };
   return {
-    start({ profile, spec }) {
+    start({ profile, spec, verb = "add" }) {
       const id = `market-${++trackerCounter}`;
-      const producer = runInstall({ profile, spec });
+      const kind = verb === "remove" ? "dsh-plugin-uninstall" : "dsh-plugin-install";
+      const producer = verb === "remove" ? runRemove({ profile, packageName: spec }) : runInstall({ profile, spec });
       const record = {
         id,
-        label: `dsh plugin --profile ${profile} add ${spec}`,
+        kind,
+        label: `dsh plugin --profile ${profile} ${verb} ${spec}`,
         profile,
         spec,
         status: "running",
@@ -297,7 +331,7 @@ export function createInstallTracker() {
       return {
         snapshot: {
           id: record.id,
-          kind: "dsh-plugin-install",
+          kind: record.kind,
           label: record.label,
           status: record.status,
           detail: record.detail,
@@ -415,6 +449,89 @@ export function runInstall({ profile, spec }) {
   const first = spawnAdd();
   current = first.proc;
   const done = first.done.then((outcome) => settle(outcome));
+
+  return {
+    cancel: () => {
+      current?.kill();
+    },
+    done,
+    readOutput: () => {
+      if (deltaQueue.length === 0) return "";
+      return deltaQueue.splice(0).join("");
+    },
+  };
+}
+
+// ── the background uninstall job ────────────────────────────────────────────
+
+/** A terminal producer for fast-fail cases (no pnpm spawn needed). */
+function failedNow(detail) {
+  return {
+    cancel: () => {},
+    done: Promise.resolve({ status: "failed", detail }),
+    readOutput: () => "",
+  };
+}
+
+/**
+ * Run `pnpm remove <package>` in the profile directory as a job producer with
+ * the same shape as `runInstall`. On success it reconciles
+ * `dsh.profile.bundles` (the removed dependency's bundle entry drops out) and
+ * deletes the client loader row `ensureClientRow` had registered for it.
+ */
+export function runRemove({ profile, packageName }) {
+  let profileDir;
+  try {
+    profileDir = resolveProfileDir(profile);
+  } catch (error) {
+    return failedNow(`invalid profile: ${error.message}`);
+  }
+  const manifestPath = join(profileDir, "package.json");
+  if (!existsSync(manifestPath)) {
+    return failedNow(`profile "${profile}" has no package.json — nothing installed to remove`);
+  }
+  const beforeDeps = new Set(Object.keys(readManifest(profileDir).dependencies ?? {}));
+  if (!beforeDeps.has(packageName)) {
+    return failedNow(`"${packageName}" is not a dependency of profile "${profile}" (installed: ${[...beforeDeps].join(", ") || "none"})`);
+  }
+  const deltaQueue = [];
+  const push = (text) => {
+    deltaQueue.push(text);
+  };
+  let current = undefined;
+
+  const proc = spawn("pnpm", ["remove", packageName, "--reporter=append-only"], {
+    cwd: profileDir,
+    env: process.env,
+    shell: process.platform === "win32",
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  current = proc;
+  const done = new Promise((resolve) => {
+    proc.on("error", (error) => resolve({ spawnError: error }));
+    proc.on("close", (exitCode) => resolve({ exitCode, signal: proc.signalCode }));
+  }).then((outcome) => {
+    if (outcome.spawnError !== undefined) {
+      const hint = outcome.spawnError.code === "ENOENT"
+        ? "pnpm not found on PATH — install pnpm (e.g. `corepack enable pnpm`) to manage profile plugins"
+        : `could not start pnpm: ${outcome.spawnError.message}`;
+      return { status: "failed", detail: hint };
+    }
+    if (outcome.exitCode === null) {
+      return { status: "killed", detail: outcome.signal ? `signal: ${outcome.signal}` : "killed before exit" };
+    }
+    if (outcome.exitCode !== 0) {
+      return { status: "failed", detail: `pnpm remove ${packageName} failed (exit code ${outcome.exitCode}). See job output.` };
+    }
+    const bundles = reconcileBundles(profileDir, beforeDeps);
+    const clientRow = removeClientRow(profileDir, packageName);
+    const notes = [`bundle layer(s) now: ${bundles.join(", ") || "none (template only)"}`];
+    if (clientRow.removed) notes.push(`removed client loader row "${clientRow.rowId}" from cordis.patch.yml`);
+    return { status: "completed", detail: `removed ${packageName} from profile "${profile}" — ${notes.join("; ")}. Restart dsh for the change to take effect.` };
+  });
+  proc.stdout?.on("data", (data) => push(data.toString()));
+  proc.stderr?.on("data", (data) => push(data.toString()));
 
   return {
     cancel: () => {

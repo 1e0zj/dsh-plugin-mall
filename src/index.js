@@ -2,10 +2,11 @@
 //
 // A Cordis plugin mounted at the host plane (profile bundle layer), so its
 // tools land in the tools registry's global layer and every session sees
-// them. It exposes four tools:
+// them. It exposes five tools:
 //   market_search     search GitHub repositories tagged topic:dsh-plugin
 //   market_info       inspect one repository (stars, license, package.json, dsh.bundle)
 //   market_install    install a plugin into a local dsh profile (background job)
+//   market_uninstall  remove a plugin from a local dsh profile (background job)
 //   market_installed  list a profile's installed plugins
 //
 // Plugin contract (see @deepseek-ai/cordis-plugin-loader): the loader imports
@@ -18,7 +19,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
 import { repoInfo, searchPlugins } from "./github.js";
-import { ensureProfile, listInstalled, normalizeSpec, runInstall, createInstallTracker } from "./installer.js";
+import { ensureProfile, listInstalled, normalizeSpec, runInstall, runRemove, createJobTracker } from "./installer.js";
 
 export const name = "@1e0zj/dsh-plugin-mall";
 export const inject = ["tools", "jobs", "systemPrompt"];
@@ -104,7 +105,7 @@ function renderInstalled(result, profile) {
     lines.push(`  ${dep.name}@${dep.version}  ${markers[dep.kind] ?? markers.plain}`);
   }
   lines.push("");
-  lines.push(`Remove with: dsh plugin --profile ${profile} remove <name> (then restart dsh).`);
+  lines.push(`Remove with: market_uninstall (package: "<name>"), or dsh plugin --profile ${profile} remove <name>; then restart dsh.`);
   return lines.join("\n");
 }
 
@@ -136,7 +137,7 @@ function rpcFail(error) {
  * tools keep using ctx.jobs; the browser surface uses `tracker` because the
  * web host plane has no job controller for ctx.jobs to serve.
  * @param ctx - plugin context.
- * @param endpoint - "search" | "info" | "installed" | "install" | "job" | "jobCancel".
+ * @param endpoint - "search" | "info" | "installed" | "install" | "uninstall" | "job" | "jobCancel".
  * @param payload - endpoint arguments from the browser.
  * @param config - the row config (defaultProfile, apiBase, perPageMax).
  * @param token - GitHub token from the environment.
@@ -192,6 +193,25 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
         return rpcFail(error);
       }
     }
+    case "uninstall": {
+      const profile = String(payload?.profile ?? defaultProfile).trim();
+      const packageName = String(payload?.package ?? "").trim();
+      if (packageName.length === 0) return rpcFail(new Error("uninstall: package name is required"));
+      try {
+        const profileDir = resolveProfileDir(profile);
+        if (!existsSync(join(profileDir, "package.json"))) {
+          return rpcFail(new Error(`profile "${profile}" has no package.json — nothing installed to remove`));
+        }
+      } catch (error) {
+        return rpcFail(new Error(`invalid profile: ${error.message}`));
+      }
+      try {
+        const jobId = tracker.start({ profile, spec: packageName, verb: "remove" });
+        return rpcOk({ jobId, profile, package: packageName });
+      } catch (error) {
+        return rpcFail(error);
+      }
+    }
     case "job": {
       try {
         return rpcOk(tracker.get(payload?.jobId));
@@ -221,7 +241,7 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
  * @param token - GitHub token from the environment.
  */
 function registerRpcChannel(ctx, config, token) {
-  const tracker = createInstallTracker();
+  const tracker = createJobTracker();
   ctx.inject(["connection"], (connectionCtx) => {
     connectionCtx.connection.rpc.handle("/market", (endpoint, payload, signal) => rpcDispatch(ctx, endpoint, payload ?? {}, config, token, tracker), { authority: "loopback" });
   });
@@ -234,7 +254,7 @@ export function apply(ctx, config = {}) {
   ctx.systemPrompt.section({
     name: "tool:market",
     order: 120,
-    text: "The dsh plugin marketplace tools are available: market_search discovers plugins on the GitHub dsh-plugin topic, market_info inspects one repository, market_install installs a plugin into a dsh profile as a background job (poll with job_output), and market_installed lists a profile's plugins. A successful market_install only takes effect after the dsh process restarts — remind the user to restart. Prefer plugins with meaningful stars and a dsh.bundle declaration (market_info shows both).",
+    text: "The dsh plugin marketplace tools are available: market_search discovers plugins on the GitHub dsh-plugin topic, market_info inspects one repository, market_install installs a plugin into a dsh profile as a background job (poll with job_output), market_uninstall removes an installed plugin from a dsh profile as a background job, and market_installed lists a profile's plugins. A successful market_install or market_uninstall only takes effect after the dsh process restarts — remind the user to restart. Prefer plugins with meaningful stars and a dsh.bundle declaration (market_info shows both).",
   });
 
   ctx.tools.register(defineTool({
@@ -360,6 +380,56 @@ export function apply(ctx, config = {}) {
       title: `dsh plugin --profile ${args.profile ?? defaultProfile} add ${args.spec}`,
       kind: "execute",
       content: [{ type: "text", text: "Install a plugin into a dsh profile (background job)" }],
+    }),
+  }));
+
+  ctx.tools.register(defineTool({
+    name: "market_uninstall",
+    description: "Remove a plugin from a local dsh profile by running `pnpm remove` in that profile's directory, dropping its entry from the profile's bundle layer list, and deleting its client loader row from cordis.patch.yml if one was registered. Same flow as `dsh plugin --profile <name> remove <package>`. ALWAYS runs as a background job: the call returns a job id immediately; poll with job_output and cancel with job_kill. A successful removal only takes effect after the dsh process restarts.",
+    parameters: {
+      package: {
+        type: "string",
+        required: true,
+        description: "Installed package name to remove, e.g. \"@1e0zj/dsh-plugin-mall\" or \"dsh-at-file\".",
+      },
+      profile: {
+        type: "string",
+        description: `Target profile under $DSH_HOME/profiles. Defaults to "${defaultProfile}".`,
+      },
+    },
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: BACKGROUND_OUTPUT_PROPERTIES,
+      },
+      render: (args, value) => [{
+        type: "text",
+        text: `started background job ${value.jobId} (${args.package} ← profile "${args.profile ?? defaultProfile}"); poll with job_output, cancel with job_kill. Restart dsh after a successful uninstall.`,
+      }],
+    },
+    async execute(args, exec) {
+      const profile = String(args.profile ?? defaultProfile).trim();
+      const packageName = String(args.package ?? "").trim();
+      if (packageName.length === 0) throw new Error("market_uninstall: package name is required");
+      try {
+        resolveProfileDir(profile);
+      } catch (error) {
+        throw new Error(`market_uninstall: invalid profile: ${error.message}`);
+      }
+      const jobId = ctx.jobs.start({
+        kind: "dsh-plugin-uninstall",
+        label: `dsh plugin --profile ${profile} remove ${packageName}`,
+        ...exec.agent ? { owner: exec.agent } : {},
+        run: () => runRemove({ profile, packageName }),
+      });
+      return { kind: "background", jobId };
+    },
+    presentCall: (args) => ({
+      card: "generic",
+      title: `dsh plugin --profile ${args.profile ?? defaultProfile} remove ${args.package}`,
+      kind: "execute",
+      content: [{ type: "text", text: "Remove a plugin from a dsh profile (background job)" }],
     }),
   }));
 

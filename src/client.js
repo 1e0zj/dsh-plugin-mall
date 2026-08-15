@@ -28,6 +28,7 @@ window.__ModuleLoader__.load({
       ".mkt_btnPrimary{background:var(--dsw-alias-state-business-primary,#2b6cb0);border-color:transparent;color:#fff}",
       ".mkt_btnPrimary:hover:not(:disabled){color:#fff;opacity:.92}",
       ".mkt_btnDanger:hover:not(:disabled){border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary)}",
+      ".mkt_btnSm{padding:3px 10px;font-size:12px}",
       ".mkt_error{color:var(--dsw-alias-state-error-primary);font-size:12px;line-height:18px}",
       ".mkt_columns{display:grid;grid-template-columns:1fr 320px;gap:14px;align-items:start}",
       "@media (max-width:860px){.mkt_columns{grid-template-columns:1fr}}",
@@ -180,7 +181,7 @@ window.__ModuleLoader__.load({
       var ids = Object.keys(props.jobs);
       if (ids.length === 0) return null;
       return h("div", { className: "mkt_card" },
-        h("p", { className: "mkt_panelTitle" }, "安装任务"),
+        h("p", { className: "mkt_panelTitle" }, "任务"),
         ids.map(function (id) {
           var job = props.jobs[id];
           var done = job.status === "completed" || job.status === "failed" || job.status === "killed";
@@ -189,9 +190,9 @@ window.__ModuleLoader__.load({
               id + " · " + clip(job.spec || "", 40) + " · " + (job.status || "running")),
             job.detail ? h("div", { className: "mkt_desc" }, job.detail) : null,
             done && job.status === "completed"
-              ? h("div", { className: "mkt_ok" }, "✓ 安装完成 — 重启 dsh 后生效")
+              ? h("div", { className: "mkt_ok" }, "✓ 完成 — 重启 dsh 后生效")
               : job.status === "failed"
-                ? h("div", { className: "mkt_error" }, "安装失败，见下方输出")
+                ? h("div", { className: "mkt_error" }, "失败，见下方输出")
                 : null,
             job.output ? h("pre", { className: "mkt_pre" }, job.output.slice(-4000)) : null
           );
@@ -224,9 +225,15 @@ window.__ModuleLoader__.load({
           : (installed.deps || []).length === 0
             ? h("div", { className: "mkt_meta" }, "还没有装过插件")
             : h("div", { className: "mkt_depList" }, (installed.deps || []).map(function (dep) {
+              var busy = (props.removing || {})[dep.name] === true;
               return h("div", { key: dep.name, className: "mkt_depRow" },
                 h("span", { className: "mkt_desc" }, dep.name + "@" + dep.version),
-                h("span", { className: "mkt_badge" }, kindLabel(dep.kind)));
+                h("span", { className: "mkt_badge" }, kindLabel(dep.kind)),
+                h("button", {
+                  className: "mkt_btn mkt_btnDanger mkt_btnSm",
+                  disabled: busy,
+                  onClick: function () { props.onUninstall(dep.name); },
+                }, busy ? "卸载中…" : "卸载"));
             }))
       );
     }
@@ -258,6 +265,9 @@ window.__ModuleLoader__.load({
       var _installing = useState({});
       var installing = _installing[0];
       var setInstalling = _installing[1];
+      var _removing = useState({});
+      var removing = _removing[0];
+      var setRemoving = _removing[1];
 
       var call = useCallback(function (endpoint, payload) {
         return rpc.call("/market", endpoint, payload || {}).then(function (res) {
@@ -325,6 +335,25 @@ window.__ModuleLoader__.load({
         });
       }, [call, track]);
 
+      var doUninstall = useCallback(function (name) {
+        setRemoving(function (prev) {
+          var next = Object.assign({}, prev, { [name]: true });
+          return next;
+        });
+        setError(null);
+        call("uninstall", { package: name }).then(function (value) {
+          track(value.jobId, name);
+        }).catch(function (e) {
+          setError(errorText(e));
+        }).finally(function () {
+          setRemoving(function (prev) {
+            var next = Object.assign({}, prev);
+            delete next[name];
+            return next;
+          });
+        });
+      }, [call, track]);
+
       useEffect(function () {
         refreshInstalled();
       }, [refreshInstalled]);
@@ -332,7 +361,7 @@ window.__ModuleLoader__.load({
       return h("div", { className: "mkt_root" },
         h("div", { className: "mkt_head" },
           h("div", { className: "mkt_title" }, "插件市场"),
-          h("div", { className: "mkt_sub" }, "搜索 GitHub dsh-plugin 话题插件 · 安装后需重启 dsh 生效")
+          h("div", { className: "mkt_sub" }, "搜索 GitHub dsh-plugin 话题插件 · 装/卸后需重启 dsh 生效")
         ),
         h("div", { className: "mkt_row" },
           h("input", {
@@ -375,7 +404,7 @@ window.__ModuleLoader__.load({
                 )
           ),
           h("div", { className: "mkt_rail" },
-            h(InstalledPanel, { installed: installed }),
+            h(InstalledPanel, { installed: installed, removing: removing, onUninstall: doUninstall }),
             h(InfoPanel, { info: info, onInstall: doInstall }),
             h(JobsPanel, { jobs: jobs })
           )
