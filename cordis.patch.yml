@@ -1,0 +1,13 @@
+# dsh-plugin-mall bundle patch: registers the plugin marketplace row.
+# Mounted at the host plane (profile bundle layer), so its tools land in the
+# tools registry's global layer and every session sees them.
+- insert:
+    - id: dsh-market
+      name: 'dsh-plugin-mall'
+      config:
+        # The profile market_install targets when the caller names none.
+        defaultProfile: web
+        # GitHub REST API base (override for self-hosted mirrors/proxies).
+        apiBase: https://api.github.com
+        # Upper bound for market_search perPage.
+        perPageMax: 30
