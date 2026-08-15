@@ -41,6 +41,8 @@ window.__ModuleLoader__.load({
       ".mkt_cardActions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:auto;padding-top:4px}",
       ".mkt_infoCard{max-width:640px}",
       ".mkt_panelTitle{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary);margin:0}",
+      ".mkt_panelRow{display:flex;align-items:center;gap:8px}",
+      ".mkt_panelRow .mkt_link{margin-left:auto}",
       ".mkt_pre{font-family:Consolas,Monaco,monospace;font-size:11.5px;line-height:16px;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-secondary,#f6f7f8);border-radius:6px;padding:8px;max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-all}",
       ".mkt_ok{color:var(--dsw-alias-state-success-primary,#2f855a)}",
       ".mkt_badge{display:inline-block;border-radius:999px;padding:1px 8px;font-size:11px;border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-tertiary)}",
@@ -152,8 +154,11 @@ window.__ModuleLoader__.load({
       var info = props.info;
       if (!info) return null;
       var data = info.data;
-      return h("div", { className: "mkt_card mkt_infoCard" },
-        h("p", { className: "mkt_panelTitle" }, "仓库详情"),
+      return h("div", { className: "mkt_card mkt_infoCard", ref: props.panelRef },
+        h("div", { className: "mkt_panelRow" },
+          h("p", { className: "mkt_panelTitle" }, "仓库详情"),
+          props.onClose ? h("span", { className: "mkt_link", onClick: props.onClose }, "✕ 关闭") : null
+        ),
         info.loading ? h("div", { className: "mkt_meta" }, "加载中…")
           : info.error ? h("div", { className: "mkt_error" }, info.error)
           : !data ? null
@@ -269,6 +274,7 @@ window.__ModuleLoader__.load({
       var _removing = useState({});
       var removing = _removing[0];
       var setRemoving = _removing[1];
+      var infoRef = useRef(null);
 
       var call = useCallback(function (endpoint, payload) {
         return rpc.call("/market", endpoint, payload || {}).then(function (res) {
@@ -297,6 +303,17 @@ window.__ModuleLoader__.load({
           setInfo({ repo: repo, error: errorText(e) });
         });
       }, [call]);
+
+      var doCloseInfo = useCallback(function () {
+        setInfo(null);
+      }, []);
+
+      // 详情面板在列表上方；点"详情"时平滑滚到面板，免得用户找不到。
+      useEffect(function () {
+        if (info && infoRef.current && typeof infoRef.current.scrollIntoView === "function") {
+          infoRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        }
+      }, [info]);
 
       var refreshInstalled = useCallback(function () {
         call("installed", {}).then(function (value) {
@@ -386,6 +403,7 @@ window.__ModuleLoader__.load({
         ),
         error ? h("div", { className: "mkt_error" }, error) : null,
         h(InstalledPanel, { installed: installed, removing: removing, onUninstall: doUninstall }),
+        h(InfoPanel, { info: info, onInstall: doInstall, onClose: doCloseInfo, panelRef: infoRef }),
         h("div", { className: "mkt_list" },
           results == null
             ? h("div", { className: "mkt_meta mkt_listHead" }, loading ? "正在加载最热插件…" : "—")
@@ -404,7 +422,6 @@ window.__ModuleLoader__.load({
                 })
               )
         ),
-        h(InfoPanel, { info: info, onInstall: doInstall }),
         h(JobsPanel, { jobs: jobs })
       );
     }
