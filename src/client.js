@@ -39,10 +39,8 @@ window.__ModuleLoader__.load({
       ".mkt_meta{font-size:12px;color:var(--dsw-alias-label-tertiary)}",
       ".mkt_desc{font-size:12.5px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}",
       ".mkt_cardActions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:auto;padding-top:4px}",
-      ".mkt_infoCard{max-width:640px}",
+      ".mkt_cardActions .mkt_btn{text-decoration:none}",
       ".mkt_panelTitle{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary);margin:0}",
-      ".mkt_panelRow{display:flex;align-items:center;gap:8px}",
-      ".mkt_panelRow .mkt_link{margin-left:auto}",
       ".mkt_pre{font-family:Consolas,Monaco,monospace;font-size:11.5px;line-height:16px;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-secondary,#f6f7f8);border-radius:6px;padding:8px;max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-all}",
       ".mkt_ok{color:var(--dsw-alias-state-success-primary,#2f855a)}",
       ".mkt_badge{display:inline-block;border-radius:999px;padding:1px 8px;font-size:11px;border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-tertiary)}",
@@ -131,6 +129,15 @@ window.__ModuleLoader__.load({
     function RepoCard(props) {
       var item = props.item;
       var installing = props.installing === true;
+      var job = props.installJob;
+      var installLabel = "安装";
+      var installDisabled = installing;
+      if (!installing && job) {
+        if (job.status === "running") { installLabel = "安装中…"; installDisabled = true; }
+        else if (job.status === "completed") { installLabel = "✓ 已装 · 重启生效"; installDisabled = true; }
+        else if (job.status === "failed") { installLabel = "安装失败 · 见任务日志"; }
+        else { installLabel = "已取消 · 重试"; }
+      }
       return h("div", { className: "mkt_card" },
         h("div", { className: "mkt_cardHead" },
           h("span", { className: "mkt_name" }, item.fullName),
@@ -142,43 +149,10 @@ window.__ModuleLoader__.load({
         item.description ? h("div", { className: "mkt_desc" }, clip(item.description, 180)) : null,
         h("div", { className: "mkt_meta" }, "更新 " + (item.updatedAt || "").slice(0, 10)),
         h("div", { className: "mkt_cardActions" },
-          h("button", { className: "mkt_btn mkt_btnPrimary", disabled: installing, onClick: function () { props.onInstall(item.fullName); } },
-            installing ? "安装中…" : "安装"),
-          h("button", { className: "mkt_btn", onClick: function () { props.onInfo(item.fullName); } }, "详情")
+          h("button", { className: "mkt_btn mkt_btnPrimary", disabled: installDisabled, onClick: function () { props.onInstall(item.fullName); } },
+            installLabel),
+          h("a", { className: "mkt_btn", href: item.htmlUrl, target: "_blank", rel: "noreferrer" }, "前往仓库 ↗")
         )
-      );
-    }
-
-    // ── info panel ──────────────────────────────────────────────────────────
-    function InfoPanel(props) {
-      var info = props.info;
-      if (!info) return null;
-      var data = info.data;
-      return h("div", { className: "mkt_card mkt_infoCard", ref: props.panelRef },
-        h("div", { className: "mkt_panelRow" },
-          h("p", { className: "mkt_panelTitle" }, "仓库详情"),
-          props.onClose ? h("span", { className: "mkt_link", onClick: props.onClose }, "✕ 关闭") : null
-        ),
-        info.loading ? h("div", { className: "mkt_meta" }, "加载中…")
-          : info.error ? h("div", { className: "mkt_error" }, info.error)
-          : !data ? null
-          : h(React.Fragment, null,
-            h("div", { className: "mkt_name" }, data.meta.fullName),
-            h("div", { className: "mkt_desc" }, clip(data.meta.description, 240)),
-            h("div", { className: "mkt_meta" },
-              "★" + data.meta.stars + " · " + (data.meta.language || "-") + " · " + (data.meta.license || "-") + " · 分支 " + data.meta.defaultBranch),
-            data.packageJson == null
-              ? h("div", { className: "mkt_meta" }, "package.json: 未找到（可能不是 npm 插件）")
-              : h(React.Fragment, null,
-                h("div", { className: "mkt_meta" }, "package.json: " + (data.packageJson.name || "?") + "@" + (data.packageJson.version || "?")),
-                data.packageJson.dshBundlePatch != null
-                  ? h("div", { className: "mkt_ok" }, "✓ dsh.bundle 宿主插件")
-                  : data.packageJson.dshClientPlatform != null
-                    ? h("div", { className: "mkt_ok" }, "✓ dsh.client 浏览器UI插件")
-                    : h("div", { className: "mkt_meta" }, "⚠ 无 bundle/client 声明，装上是普通依赖")),
-            h("button", { className: "mkt_btn mkt_btnPrimary", onClick: function () { props.onInstall(data.meta.fullName); } }, "安装 github:" + data.meta.fullName),
-            h("a", { className: "mkt_link", href: data.meta.htmlUrl, target: "_blank", rel: "noreferrer" }, "打开仓库 ↗")
-          )
       );
     }
 
@@ -262,9 +236,6 @@ window.__ModuleLoader__.load({
       var _error = useState(null);
       var error = _error[0];
       var setError = _error[1];
-      var _info = useState(null);
-      var info = _info[0];
-      var setInfo = _info[1];
       var _installed = useState(null);
       var installed = _installed[0];
       var setInstalled = _installed[1];
@@ -274,7 +245,6 @@ window.__ModuleLoader__.load({
       var _removing = useState({});
       var removing = _removing[0];
       var setRemoving = _removing[1];
-      var infoRef = useRef(null);
 
       var call = useCallback(function (endpoint, payload) {
         return rpc.call("/market", endpoint, payload || {}).then(function (res) {
@@ -294,26 +264,6 @@ window.__ModuleLoader__.load({
           setLoading(false);
         });
       }, [call, query, sort]);
-
-      var doInfo = useCallback(function (repo) {
-        setInfo({ repo: repo, loading: true });
-        call("info", { repo: repo }).then(function (value) {
-          setInfo({ repo: repo, data: value });
-        }).catch(function (e) {
-          setInfo({ repo: repo, error: errorText(e) });
-        });
-      }, [call]);
-
-      var doCloseInfo = useCallback(function () {
-        setInfo(null);
-      }, []);
-
-      // 详情面板在列表上方；点"详情"时平滑滚到面板，免得用户找不到。
-      useEffect(function () {
-        if (info && infoRef.current && typeof infoRef.current.scrollIntoView === "function") {
-          infoRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
-        }
-      }, [info]);
 
       var refreshInstalled = useCallback(function () {
         call("installed", {}).then(function (value) {
@@ -376,6 +326,10 @@ window.__ModuleLoader__.load({
         refreshInstalled();
       }, [refreshInstalled]);
 
+      // 活动任务置顶（紧跟已装面板，点安装立刻看到进度）；全部静止后归档到底部当日志。
+      var jobsActive = false;
+      for (var jid in jobs) { if (jobs[jid] && jobs[jid].status === "running") { jobsActive = true; break; } }
+
       return h("div", { className: "mkt_root" },
         h("div", { className: "mkt_head" },
           h("div", { className: "mkt_title" }, "插件市场"),
@@ -403,7 +357,7 @@ window.__ModuleLoader__.load({
         ),
         error ? h("div", { className: "mkt_error" }, error) : null,
         h(InstalledPanel, { installed: installed, removing: removing, onUninstall: doUninstall }),
-        h(InfoPanel, { info: info, onInstall: doInstall, onClose: doCloseInfo, panelRef: infoRef }),
+        jobsActive ? h(JobsPanel, { jobs: jobs }) : null,
         h("div", { className: "mkt_list" },
           results == null
             ? h("div", { className: "mkt_meta mkt_listHead" }, loading ? "正在加载最热插件…" : "—")
@@ -412,17 +366,21 @@ window.__ModuleLoader__.load({
               : h(React.Fragment, null,
                 h("div", { className: "mkt_meta mkt_listHead" }, "共 " + results.total + " 个仓库（显示 " + results.items.length + " 个）"),
                 results.items.map(function (item) {
+                  var installJob = null;
+                  for (var jobId in jobs) {
+                    if (jobs[jobId] && jobs[jobId].spec === "github:" + item.fullName) { installJob = jobs[jobId]; break; }
+                  }
                   return h(RepoCard, {
                     key: item.fullName,
                     item: item,
                     installing: installing[item.fullName] === true,
+                    installJob: installJob,
                     onInstall: doInstall,
-                    onInfo: doInfo,
                   });
                 })
               )
         ),
-        h(JobsPanel, { jobs: jobs })
+        jobsActive ? null : h(JobsPanel, { jobs: jobs })
       );
     }
 
