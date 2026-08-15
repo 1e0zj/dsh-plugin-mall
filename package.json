@@ -42,5 +42,9 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "repository": {
+    "url": "git+https://github.com/1e0zj/dsh-plugin-mall.git",
+    "type": "git"
   }
 }
