@@ -30,8 +30,6 @@ window.__ModuleLoader__.load({
       ".mkt_btnDanger:hover:not(:disabled){border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary)}",
       ".mkt_btnSm{padding:3px 10px;font-size:12px}",
       ".mkt_error{color:var(--dsw-alias-state-error-primary);font-size:12px;line-height:18px}",
-      ".mkt_columns{display:grid;grid-template-columns:1fr 320px;gap:14px;align-items:start}",
-      "@media (max-width:860px){.mkt_columns{grid-template-columns:1fr}}",
       ".mkt_list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;align-items:stretch;min-width:0}",
       "@media (max-width:820px){.mkt_list{grid-template-columns:minmax(0,1fr)}}",
       ".mkt_listHead{grid-column:1/-1;font-size:12px;color:var(--dsw-alias-label-tertiary)}",
@@ -41,7 +39,7 @@ window.__ModuleLoader__.load({
       ".mkt_meta{font-size:12px;color:var(--dsw-alias-label-tertiary)}",
       ".mkt_desc{font-size:12.5px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}",
       ".mkt_cardActions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:auto;padding-top:4px}",
-      ".mkt_rail{display:flex;flex-direction:column;gap:10px;min-width:0}",
+      ".mkt_infoCard{max-width:640px}",
       ".mkt_panelTitle{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary);margin:0}",
       ".mkt_pre{font-family:Consolas,Monaco,monospace;font-size:11.5px;line-height:16px;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-secondary,#f6f7f8);border-radius:6px;padding:8px;max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-all}",
       ".mkt_ok{color:var(--dsw-alias-state-success-primary,#2f855a)}",
@@ -49,8 +47,8 @@ window.__ModuleLoader__.load({
       ".mkt_link{color:var(--dsw-alias-state-business-primary);font-size:12px;text-decoration:none;cursor:pointer}",
       ".mkt_installedHead{display:flex;align-items:center;gap:8px;width:100%;background:none;border:0;padding:0;margin:0;cursor:pointer;font:inherit;text-align:left}",
       ".mkt_installedHead:hover .mkt_panelTitle{color:var(--dsw-alias-state-business-primary)}",
-      ".mkt_depList{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 14px;margin-top:8px}",
-      "@media (max-width:820px){.mkt_depList{grid-template-columns:minmax(0,1fr)}}",
+      ".mkt_installedToggle{margin-left:auto}",
+      ".mkt_depList{display:flex;flex-direction:column;gap:6px;margin-top:8px}",
       ".mkt_depRow{display:flex;justify-content:space-between;align-items:center;gap:8px}",
     ].join("\n");
     var tagId = "@1e0zj/dsh-plugin-mall/market-tab.css";
@@ -154,7 +152,7 @@ window.__ModuleLoader__.load({
       var info = props.info;
       if (!info) return null;
       var data = info.data;
-      return h("div", { className: "mkt_card" },
+      return h("div", { className: "mkt_card mkt_infoCard" },
         h("p", { className: "mkt_panelTitle" }, "仓库详情"),
         info.loading ? h("div", { className: "mkt_meta" }, "加载中…")
           : info.error ? h("div", { className: "mkt_error" }, info.error)
@@ -220,7 +218,7 @@ window.__ModuleLoader__.load({
         },
           h("span", { className: "mkt_panelTitle" }, "已装插件"),
           h("span", { className: "mkt_badge" }, count + " 个"),
-          h("span", { className: "mkt_meta" }, open ? "收起 ▲" : "展开 ▼")
+          h("span", { className: "mkt_meta mkt_installedToggle" }, open ? "收起 ▲" : "展开 ▼")
         ),
         installed.error
           ? h("div", { className: "mkt_error" }, installed.error)
@@ -388,30 +386,26 @@ window.__ModuleLoader__.load({
         ),
         error ? h("div", { className: "mkt_error" }, error) : null,
         h(InstalledPanel, { installed: installed, removing: removing, onUninstall: doUninstall }),
-        h("div", { className: "mkt_columns" },
-          h("div", { className: "mkt_list" },
-            results == null
-              ? h("div", { className: "mkt_meta mkt_listHead" }, loading ? "正在加载最热插件…" : "—")
-              : results.items.length === 0
-                ? h("div", { className: "mkt_meta mkt_listHead" }, "没有匹配的仓库。")
-                : h(React.Fragment, null,
-                  h("div", { className: "mkt_meta mkt_listHead" }, "共 " + results.total + " 个仓库（显示 " + results.items.length + " 个）"),
-                  results.items.map(function (item) {
-                    return h(RepoCard, {
-                      key: item.fullName,
-                      item: item,
-                      installing: installing[item.fullName] === true,
-                      onInstall: doInstall,
-                      onInfo: doInfo,
-                    });
-                  })
-                )
-          ),
-          h("div", { className: "mkt_rail" },
-            h(InfoPanel, { info: info, onInstall: doInstall }),
-            h(JobsPanel, { jobs: jobs })
-          )
-        )
+        h("div", { className: "mkt_list" },
+          results == null
+            ? h("div", { className: "mkt_meta mkt_listHead" }, loading ? "正在加载最热插件…" : "—")
+            : results.items.length === 0
+              ? h("div", { className: "mkt_meta mkt_listHead" }, "没有匹配的仓库。")
+              : h(React.Fragment, null,
+                h("div", { className: "mkt_meta mkt_listHead" }, "共 " + results.total + " 个仓库（显示 " + results.items.length + " 个）"),
+                results.items.map(function (item) {
+                  return h(RepoCard, {
+                    key: item.fullName,
+                    item: item,
+                    installing: installing[item.fullName] === true,
+                    onInstall: doInstall,
+                    onInfo: doInfo,
+                  });
+                })
+              )
+        ),
+        h(InfoPanel, { info: info, onInstall: doInstall }),
+        h(JobsPanel, { jobs: jobs })
       );
     }
 
