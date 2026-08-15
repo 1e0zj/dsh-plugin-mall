@@ -2,11 +2,11 @@
 //
 // Client plugin contract (see @deepseek-ai/dsh-client-modules): the bundle
 // registers itself on window.__ModuleLoader__, exports a cordis-style
-// { apply, inject }, and is served at /plugins/dsh-plugin-mall/client.js.
+// { apply, inject }, and is served at /plugins/@1e0zj/dsh-plugin-mall/client.js.
 // This file is hand-written ES5-ish JS on purpose — no build step — using the
 // React instance the shell shares through the client module loader.
 window.__ModuleLoader__.load({
-  id: "dsh-plugin-mall",
+  id: "@1e0zj/dsh-plugin-mall",
   factory: (require) => {
     var module = { exports: {} };
     var exports = module.exports;
@@ -45,10 +45,10 @@ window.__ModuleLoader__.load({
       ".mkt_badge{display:inline-block;border-radius:999px;padding:1px 8px;font-size:11px;border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-tertiary)}",
       ".mkt_link{color:var(--dsw-alias-state-business-primary);font-size:12px;text-decoration:none;cursor:pointer}",
     ].join("\n");
-    var tagId = "dsh-plugin-mall/market-tab.css";
+    var tagId = "@1e0zj/dsh-plugin-mall/market-tab.css";
     if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId) + "]") === null) {
       var styleTag = document.createElement("style");
-      styleTag.dataset.plugin = "dsh-plugin-mall";
+      styleTag.dataset.plugin = "@1e0zj/dsh-plugin-mall";
       styleTag.dataset.pluginCss = tagId;
       styleTag.textContent = css;
       document.head.appendChild(styleTag);
@@ -371,7 +371,7 @@ window.__ModuleLoader__.load({
             },
           }, MarketplaceTab);
         });
-      }, "dsh-plugin-mall: marketplace tab");
+      }, "@1e0zj/dsh-plugin-mall: marketplace tab");
     }
     exports.apply = apply;
     exports.inject = inject;

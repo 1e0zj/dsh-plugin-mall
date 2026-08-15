@@ -18,10 +18,10 @@
 
 ```powershell
 # 从 npm（发布后）
-dsh plugin --profile web add dsh-plugin-mall
+dsh plugin --profile web add @1e0zj/dsh-plugin-mall
 
 # 从 GitHub
-dsh plugin --profile web add github:owner/dsh-plugin-mall
+dsh plugin --profile web add github:1e0zj/dsh-plugin-mall
 
 # 本地开发（软链，改代码后重启 dsh 即生效）
 dsh plugin --profile web add link:C:\path\to\dsh-plugin-mall

@@ -20,7 +20,7 @@ import { resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
 import { repoInfo, searchPlugins } from "./github.js";
 import { ensureProfile, listInstalled, normalizeSpec, runInstall, createInstallTracker } from "./installer.js";
 
-export const name = "dsh-plugin-mall";
+export const name = "@1e0zj/dsh-plugin-mall";
 export const inject = ["tools", "jobs", "systemPrompt"];
 
 export const Config = z.object({
@@ -234,7 +234,7 @@ export function apply(ctx, config = {}) {
   ctx.systemPrompt.section({
     name: "tool:market",
     order: 120,
-    text: "dsh-plugin-mall tools are available: market_search discovers plugins on the GitHub dsh-plugin topic, market_info inspects one repository, market_install installs a plugin into a dsh profile as a background job (poll with job_output), and market_installed lists a profile's plugins. A successful market_install only takes effect after the dsh process restarts — remind the user to restart. Prefer plugins with meaningful stars and a dsh.bundle declaration (market_info shows both).",
+    text: "The dsh plugin marketplace tools are available: market_search discovers plugins on the GitHub dsh-plugin topic, market_info inspects one repository, market_install installs a plugin into a dsh profile as a background job (poll with job_output), and market_installed lists a profile's plugins. A successful market_install only takes effect after the dsh process restarts — remind the user to restart. Prefer plugins with meaningful stars and a dsh.bundle declaration (market_info shows both).",
   });
 
   ctx.tools.register(defineTool({

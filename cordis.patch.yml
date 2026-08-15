@@ -3,7 +3,7 @@
 # tools registry's global layer and every session sees them.
 - insert:
     - id: dsh-market
-      name: 'dsh-plugin-mall'
+      name: '@1e0zj/dsh-plugin-mall'
       config:
         # The profile market_install targets when the caller names none.
         defaultProfile: web
