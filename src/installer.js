@@ -218,19 +218,26 @@ export function removeClientRow(profileDir, packageName) {
 // ── build-script allow-listing ──────────────────────────────────────────────
 
 /** Extract package names from pnpm's "Ignored build scripts: ..." output. */
+/** Valid npm package name (scoped or bare) — anything else is not a name. */
+const NPM_NAME_RE = /^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/i;
+
 function parseIgnoredBuilds(output) {
   const names = new Set();
-  const pattern = /(?:Ignored build scripts|allowBuilds|onlyBuiltDependencies)\s*:\s*([^\n]+)/gi;
+  // Only pnpm's own notice line is a parsing source. "allowBuilds" also
+  // appears in pnpm's advice/error text (never followed by a name list), and
+  // matching it fed error echoes into the allow-list, corrupting the YAML.
+  const pattern = /(?:Ignored build scripts|onlyBuiltDependencies)\s*:\s*([^\n]+)/gi;
   let match;
   while ((match = pattern.exec(output)) !== null) {
     for (const raw of match[1].split(",")) {
-      const trimmed = raw.trim();
-      if (trimmed.length === 0) continue;
-      // Strip a trailing @version so `foo@1.2.3` -> `foo`, `@s/n@1.0.0` -> `@s/n`.
-      const name = trimmed.includes("@") && !trimmed.startsWith("@")
-        ? trimmed.split("@").slice(0, -1).join("@")
-        : trimmed.replace(/@[^@/]+$/, "");
-      if (name.length > 0) names.add(name);
+      const candidate = raw.trim();
+      if (candidate.length === 0) continue;
+      // Strip a trailing @version or @tarball-url so `foo@1.2.3` -> `foo`,
+      // `@s/n@1.0.0` -> `@s/n`, `@s/n@https://…` -> `@s/n`. Whatever remains
+      // must be a valid npm name; pnpm error echoes ("9 | - pkg", advice
+      // sentences) are dropped instead of being written to the YAML.
+      const name = candidate.replace(/@(?:[\w.+-]+|https?:\/\/\S+|file:\S+|link:\S+|github:\S+)$/, "");
+      if (NPM_NAME_RE.test(name)) names.add(name);
     }
   }
   return [...names];
@@ -238,6 +245,8 @@ function parseIgnoredBuilds(output) {
 
 /** Merge new names into the profile's pnpm-workspace.yaml `allowBuilds` list. */
 function ensureAllowBuilds(profileDir, names) {
+  const valid = names.filter((name) => NPM_NAME_RE.test(name));
+  if (valid.length === 0) return;
   const workspacePath = join(profileDir, "pnpm-workspace.yaml");
   let content = existsSync(workspacePath)
     ? readFileSync(workspacePath, "utf8")
@@ -246,22 +255,24 @@ function ensureAllowBuilds(profileDir, names) {
   const keyIndex = lines.findIndex((line) => /^allowBuilds\s*:/.test(line));
   if (keyIndex === -1) {
     if (!content.endsWith("\n")) content += "\n";
-    content += `\nallowBuilds:\n${names.map((name) => `  - ${name}`).join("\n")}\n`;
+    // Quote every entry: a bare `@scope/name` starts with YAML's reserved
+    // `@` indicator and fails to parse.
+    content += `\nallowBuilds:\n${valid.map((name) => `  - '${name}'`).join("\n")}\n`;
   } else {
     const existing = new Set();
     let insertIndex = keyIndex + 1;
     for (let index = keyIndex + 1; index < lines.length; index++) {
       const item = /^\s*-\s+(.+?)\s*$/.exec(lines[index]);
       if (item) {
-        existing.add(item[1]);
+        existing.add(item[1].replace(/^['"](.*)['"]$/, "$1"));
         insertIndex = index + 1;
         continue;
       }
       if (/^\S/.test(lines[index])) break;
     }
-    const additions = names.filter((name) => !existing.has(name));
+    const additions = valid.filter((name) => !existing.has(name));
     if (additions.length > 0) {
-      lines.splice(insertIndex, 0, ...additions.map((name) => `  - ${name}`));
+      lines.splice(insertIndex, 0, ...additions.map((name) => `  - '${name}'`));
       content = lines.join("\n");
     }
   }
