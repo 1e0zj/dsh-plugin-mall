@@ -16,8 +16,11 @@ export function buildHeaders(token) {
   return headers;
 }
 
+const DEFAULT_API_BASE = "https://api.github.com";
+
 function apiUrl(apiBase, path) {
-  const base = apiBase.endsWith("/") ? apiBase : `${apiBase}/`;
+  const raw = typeof apiBase === "string" && apiBase.length > 0 ? apiBase : DEFAULT_API_BASE;
+  const base = raw.endsWith("/") ? raw : `${raw}/`;
   return `${base}${path.replace(/^\//, "")}`;
 }
 
