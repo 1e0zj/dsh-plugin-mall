@@ -270,7 +270,17 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
 function registerRpcChannel(ctx, config, token) {
   const tracker = createJobTracker();
   ctx.inject(["connection"], (connectionCtx) => {
-    connectionCtx.connection.rpc.handle("/market", (endpoint, payload, signal) => rpcDispatch(ctx, endpoint, payload ?? {}, config, token, tracker), { authority: "loopback" });
+    connectionCtx.connection.rpc.handle("/market", async (endpoint, payload, signal) => {
+      try {
+        return await rpcDispatch(ctx, endpoint, payload ?? {}, config, token, tracker);
+      } catch (error) {
+        // 没有这层兜底时连接层只会回一个 HTTP 500 "transport failure"，
+        // 真实异常既到不了浏览器也不留痕。透传错误文本，同时把堆栈
+        // 打进 dsh 进程的 stderr（前台运行时可见）。
+        console.error(`[dsh-plugin-mall] /market/${String(endpoint)} failed:`, error);
+        return rpcFail(error);
+      }
+    }, { authority: "loopback" });
   });
 }
 
