@@ -41,7 +41,7 @@ window.__ModuleLoader__.load({
       ".mkt_meta{font-size:12px;color:var(--dsw-alias-label-tertiary)}",
       ".mkt_desc{font-size:12.5px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}",
       ".mkt_descTip{position:relative;cursor:default}",
-      ".mkt_descTip:hover::after{content:attr(data-full);position:absolute;left:0;top:100%;margin-top:6px;background:var(--dsw-alias-bg-primary,#fff);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:8px 10px;font-size:12.5px;line-height:18px;color:var(--dsw-alias-label-secondary);max-width:520px;width:max-content;white-space:normal;overflow-wrap:anywhere;box-shadow:0 4px 14px rgba(0,0,0,.14);z-index:40}",
+      ".mkt_descTip:hover::after{content:attr(data-full);position:absolute;left:0;right:0;top:100%;margin-top:6px;background:var(--dsw-alias-bg-primary,#fff);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:8px 10px;font-size:12.5px;line-height:18px;color:var(--dsw-alias-label-secondary);white-space:normal;overflow-wrap:anywhere;box-shadow:0 4px 14px rgba(0,0,0,.14);z-index:40}",
       ".mkt_cardActions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:auto;padding-top:4px}",
       ".mkt_cardActions .mkt_btn{text-decoration:none}",
       ".mkt_panelTitle{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary);margin:0}",
