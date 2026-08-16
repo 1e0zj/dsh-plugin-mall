@@ -49,6 +49,7 @@ window.__ModuleLoader__.load({
       ".mkt_ok{color:var(--dsw-alias-state-success-primary,#2f855a)}",
       ".mkt_badge{display:inline-block;border-radius:999px;padding:1px 8px;font-size:11px;border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-tertiary)}",
       ".mkt_badgeOk{border-color:var(--dsw-alias-state-success-primary,#2f855a);color:var(--dsw-alias-state-success-primary,#2f855a)}",
+      ".mkt_badgeBad{border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary)}",
       ".mkt_check{display:flex;align-items:center;gap:4px;font-size:12.5px;color:var(--dsw-alias-label-secondary);cursor:pointer;white-space:nowrap}",
       ".mkt_link{color:var(--dsw-alias-state-business-primary);font-size:12px;text-decoration:none;cursor:pointer}",
       ".mkt_installedHead{display:flex;align-items:center;gap:8px;width:100%;background:none;border:0;padding:0;margin:0;cursor:pointer;font:inherit;text-align:left}",
@@ -141,6 +142,9 @@ window.__ModuleLoader__.load({
     // dsh.bundle/dsh.client 声明，进程内缓存）。unknown 不显示徽章。
     function verifyBadge(verified) {
       if (verified === undefined || verified === null) return null;
+      if (verified.hostDeps !== undefined && verified.hostDeps.length > 0) {
+        return h("span", { className: "mkt_badge mkt_badgeBad", title: verified.hostDeps.join(", ") }, "宿主依赖风险");
+      }
       if (verified.kind === "bundle") return h("span", { className: "mkt_badge mkt_badgeOk" }, "宿主插件");
       if (verified.kind === "client") return h("span", { className: "mkt_badge mkt_badgeOk" }, "UI插件");
       if (verified.kind === "plain") return h("span", { className: "mkt_badge" }, "未声明");
@@ -489,7 +493,8 @@ window.__ModuleLoader__.load({
       var visibleItems = results === null ? [] : results.items.filter(function (it) {
         if (verifiedOnly !== true) return true;
         var v = verified[it.fullName];
-        return v !== undefined && (v.kind === "bundle" || v.kind === "client");
+        return v !== undefined && (v.kind === "bundle" || v.kind === "client")
+          && !(v.hostDeps !== undefined && v.hostDeps.length > 0);
       });
       var verifyPending = results !== null && results.items.some(function (it) { return verified[it.fullName] === undefined; });
 

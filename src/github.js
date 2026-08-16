@@ -137,7 +137,7 @@ export async function npmPackageInfo(name) {
       if (typeof latest === "string") {
         const rawRepository = body?.repository;
         const repositoryUrl = typeof rawRepository === "string" ? rawRepository : rawRepository?.url;
-        info = { latest, repositoryUrl: typeof repositoryUrl === "string" ? repositoryUrl : undefined };
+        info = { latest, repositoryUrl: typeof repositoryUrl === "string" ? repositoryUrl : undefined, hostDeps: hostShadowDependencies(body) };
       }
     }
   } catch {
@@ -164,6 +164,32 @@ export async function preferNpmSpec({ spec }) {
   if (info === null || info.repositoryUrl === undefined) return raw;
   const pointsBack = new RegExp(`github\\.com[/:]${repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(/|\\.git|$)`, "i").test(info.repositoryUrl);
   return pointsBack ? declaredName : raw;
+}
+
+/**
+ * Refuse to install a package whose `dependencies` shadow host framework
+ * packages. Host copies inside a profile split module identities and crash
+ * all tool scheduling — the dsh contract is peerDependencies, but the host
+ * enforces nothing, so the marketplace is the last line of defense.
+ * Sources: registry abbreviated metadata for npm names, the verify cache
+ * (raw package.json) for github: specs.
+ */
+export async function assertSafeToInstall({ spec }) {
+  const raw = String(spec ?? "");
+  let hostDeps;
+  if (/^(?:@[\w.-]+\/)?[\w.-]+$/.test(raw)) {
+    const info = await npmPackageInfo(raw);
+    hostDeps = info?.hostDeps;
+  } else {
+    const match = /^github:([^/\s]+\/[^/\s]+?)(?:\.git)?$/i.exec(raw);
+    if (match !== null) {
+      const { results } = await verifyPlugins({ repos: [match[1]] });
+      hostDeps = results[match[1]]?.hostDeps;
+    }
+  }
+  if (hostDeps !== undefined && hostDeps.length > 0) {
+    throw new Error(`${raw} declares ${hostDeps.length} host framework package(s) as dependencies (${hostDeps.slice(0, 3).join(", ")}${hostDeps.length > 3 ? ", …" : ""}) — installing it would duplicate host modules and crash dsh tool scheduling. Ask the plugin author to move @deepseek-ai/* to peerDependencies.`);
+  }
 }
 
 /** Loose semver-ish comparison: "0.2.10" vs "0.2.9" → 1. Non-numeric parts read as 0. */
@@ -223,9 +249,26 @@ async function fetchRawPackageJson(repo, signal) {
 }
 
 /**
+ * Framework packages the host provides via the profiles/node_modules fallback.
+ * A plugin declaring any of these as `dependencies` (instead of
+ * peerDependencies) installs real copies into the profile — the loader then
+ * holds two module instances, symbol identities split, and every tool call
+ * crashes with an undiagnosable "reading 'prepare'". See installer docs.
+ */
+const HOST_PACKAGES = /^(@deepseek-ai\/|cosmokit$|schemastery$)/;
+
+/** The @deepseek-ai/* (and cordis runtime) entries inside `dependencies`. */
+function hostShadowDependencies(pkg) {
+  if (pkg === undefined || typeof pkg !== "object") return undefined;
+  const deps = Object.keys(pkg.dependencies ?? {});
+  const host = deps.filter((name) => HOST_PACKAGES.test(name));
+  return host.length > 0 ? host : undefined;
+}
+
+/**
  * Verify repositories as real dsh plugins by their package.json declaration.
  * @param {{repos: string[], signal?: AbortSignal}} options - "owner/name" list.
- * @returns the {results} map: fullName -> {kind: "bundle"|"client"|"plain"|"no-manifest"|"unknown", name?, version?}.
+ * @returns the {results} map: fullName -> {kind: "bundle"|"client"|"plain"|"no-manifest"|"unknown", name?, version?, hostDeps?}.
  */
 export async function verifyPlugins({ repos, signal }) {
   const wanted = [...new Set((Array.isArray(repos) ? repos : []).map(String)
@@ -241,7 +284,7 @@ export async function verifyPlugins({ repos, signal }) {
           : typeof pkg.dsh?.bundle?.patch === "string" ? "bundle"
             : pkg.dsh?.client !== undefined ? "client"
               : "plain";
-        verifyCache.set(repo, { kind, name: pkg?.name, version: pkg?.version });
+        verifyCache.set(repo, { kind, name: pkg?.name, version: pkg?.version, hostDeps: hostShadowDependencies(pkg) });
       } catch (error) {
         if (error?.name === "AbortError") throw error;
         verifyCache.set(repo, { kind: "unknown" });

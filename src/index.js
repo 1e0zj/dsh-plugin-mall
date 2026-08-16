@@ -19,7 +19,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
-import { repoInfo, searchPlugins, verifyPlugins, preferNpmSpec, npmPackageInfo, compareVersions } from "./github.js";
+import { repoInfo, searchPlugins, verifyPlugins, preferNpmSpec, npmPackageInfo, compareVersions, assertSafeToInstall } from "./github.js";
 import { ensureProfile, listInstalled, normalizeSpec, runInstall, runRemove, createJobTracker } from "./installer.js";
 
 export const name = "@1e0zj/dsh-plugin-mall";
@@ -212,6 +212,13 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
       // npm tarball 优先（小而快、带 integrity）；registry 条目不同源的包名
       // 视为抢注，回退 github: 全仓库 spec。
       spec = await preferNpmSpec({ spec });
+      // 宿主依赖硬拦：dependencies 里拖着 @deepseek-ai/* 的包装进 profile
+      // 就是双模块实例 + 全工具调度崩溃（宿主无任何护栏，市场是最后防线）。
+      try {
+        await assertSafeToInstall({ spec });
+      } catch (error) {
+        return rpcFail(error);
+      }
       try {
         const profileDir = resolveProfileDir(profile);
         if (!existsSync(join(profileDir, "package.json"))) ensureProfile(profile);
@@ -419,6 +426,7 @@ export function apply(ctx, config = {}) {
     async execute(args, exec) {
       const profile = String(args.profile ?? defaultProfile).trim();
       const spec = await preferNpmSpec({ spec: normalizeSpec(args.spec) });
+      await assertSafeToInstall({ spec });
       let profileDir;
       try {
         profileDir = resolveProfileDir(profile);
