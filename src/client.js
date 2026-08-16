@@ -299,7 +299,11 @@ window.__ModuleLoader__.load({
 
       var call = useCallback(function (endpoint, payload) {
         return rpc.call("/market", endpoint, payload || {}).then(function (res) {
-          if (!res || res.ok !== true) throw new Error((res && res.error) || "market request failed");
+          if (!res || res.ok !== true) {
+            var err = res && res.error;
+            var msg = err && typeof err === "object" ? (err.message || JSON.stringify(err)) : (err || "market request failed");
+            throw new Error(msg);
+          }
           return res.value;
         });
       }, [rpc]);
