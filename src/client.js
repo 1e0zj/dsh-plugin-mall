@@ -351,11 +351,16 @@ window.__ModuleLoader__.load({
       // 无限滚动：哨兵进入视口时拉下一页并追加。GitHub topic 的翻页间数据
       // 可能移动造成重复，按 fullName 去重；已显示数追上 total 即到底。
       var canLoadMore = results !== null && results.items.length < results.total && !reachedLimit;
+      var loadMoreLock = useRef(false);
       var loadMore = useCallback(function () {
         if (!canLoadMore || loading || loadingMore) return;
+        // 同一 tick 内 observer 可能连续触发两次，state 更新不阻塞闭包读值，
+        // 用 ref 做重入闸。
+        if (loadMoreLock.current) return;
         // 限流熔断：失败后 60s 内不再自动请求（哨兵重渲染会反复触发
         // IntersectionObserver，不熔断会连环 500 直到限流窗口过去）。
         if (Date.now() < retryAt) return;
+        loadMoreLock.current = true;
         setLoadingMore(true);
         call("search", { query: query, sort: sort, perPage: 20, page: page + 1 }).then(function (value) {
           if (value.truncated === true) { setReachedLimit(true); return; }
@@ -376,6 +381,7 @@ window.__ModuleLoader__.load({
           setError(errorText(e));
           setRetryAt(Date.now() + 60000);
         }).finally(function () {
+          loadMoreLock.current = false;
           setLoadingMore(false);
         });
       }, [call, canLoadMore, loading, loadingMore, page, query, sort, retryAt]);
@@ -451,7 +457,12 @@ window.__ModuleLoader__.load({
           var tries = 0;
           var ping = setInterval(function () {
             tries++;
-            if (tries > 40) { clearInterval(ping); return; }
+            if (tries > 40) {
+              clearInterval(ping);
+              setRestarting(false);
+              setError("2 分钟内未检测到 dsh 重启完成，请手动检查 dsh 状态后刷新页面。");
+              return;
+            }
             rpc.call("/market", "installed", {}).then(function () {
               clearInterval(ping);
               window.location.reload();

@@ -1,6 +1,8 @@
 // GitHub API helpers for the dsh plugin marketplace.
 // Pure functions with no harness imports, so this module is unit-testable
 // standalone (node src/github.js --self-test).
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 const SEARCH_TOPIC = "topic:dsh-plugin";
 /** GitHub search never serves past the first 1000 results. */
@@ -116,34 +118,41 @@ export async function searchPlugins({ query, sort = "stars", perPage = 10, page 
 // to the explicit github: spec).
 
 const NPM_REGISTRY = "https://registry.npmjs.org";
-const npmCache = new Map(); // name -> {latest, repositoryUrl} | null (unknown/not found)
+const npmCache = new Map(); // name -> {info, at} — null misses expire after 5 min
 
 /**
- * Look up a package on the npm registry (abbreviated metadata). Cached for
- * the process lifetime; null means "not on npm / unreachable".
+ * Look up a package on the npm registry (abbreviated metadata). Successful
+ * lookups cache for the process lifetime; "not found / unreachable" (null)
+ * expires after 5 minutes so a transient registry failure self-heals.
  */
 export async function npmPackageInfo(name) {
   const clean = String(name ?? "").trim();
   if (clean.length === 0 || !/^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/i.test(clean)) return null;
-  if (npmCache.has(clean)) return npmCache.get(clean);
+  const cached = npmCache.get(clean);
+  if (cached !== undefined && (cached.info !== null || Date.now() - cached.at < 300000)) return cached.info;
   let info = null;
   try {
-    const response = await fetch(`${NPM_REGISTRY}/${clean.replace("/", "%2F")}`, {
-      headers: { "User-Agent": "dsh-plugin-mall", Accept: "application/vnd.npm.install-v1+json" },
+    // 单版本端点返回 latest 的完整 manifest（dependencies + repository 都在）。
+    // abbreviated packument 不含 repository，防抢注比对会永远落空。
+    const response = await fetch(`${NPM_REGISTRY}/${clean.replace("/", "%2F")}/latest`, {
+      headers: { "User-Agent": "dsh-plugin-mall", Accept: "application/json" },
     });
     if (response.ok) {
       const body = await response.json();
-      const latest = body?.["dist-tags"]?.latest;
-      if (typeof latest === "string") {
-        const rawRepository = body?.repository;
+      if (typeof body?.version === "string") {
+        const rawRepository = body.repository;
         const repositoryUrl = typeof rawRepository === "string" ? rawRepository : rawRepository?.url;
-        info = { latest, repositoryUrl: typeof repositoryUrl === "string" ? repositoryUrl : undefined, hostDeps: hostShadowDependencies(body) };
+        info = {
+          latest: body.version,
+          repositoryUrl: typeof repositoryUrl === "string" ? repositoryUrl : undefined,
+          hostDeps: hostShadowDependencies(body),
+        };
       }
     }
   } catch {
     info = null; // registry unreachable — caller falls back
   }
-  npmCache.set(clean, info);
+  npmCache.set(clean, { info, at: Date.now() });
   return info;
 }
 
@@ -174,25 +183,56 @@ export async function preferNpmSpec({ spec }) {
  * Sources: registry abbreviated metadata for npm names, the verify cache
  * (raw package.json) for github: specs.
  */
+/**
+ * Extract the bare npm package name: "name", "name@version", "@s/n@version"
+ * → "name"/"@s/n". Returns null for anything that is not an npm name shape.
+ */
+function npmNameOf(raw) {
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  if (raw.startsWith("@")) {
+    const match = /^(@[^/@\s]+\/[^/@\s]+?)(?:@[^/\s]+)?$/.exec(raw);
+    return match === null ? null : match[1];
+  }
+  const match = /^([^@\s]+?)(?:@[^/\s]+)?$/.exec(raw);
+  return match === null ? null : match[1];
+}
+
 export async function assertSafeToInstall({ spec }) {
   const raw = String(spec ?? "");
   let hostDeps;
-  if (/^(?:@[\w.-]+\/)?[\w.-]+$/.test(raw)) {
-    const info = await npmPackageInfo(raw);
-    hostDeps = info?.hostDeps;
-  } else {
-    const match = /^github:([^/\s]+\/[^/\s]+?)(?:\.git)?$/i.exec(raw);
-    if (match !== null) {
-      const { results } = await verifyPlugins({ repos: [match[1]] });
-      hostDeps = results[match[1]]?.hostDeps;
+  if (/^(?:file:|link:)/i.test(raw)) {
+    // 本地路径直通：直接读它的 package.json 查 dependencies。
+    const dir = raw.replace(/^(?:file:|link:)/i, "").replace(/[\\/]+$/, "");
+    try {
+      const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+      hostDeps = hostShadowDependencies(pkg);
+    } catch {
+      return; // 读不到清单——pnpm 会给出真实错误，这里放行
     }
+  } else if (/^github:([^/\s]+\/[^/\s]+?)(?:\.git)?(?:#.+)?$/i.test(raw)) {
+    const repo = /^github:([^/\s]+\/[^/\s]+?)(?:\.git)?(?:#.+)?$/i.exec(raw)[1];
+    const { results } = await verifyPlugins({ repos: [repo] });
+    hostDeps = results[repo]?.hostDeps;
+  } else if (/^https?:\/\//i.test(raw)) {
+    return; // 远程 tarball 下载前无法廉价检查；罕见路径，放行
+  } else {
+    // npm 名（含带版本形式）：剥掉 @version 再查。
+    const name = npmNameOf(raw);
+    if (name === null || name.length === 0) {
+      // 无法识别形状的 spec 一律拒绝，而不是静默跳过检查。
+      throw new Error(`cannot analyze install spec ${JSON.stringify(raw)} for host-shadow dependencies — refusing to install`);
+    }
+    const info = await npmPackageInfo(name);
+    hostDeps = info?.hostDeps;
   }
-  if (hostDeps !== undefined && hostDeps.length > 0) {
+  if (hostDeps !== undefined && hostDeps !== null && hostDeps.length > 0) {
     throw new Error(`${raw} declares ${hostDeps.length} host framework package(s) as dependencies (${hostDeps.slice(0, 3).join(", ")}${hostDeps.length > 3 ? ", …" : ""}) — installing it would duplicate host modules and crash dsh tool scheduling. Ask the plugin author to move @deepseek-ai/* to peerDependencies.`);
   }
 }
 
-/** Loose semver-ish comparison: "0.2.10" vs "0.2.9" → 1. Non-numeric parts read as 0. */
+/** Loose semver-ish comparison: "0.2.10" vs "0.2.9" → 1. Non-numeric parts
+ *  read as 0; numerically equal versions where one carries a pre-release
+ *  segment ("-rc.1") sort below the plain release ("2.0.0-beta" < "2.0.0"). */
 export function compareVersions(a, b) {
   const pa = String(a ?? "").split(".");
   const pb = String(b ?? "").split(".");
@@ -201,6 +241,9 @@ export function compareVersions(a, b) {
     const nb = Number(pb[index]) || 0;
     if (na !== nb) return na < nb ? -1 : 1;
   }
+  const preA = String(a ?? "").includes("-");
+  const preB = String(b ?? "").includes("-");
+  if (preA !== preB) return preA ? -1 : 1;
   return 0;
 }
 // ── plugin verification (raw CDN, no API quota) ─────────────────────────────
@@ -273,7 +316,12 @@ function hostShadowDependencies(pkg) {
 export async function verifyPlugins({ repos, signal }) {
   const wanted = [...new Set((Array.isArray(repos) ? repos : []).map(String)
     .filter((repo) => /^[^/\s]+\/[^/\s]+$/.test(repo) && !repo.includes("..")))];
-  const pending = wanted.filter((repo) => !verifyCache.has(repo));
+  // "unknown"（网络失败）60s 后过期重试；成功结果进程内永久缓存。
+  const pending = wanted.filter((repo) => {
+    const cached = verifyCache.get(repo);
+    if (cached === undefined) return true;
+    return cached.kind === "unknown" && Date.now() - (cached.ts ?? 0) > 60000;
+  });
   let cursor = 0;
   const worker = async () => {
     while (cursor < pending.length) {
@@ -287,13 +335,18 @@ export async function verifyPlugins({ repos, signal }) {
         verifyCache.set(repo, { kind, name: pkg?.name, version: pkg?.version, hostDeps: hostShadowDependencies(pkg) });
       } catch (error) {
         if (error?.name === "AbortError") throw error;
-        verifyCache.set(repo, { kind: "unknown" });
+        verifyCache.set(repo, { kind: "unknown", ts: Date.now() });
       }
     }
   };
   await Promise.all(Array.from({ length: Math.min(VERIFY_CONCURRENCY, pending.length) }, worker));
   const results = {};
-  for (const repo of wanted) results[repo] = verifyCache.get(repo) ?? { kind: "unknown" };
+  for (const repo of wanted) {
+    const cached = verifyCache.get(repo);
+    results[repo] = cached === undefined || cached.ts !== undefined
+      ? { kind: cached?.kind ?? "unknown", name: cached?.name, version: cached?.version, hostDeps: cached?.hostDeps }
+      : cached;
+  }
   return { results };
 }
 

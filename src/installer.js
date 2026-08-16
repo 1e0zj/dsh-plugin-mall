@@ -361,6 +361,20 @@ export function createJobTracker() {
   };
 }
 
+// ── spec shape guard ────────────────────────────────────────────────────────
+
+// Windows spawn 走 shell，spec 会被拼进 cmd 行；agent 传入的参数不可信。
+// 合法的 npm 名 / github:owner\/repo / git·file·link·URL spec 都不含这些
+// shell 元字符——出现即拒绝，宁可误杀不放开命令注入面。
+const UNSAFE_SPEC_RE = /[;&|`$()<>^"!*\n\r]/;
+
+/** Reject install/remove specs carrying shell metacharacters. */
+export function assertSafeSpec(spec) {
+  if (UNSAFE_SPEC_RE.test(String(spec ?? ""))) {
+    throw new Error(`spec contains characters that are not allowed in an install spec: ${JSON.stringify(String(spec))}`);
+  }
+}
+
 // ── pnpm self-heal (corepack) ───────────────────────────────────────────────
 
 /**
@@ -565,10 +579,12 @@ export function runRemove({ profile, packageName }, selfHealed = false) {
     proc.on("close", (exitCode) => resolve({ exitCode, signal: proc.signalCode }));
   }).then(async (outcome) => {
     if (outcome.spawnError !== undefined) {
-      // pnpm 缺失时先 corepack 自愈一次再重试（重试在新 producer 里跑）。
+      // pnpm 缺失时先 corepack 自愈一次再重试（重试在新 producer 里跑，
+      // 这里必须返回它的 done outcome——返回 producer 本体会让 tracker
+      // 把成功任务记成 failed）。
       if (outcome.spawnError.code === "ENOENT" && selfHealed !== true) {
-        const healed = await enablePnpmViaCorepack(() => {});
-        if (healed) return runRemove({ profile, packageName }, true);
+        const healed = await enablePnpmViaCorepack(push);
+        if (healed) return await runRemove({ profile, packageName }, true).done;
       }
       const hint = outcome.spawnError.code === "ENOENT"
         ? "pnpm not found on PATH — install pnpm (e.g. `corepack enable pnpm`) to manage profile plugins"

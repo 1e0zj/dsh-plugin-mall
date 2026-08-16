@@ -20,7 +20,7 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
 import { repoInfo, searchPlugins, verifyPlugins, preferNpmSpec, npmPackageInfo, compareVersions, assertSafeToInstall } from "./github.js";
-import { ensureProfile, listInstalled, normalizeSpec, runInstall, runRemove, createJobTracker } from "./installer.js";
+import { ensureProfile, listInstalled, normalizeSpec, runInstall, runRemove, createJobTracker, assertSafeSpec } from "./installer.js";
 
 export const name = "@1e0zj/dsh-plugin-mall";
 export const inject = ["tools", "jobs", "systemPrompt"];
@@ -206,6 +206,7 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
       let spec;
       try {
         spec = normalizeSpec(payload?.spec);
+        assertSafeSpec(spec);
       } catch (error) {
         return rpcFail(error);
       }
@@ -236,6 +237,11 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
       const profile = String(payload?.profile ?? defaultProfile).trim();
       const packageName = String(payload?.package ?? "").trim();
       if (packageName.length === 0) return rpcFail(new Error("uninstall: package name is required"));
+      try {
+        assertSafeSpec(packageName);
+      } catch (error) {
+        return rpcFail(error);
+      }
       try {
         const profileDir = resolveProfileDir(profile);
         if (!existsSync(join(profileDir, "package.json"))) {
@@ -274,7 +280,7 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
         : `sleep 2 && ${relaunch}`;
       const child = spawn(launcher, { shell: true, detached: true, stdio: "ignore", cwd: process.cwd(), windowsHide: true });
       child.unref();
-      setTimeout(() => process.exit(0), 800);
+      setTimeout(() => process.exit(0), 1500);
       return rpcOk({ restarting: true });
     }
     case "jobCancel": {
@@ -425,7 +431,9 @@ export function apply(ctx, config = {}) {
     },
     async execute(args, exec) {
       const profile = String(args.profile ?? defaultProfile).trim();
-      const spec = await preferNpmSpec({ spec: normalizeSpec(args.spec) });
+      const normalized = normalizeSpec(args.spec);
+      assertSafeSpec(normalized);
+      const spec = await preferNpmSpec({ spec: normalized });
       await assertSafeToInstall({ spec });
       let profileDir;
       try {
@@ -481,6 +489,7 @@ export function apply(ctx, config = {}) {
       const profile = String(args.profile ?? defaultProfile).trim();
       const packageName = String(args.package ?? "").trim();
       if (packageName.length === 0) throw new Error("market_uninstall: package name is required");
+      assertSafeSpec(packageName);
       try {
         resolveProfileDir(profile);
       } catch (error) {
