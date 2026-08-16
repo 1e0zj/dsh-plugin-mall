@@ -148,7 +148,7 @@ window.__ModuleLoader__.load({
       var installing = props.installing === true;
       var job = props.installJob;
       var installLabel = props.alreadyInstalled === true ? "已装" : "安装";
-      var installDisabled = installing;
+      var installDisabled = installing || props.alreadyInstalled === true;
       if (!installing && job) {
         if (job.status === "running") { installLabel = "安装中…"; installDisabled = true; }
         else if (job.status === "completed") { installLabel = "已装 · 重启生效"; installDisabled = true; }
