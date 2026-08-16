@@ -361,6 +361,35 @@ export function createJobTracker() {
   };
 }
 
+// ── pnpm self-heal (corepack) ───────────────────────────────────────────────
+
+/**
+ * Try to provision pnpm once via `corepack enable pnpm` (corepack ships with
+ * Node). Output lands in the caller's job log; returns whether a retry of the
+ * pnpm spawn is worth attempting.
+ */
+async function enablePnpmViaCorepack(push) {
+  push("\n[dsh-plugin-mall] pnpm not found on PATH — trying `corepack enable pnpm` once\n");
+  return await new Promise((resolve) => {
+    let proc;
+    try {
+      proc = spawn("corepack", ["enable", "pnpm"], {
+        env: process.env,
+        shell: process.platform === "win32",
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+    } catch {
+      resolve(false);
+      return;
+    }
+    proc.on("error", () => resolve(false));
+    proc.stdout?.on("data", (data) => push(data.toString()));
+    proc.stderr?.on("data", (data) => push(data.toString()));
+    proc.on("close", (code) => resolve(code === 0));
+  });
+}
+
 // ── the background install job ──────────────────────────────────────────────
 
 /**
@@ -381,6 +410,7 @@ export function runInstall({ profile, spec }) {
     deltaQueue.push(text);
   };
   let current = undefined;
+  let pnpmSelfHealed = false;
 
   const spawnAdd = () => {
     const proc = spawn("pnpm", ["add", spec, "--reporter=append-only"], {
@@ -427,6 +457,17 @@ export function runInstall({ profile, spec }) {
 
   const settle = async (outcome) => {
     if (outcome.spawnError !== undefined) {
+      // pnpm 缺失时先尝试 corepack 自愈一次，成功则重跑安装。
+      if (outcome.spawnError.code === "ENOENT" && !pnpmSelfHealed) {
+        pnpmSelfHealed = true;
+        const healed = await enablePnpmViaCorepack(push);
+        if (healed) {
+          const retry = spawnAdd();
+          current = retry.proc;
+          return settle(await retry.done);
+        }
+        return { status: "failed", detail: "pnpm not found on PATH and `corepack enable pnpm` could not provision it — install pnpm (e.g. `npm i -g pnpm`) to manage profile plugins" };
+      }
       const hint = outcome.spawnError.code === "ENOENT"
         ? "pnpm not found on PATH — install pnpm (e.g. `corepack enable pnpm`) to manage profile plugins"
         : `could not start pnpm: ${outcome.spawnError.message}`;
@@ -490,7 +531,7 @@ function failedNow(detail) {
  * `dsh.profile.bundles` (the removed dependency's bundle entry drops out) and
  * deletes the client loader row `ensureClientRow` had registered for it.
  */
-export function runRemove({ profile, packageName }) {
+export function runRemove({ profile, packageName }, selfHealed = false) {
   let profileDir;
   try {
     profileDir = resolveProfileDir(profile);
@@ -522,8 +563,13 @@ export function runRemove({ profile, packageName }) {
   const done = new Promise((resolve) => {
     proc.on("error", (error) => resolve({ spawnError: error }));
     proc.on("close", (exitCode) => resolve({ exitCode, signal: proc.signalCode }));
-  }).then((outcome) => {
+  }).then(async (outcome) => {
     if (outcome.spawnError !== undefined) {
+      // pnpm 缺失时先 corepack 自愈一次再重试（重试在新 producer 里跑）。
+      if (outcome.spawnError.code === "ENOENT" && selfHealed !== true) {
+        const healed = await enablePnpmViaCorepack(() => {});
+        if (healed) return runRemove({ profile, packageName }, true);
+      }
       const hint = outcome.spawnError.code === "ENOENT"
         ? "pnpm not found on PATH — install pnpm (e.g. `corepack enable pnpm`) to manage profile plugins"
         : `could not start pnpm: ${outcome.spawnError.message}`;

@@ -40,6 +40,8 @@ window.__ModuleLoader__.load({
       ".mkt_name{font-size:13.5px;font-weight:600;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}",
       ".mkt_meta{font-size:12px;color:var(--dsw-alias-label-tertiary)}",
       ".mkt_desc{font-size:12.5px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}",
+      ".mkt_descTip{position:relative;cursor:default}",
+      ".mkt_descTip:hover::after{content:attr(data-full);position:absolute;left:0;top:100%;margin-top:6px;background:var(--dsw-alias-bg-primary,#fff);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:8px 10px;font-size:12.5px;line-height:18px;color:var(--dsw-alias-label-secondary);max-width:520px;width:max-content;white-space:normal;overflow-wrap:anywhere;box-shadow:0 4px 14px rgba(0,0,0,.14);z-index:40}",
       ".mkt_cardActions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:auto;padding-top:4px}",
       ".mkt_cardActions .mkt_btn{text-decoration:none}",
       ".mkt_panelTitle{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary);margin:0}",
@@ -161,7 +163,7 @@ window.__ModuleLoader__.load({
           verifyBadge(props.verified),
           item.archived ? h("span", { className: "mkt_badge" }, "archived") : null
         ),
-        item.description ? h("div", { className: "mkt_desc" }, clip(item.description, 180)) : null,
+        item.description ? h("div", { className: "mkt_desc mkt_descTip", "data-full": item.description }, clip(item.description, 180)) : null,
         h("div", { className: "mkt_metaRow" },
           h("span", { className: "mkt_meta" }, "★" + item.stars),
           item.language ? h("span", { className: "mkt_meta" }, item.language) : null,
@@ -293,6 +295,9 @@ window.__ModuleLoader__.load({
       var _retryAt = useState(0);
       var retryAt = _retryAt[0];
       var setRetryAt = _retryAt[1];
+      var _restarting = useState(false);
+      var restarting = _restarting[0];
+      var setRestarting = _restarting[1];
 
       var call = useCallback(function (endpoint, payload) {
         return rpc.call("/market", endpoint, payload || {}).then(function (res) {
@@ -418,6 +423,30 @@ window.__ModuleLoader__.load({
         doInstallSpec("github:" + repo);
       }, [doInstallSpec]);
 
+      // 一键重启：loopback-only 的 /market restart 端点会 detached 拉起新的
+      // dsh 进程后退出当前进程；这里轮询 host 恢复后自动刷新页面。
+      var doRestart = useCallback(function () {
+        if (typeof window !== "undefined" && typeof window.confirm === "function") {
+          if (window.confirm("重启 dsh？正在进行的任务会中断。") !== true) return;
+        }
+        setRestarting(true);
+        setError(null);
+        call("restart", {}).then(function () {
+          var tries = 0;
+          var ping = setInterval(function () {
+            tries++;
+            if (tries > 40) { clearInterval(ping); return; }
+            rpc.call("/market", "installed", {}).then(function () {
+              clearInterval(ping);
+              window.location.reload();
+            }).catch(function () { /* host 还在重启，继续等 */ });
+          }, 3000);
+        }).catch(function (e) {
+          setRestarting(false);
+          setError(errorText(e));
+        });
+      }, [call, rpc]);
+
       var doUninstall = useCallback(function (name) {
         setRemoving(function (prev) {
           var next = Object.assign({}, prev, { [name]: true });
@@ -478,6 +507,7 @@ window.__ModuleLoader__.load({
           ),
           h("button", { className: "mkt_btn mkt_btnPrimary", disabled: loading, onClick: doSearch }, loading ? "搜索中…" : "搜索"),
           h("button", { className: "mkt_btn", onClick: refreshInstalled }, "刷新已装"),
+          h("button", { className: "mkt_btn mkt_btnDanger", disabled: restarting, onClick: doRestart }, restarting ? "重启中…" : "重启 dsh"),
           h("label", { className: "mkt_check" },
             h("input", { type: "checkbox", checked: verifiedOnly, onChange: function (e) { setVerifiedOnly(e.target.checked); } }),
             "只看已验证插件")

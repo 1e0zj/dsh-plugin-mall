@@ -17,6 +17,7 @@ import z from "@deepseek-ai/schemastery";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
 import { resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
 import { repoInfo, searchPlugins, verifyPlugins, preferNpmSpec, npmPackageInfo, compareVersions } from "./github.js";
 import { ensureProfile, listInstalled, normalizeSpec, runInstall, runRemove, createJobTracker } from "./installer.js";
@@ -28,6 +29,7 @@ export const Config = z.object({
   defaultProfile: z.string().default("web"),
   apiBase: z.string().default("https://api.github.com"),
   perPageMax: z.number().default(30),
+  allowRestart: z.boolean().default(true),
 });
 
 /** Clip long strings for compact model-facing output. */
@@ -145,7 +147,7 @@ function rpcFail(error) {
  * @returns the {ok, value|error} envelope.
  */
 async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
-  const { defaultProfile = "web", apiBase = "https://api.github.com", perPageMax = 30 } = config;
+  const { defaultProfile = "web", apiBase = "https://api.github.com", perPageMax = 30, allowRestart = true } = config;
   switch (endpoint) {
     case "search": {
       const perPage = Math.min(Math.max(Math.trunc(payload?.perPage ?? 10) || 10, 1), Math.trunc(perPageMax) || 30);
@@ -245,6 +247,25 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
       } catch (error) {
         return rpcFail(error);
       }
+    }
+    case "restart": {
+      // 一键重启：detached 拉起新 dsh 进程（用当前进程的 argv 重建启动命令）
+      // 后退出自己。仅 loopback 直连可调（channel 级 authority 已限制）；
+      // allowRestart:false 时禁用（进程由 systemd/pm2 等托管时接管重启）。
+      if (allowRestart !== true) return rpcFail(new Error("restart disabled by config (allowRestart: false)"));
+      const script = process.argv[1];
+      const scriptArgs = process.argv.slice(2);
+      if (typeof script !== "string" || script.length === 0 || !existsSync(script)) {
+        return rpcFail(new Error("cannot determine the dsh launch command for an automatic restart — please restart manually"));
+      }
+      const relaunch = `"${process.execPath}" "${script}"${scriptArgs.length > 0 ? ` ${scriptArgs.map((arg) => `"${arg}"`).join(" ")}` : ""}`;
+      const launcher = process.platform === "win32"
+        ? `timeout /t 2 /nobreak >nul & ${relaunch}`
+        : `sleep 2 && ${relaunch}`;
+      const child = spawn(launcher, { shell: true, detached: true, stdio: "ignore", cwd: process.cwd(), windowsHide: true });
+      child.unref();
+      setTimeout(() => process.exit(0), 800);
+      return rpcOk({ restarting: true });
     }
     case "jobCancel": {
       try {
