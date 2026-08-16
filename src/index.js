@@ -130,9 +130,10 @@ function rpcOk(value) {
 }
 
 function rpcFail(error) {
-  // dsh 的 connection RPC 对响应信封有校验：error 必须是 object（string 会
-  // 被 zod union 拒掉，抛 invalid_union 掩盖真实错误）。
-  return { ok: false, error: { message: error?.message ?? String(error) } };
+  // dsh connection RPC 的响应信封校验（dsh-client-connection rpcResultSchema）
+  // 要求 error 为 discriminated object：{code, message, details}。code 取
+  // 通用 "internal"，否则整条错误会被 zod 以 invalid_union 吞掉。
+  return { ok: false, error: { code: "internal", message: error?.message ?? String(error), details: {} } };
 }
 
 /**
