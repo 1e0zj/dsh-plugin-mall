@@ -33,6 +33,7 @@ window.__ModuleLoader__.load({
       ".mkt_list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;align-items:stretch;min-width:0}",
       "@media (max-width:820px){.mkt_list{grid-template-columns:minmax(0,1fr)}}",
       ".mkt_listHead{grid-column:1/-1;font-size:12px;color:var(--dsw-alias-label-tertiary)}",
+      ".mkt_loadMore{grid-column:1/-1;text-align:center;font-size:12px;color:var(--dsw-alias-label-tertiary);padding:10px 0}",
       ".mkt_card{border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:10px 12px;background:var(--dsw-alias-bg-primary,#fff);display:flex;flex-direction:column;gap:6px;min-width:0}",
       ".mkt_cardHead{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}",
       ".mkt_name{font-size:13.5px;font-weight:600;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}",
@@ -44,12 +45,15 @@ window.__ModuleLoader__.load({
       ".mkt_pre{font-family:Consolas,Monaco,monospace;font-size:11.5px;line-height:16px;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-secondary,#f6f7f8);border-radius:6px;padding:8px;max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-all}",
       ".mkt_ok{color:var(--dsw-alias-state-success-primary,#2f855a)}",
       ".mkt_badge{display:inline-block;border-radius:999px;padding:1px 8px;font-size:11px;border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-tertiary)}",
+      ".mkt_badgeOk{border-color:var(--dsw-alias-state-success-primary,#2f855a);color:var(--dsw-alias-state-success-primary,#2f855a)}",
+      ".mkt_check{display:flex;align-items:center;gap:4px;font-size:12.5px;color:var(--dsw-alias-label-secondary);cursor:pointer;white-space:nowrap}",
       ".mkt_link{color:var(--dsw-alias-state-business-primary);font-size:12px;text-decoration:none;cursor:pointer}",
       ".mkt_installedHead{display:flex;align-items:center;gap:8px;width:100%;background:none;border:0;padding:0;margin:0;cursor:pointer;font:inherit;text-align:left}",
       ".mkt_installedHead:hover .mkt_panelTitle{color:var(--dsw-alias-state-business-primary)}",
       ".mkt_installedToggle{margin-left:auto}",
       ".mkt_depList{display:flex;flex-direction:column;gap:6px;margin-top:8px}",
       ".mkt_depRow{display:flex;justify-content:space-between;align-items:center;gap:8px}",
+      ".mkt_depActions{display:flex;align-items:center;gap:6px;flex-wrap:wrap}",
     ].join("\n");
     var tagId = "@1e0zj/dsh-plugin-mall/market-tab.css";
     if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId) + "]") === null) {
@@ -125,6 +129,18 @@ window.__ModuleLoader__.load({
       return { jobs: jobs, track: track };
     }
 
+    // ── plugin verification badge ───────────────────────────────────────────
+    // verified 来自 /market verify 端点（node 侧拉 raw package.json 判定
+    // dsh.bundle/dsh.client 声明，进程内缓存）。unknown 不显示徽章。
+    function verifyBadge(verified) {
+      if (verified === undefined || verified === null) return null;
+      if (verified.kind === "bundle") return h("span", { className: "mkt_badge mkt_badgeOk" }, "✓ 宿主插件");
+      if (verified.kind === "client") return h("span", { className: "mkt_badge mkt_badgeOk" }, "✓ UI插件");
+      if (verified.kind === "plain") return h("span", { className: "mkt_badge" }, "未声明");
+      if (verified.kind === "no-manifest") return h("span", { className: "mkt_badge" }, "无package.json");
+      return null;
+    }
+
     // ── repo card ───────────────────────────────────────────────────────────
     function RepoCard(props) {
       var item = props.item;
@@ -141,6 +157,7 @@ window.__ModuleLoader__.load({
       return h("div", { className: "mkt_card" },
         h("div", { className: "mkt_cardHead" },
           h("span", { className: "mkt_name" }, item.fullName),
+          verifyBadge(props.verified),
           h("span", { className: "mkt_meta" }, "★" + item.stars),
           item.language ? h("span", { className: "mkt_meta" }, item.language) : null,
           item.license ? h("span", { className: "mkt_meta" }, item.license) : null,
@@ -206,14 +223,20 @@ window.__ModuleLoader__.load({
             ? h("div", { className: "mkt_meta" }, "还没有装过插件")
             : h("div", { className: "mkt_depList" }, (installed.deps || []).map(function (dep) {
               var busy = (props.removing || {})[dep.name] === true;
+              var upd = (props.updates || {})[dep.name];
               return h("div", { key: dep.name, className: "mkt_depRow" },
                 h("span", { className: "mkt_desc" }, dep.name + "@" + dep.version),
-                h("span", { className: "mkt_badge" }, kindLabel(dep.kind)),
-                h("button", {
-                  className: "mkt_btn mkt_btnDanger mkt_btnSm",
-                  disabled: busy,
-                  onClick: function () { props.onUninstall(dep.name); },
-                }, busy ? "卸载中…" : "卸载"));
+                h("span", { className: "mkt_depActions" },
+                  h("span", { className: "mkt_badge" }, kindLabel(dep.kind)),
+                  upd && upd.hasUpdate ? h("button", {
+                    className: "mkt_btn mkt_btnSm",
+                    onClick: function () { props.onInstallSpec(dep.name); },
+                  }, "更新 → " + upd.latest) : null,
+                  h("button", {
+                    className: "mkt_btn mkt_btnDanger mkt_btnSm",
+                    disabled: busy,
+                    onClick: function () { props.onUninstall(dep.name); },
+                  }, busy ? "卸载中…" : "卸载")));
             }))
       );
     }
@@ -245,6 +268,22 @@ window.__ModuleLoader__.load({
       var _removing = useState({});
       var removing = _removing[0];
       var setRemoving = _removing[1];
+      var _page = useState(1);
+      var page = _page[0];
+      var setPage = _page[1];
+      var _loadingMore = useState(false);
+      var loadingMore = _loadingMore[0];
+      var setLoadingMore = _loadingMore[1];
+      var sentinelRef = useRef(null);
+      var _verified = useState({});
+      var verified = _verified[0];
+      var setVerified = _verified[1];
+      var _verifiedOnly = useState(false);
+      var verifiedOnly = _verifiedOnly[0];
+      var setVerifiedOnly = _verifiedOnly[1];
+      var _updates = useState(null);
+      var updates = _updates[0];
+      var setUpdates = _updates[1];
 
       var call = useCallback(function (endpoint, payload) {
         return rpc.call("/market", endpoint, payload || {}).then(function (res) {
@@ -253,21 +292,75 @@ window.__ModuleLoader__.load({
         });
       }, [rpc]);
 
+      // 每页搜索结果到货后批量验证（node 侧 raw CDN，带缓存），失败静默——
+      // 徽章缺失可接受，不该打断浏览。
+      var verifyPage = useCallback(function (items) {
+        var repos = (items || []).map(function (it) { return it.fullName; });
+        if (repos.length === 0) return;
+        call("verify", { repos: repos }).then(function (value) {
+          setVerified(function (prev) { return Object.assign({}, prev, value.results); });
+        }).catch(function () { /* 徽章缺失即可 */ });
+      }, [call]);
+
       var doSearch = useCallback(function () {
         setLoading(true);
         setError(null);
+        setPage(1);
         call("search", { query: query, sort: sort, perPage: 20 }).then(function (value) {
           setResults(value);
+          setVerified({});
+          verifyPage(value.items);
         }).catch(function (e) {
           setError(errorText(e));
         }).finally(function () {
           setLoading(false);
         });
-      }, [call, query, sort]);
+      }, [call, query, sort, verifyPage]);
+
+      // 无限滚动：哨兵进入视口时拉下一页并追加。GitHub topic 的翻页间数据
+      // 可能移动造成重复，按 fullName 去重；已显示数追上 total 即到底。
+      var canLoadMore = results !== null && results.items.length < results.total;
+      var loadMore = useCallback(function () {
+        if (!canLoadMore || loading || loadingMore) return;
+        setLoadingMore(true);
+        call("search", { query: query, sort: sort, perPage: 20, page: page + 1 }).then(function (value) {
+          setPage(page + 1);
+          verifyPage(value.items);
+          setResults(function (prev) {
+            if (prev === null) return value;
+            var seen = {};
+            var merged = [];
+            prev.items.concat(value.items).forEach(function (it) {
+              if (seen[it.fullName] === true) return;
+              seen[it.fullName] = true;
+              merged.push(it);
+            });
+            return { total: value.total, items: merged };
+          });
+        }).catch(function (e) {
+          setError(errorText(e));
+        }).finally(function () {
+          setLoadingMore(false);
+        });
+      }, [call, canLoadMore, loading, loadingMore, page, query, sort]);
+
+      useEffect(function () {
+        var node = sentinelRef.current;
+        if (node === null || node === undefined) return undefined;
+        if (typeof IntersectionObserver === "undefined") return undefined;
+        var observer = new IntersectionObserver(function (entries) {
+          for (var index = 0; index < entries.length; index++) {
+            if (entries[index].isIntersecting) { loadMore(); break; }
+          }
+        }, { rootMargin: "300px" });
+        observer.observe(node);
+        return function () { observer.disconnect(); };
+      }, [loadMore]);
 
       var refreshInstalled = useCallback(function () {
         call("installed", {}).then(function (value) {
           setInstalled(value);
+          call("updates", {}).then(setUpdates).catch(function () { setUpdates(null); });
         }).catch(function (e) {
           setInstalled({ error: errorText(e) });
         });
@@ -283,10 +376,12 @@ window.__ModuleLoader__.load({
         // eslint-disable-next-line react-hooks/exhaustive-deps
       }, []);
 
-      var doInstall = useCallback(function (repo) {
-        var spec = "github:" + repo;
+      // 通用安装入口：spec 可以是 github:owner/repo（卡片按钮）或 npm 包名
+      // （已装面板的更新按钮）。后端会把同源发布的 github spec 改写为 npm
+      // tarball 安装（更快），job 里记录的是最终 spec。
+      var doInstallSpec = useCallback(function (spec) {
         setInstalling(function (prev) {
-          var next = Object.assign({}, prev, { [repo]: true });
+          var next = Object.assign({}, prev, { [spec]: true });
           return next;
         });
         setError(null);
@@ -297,11 +392,15 @@ window.__ModuleLoader__.load({
         }).finally(function () {
           setInstalling(function (prev) {
             var next = Object.assign({}, prev);
-            delete next[repo];
+            delete next[spec];
             return next;
           });
         });
       }, [call, track]);
+
+      var doInstall = useCallback(function (repo) {
+        doInstallSpec("github:" + repo);
+      }, [doInstallSpec]);
 
       var doUninstall = useCallback(function (name) {
         setRemoving(function (prev) {
@@ -330,6 +429,13 @@ window.__ModuleLoader__.load({
       var jobsActive = false;
       for (var jid in jobs) { if (jobs[jid] && jobs[jid].status === "running") { jobsActive = true; break; } }
 
+      // "只看已验证"开关下的可见项：verify 判定 bundle/client 的才算插件。
+      var visibleItems = results === null ? [] : results.items.filter(function (it) {
+        if (verifiedOnly !== true) return true;
+        var v = verified[it.fullName];
+        return v !== undefined && (v.kind === "bundle" || v.kind === "client");
+      });
+
       return h("div", { className: "mkt_root" },
         h("div", { className: "mkt_head" },
           h("div", { className: "mkt_title" }, "插件市场"),
@@ -353,10 +459,13 @@ window.__ModuleLoader__.load({
             h("option", { value: "forks" }, "按 fork")
           ),
           h("button", { className: "mkt_btn mkt_btnPrimary", disabled: loading, onClick: doSearch }, loading ? "搜索中…" : "搜索"),
-          h("button", { className: "mkt_btn", onClick: refreshInstalled }, "刷新已装")
+          h("button", { className: "mkt_btn", onClick: refreshInstalled }, "刷新已装"),
+          h("label", { className: "mkt_check" },
+            h("input", { type: "checkbox", checked: verifiedOnly, onChange: function (e) { setVerifiedOnly(e.target.checked); } }),
+            "只看已验证")
         ),
         error ? h("div", { className: "mkt_error" }, error) : null,
-        h(InstalledPanel, { installed: installed, removing: removing, onUninstall: doUninstall }),
+        h(InstalledPanel, { installed: installed, removing: removing, updates: updates, onUninstall: doUninstall, onInstallSpec: doInstallSpec }),
         jobsActive ? h(JobsPanel, { jobs: jobs }) : null,
         h("div", { className: "mkt_list" },
           results == null
@@ -364,8 +473,13 @@ window.__ModuleLoader__.load({
             : results.items.length === 0
               ? h("div", { className: "mkt_meta mkt_listHead" }, "没有匹配的仓库。")
               : h(React.Fragment, null,
-                h("div", { className: "mkt_meta mkt_listHead" }, "共 " + results.total + " 个仓库（显示 " + results.items.length + " 个）"),
-                results.items.map(function (item) {
+                h("div", { className: "mkt_meta mkt_listHead" }, verifiedOnly
+                  ? "已验证 " + visibleItems.length + " · 已显示 " + results.items.length + " · 共 " + results.total + " 个仓库（star≥1）"
+                  : "共 " + results.total + " 个仓库（star≥1）· 已显示 " + results.items.length + " 个"),
+                visibleItems.length === 0 && verifiedOnly
+                  ? h("div", { className: "mkt_meta mkt_listHead" }, "当前结果里没有已验证的 dsh 插件（✓ 徽章）。")
+                  : null,
+                visibleItems.map(function (item) {
                   var installJob = null;
                   for (var jobId in jobs) {
                     if (jobs[jobId] && jobs[jobId].spec === "github:" + item.fullName) { installJob = jobs[jobId]; break; }
@@ -373,11 +487,15 @@ window.__ModuleLoader__.load({
                   return h(RepoCard, {
                     key: item.fullName,
                     item: item,
-                    installing: installing[item.fullName] === true,
+                    installing: installing[item.fullName] === true || installing["github:" + item.fullName] === true,
                     installJob: installJob,
+                    verified: verified[item.fullName],
                     onInstall: doInstall,
                   });
-                })
+                }),
+                canLoadMore
+                  ? h("div", { className: "mkt_loadMore", ref: sentinelRef }, loadingMore ? "加载中…" : "下滑加载更多")
+                  : h("div", { className: "mkt_loadMore" }, "已显示全部 " + results.items.length + " 个")
               )
         ),
         jobsActive ? null : h(JobsPanel, { jobs: jobs })

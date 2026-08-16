@@ -18,7 +18,7 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
-import { repoInfo, searchPlugins } from "./github.js";
+import { repoInfo, searchPlugins, verifyPlugins, preferNpmSpec, npmPackageInfo, compareVersions } from "./github.js";
 import { ensureProfile, listInstalled, normalizeSpec, runInstall, runRemove, createJobTracker } from "./installer.js";
 
 export const name = "@1e0zj/dsh-plugin-mall";
@@ -154,10 +154,34 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
         sort: payload?.sort ?? "stars",
         perPage,
         page: payload?.page ?? 1,
+        minStars: payload?.minStars,
         apiBase,
         token,
       });
       return rpcOk(result);
+    }
+    case "verify": {
+      const result = await verifyPlugins({ repos: payload?.repos });
+      return rpcOk(result);
+    }
+    case "updates": {
+      const profile = String(payload?.profile ?? defaultProfile).trim();
+      let deps;
+      try {
+        resolveProfileDir(profile);
+        deps = listInstalled(profile).deps;
+      } catch (error) {
+        return rpcFail(new Error(`invalid profile: ${error.message}`));
+      }
+      const results = {};
+      await Promise.all(deps.map(async (dep) => {
+        if (dep.kind === "missing") { results[dep.name] = { latest: null }; return; }
+        const info = await npmPackageInfo(dep.name);
+        results[dep.name] = info === null
+          ? { latest: null }
+          : { latest: info.latest, hasUpdate: compareVersions(info.latest, dep.version) > 0 };
+      }));
+      return rpcOk(results);
     }
     case "info": {
       const result = await repoInfo({ repo: payload?.repo, apiBase, token });
@@ -180,6 +204,9 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
       } catch (error) {
         return rpcFail(error);
       }
+      // npm tarball 优先（小而快、带 integrity）；registry 条目不同源的包名
+      // 视为抢注，回退 github: 全仓库 spec。
+      spec = await preferNpmSpec({ spec });
       try {
         const profileDir = resolveProfileDir(profile);
         if (!existsSync(join(profileDir, "package.json"))) ensureProfile(profile);
@@ -357,7 +384,7 @@ export function apply(ctx, config = {}) {
     },
     async execute(args, exec) {
       const profile = String(args.profile ?? defaultProfile).trim();
-      const spec = normalizeSpec(args.spec);
+      const spec = await preferNpmSpec({ spec: normalizeSpec(args.spec) });
       let profileDir;
       try {
         profileDir = resolveProfileDir(profile);
