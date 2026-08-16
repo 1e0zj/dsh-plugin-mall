@@ -43,6 +43,8 @@ window.__ModuleLoader__.load({
       ".mkt_cardActions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:auto;padding-top:4px}",
       ".mkt_cardActions .mkt_btn{text-decoration:none}",
       ".mkt_panelTitle{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary);margin:0}",
+      ".mkt_panelRow{display:flex;align-items:center;gap:8px}",
+      ".mkt_panelRow .mkt_link{margin-left:auto}",
       ".mkt_pre{font-family:Consolas,Monaco,monospace;font-size:11.5px;line-height:16px;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-secondary,#f6f7f8);border-radius:6px;padding:8px;max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-all}",
       ".mkt_ok{color:var(--dsw-alias-state-success-primary,#2f855a)}",
       ".mkt_badge{display:inline-block;border-radius:999px;padding:1px 8px;font-size:11px;border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-tertiary)}",
@@ -127,7 +129,11 @@ window.__ModuleLoader__.load({
         jobsRef.current = Object.assign({}, jobsRef.current, { [id]: { status: "running", spec: spec, output: "" } });
         setJobs(Object.assign({}, jobsRef.current));
       }, []);
-      return { jobs: jobs, track: track };
+      var clear = useCallback(function () {
+        jobsRef.current = {};
+        setJobs({});
+      }, []);
+      return { jobs: jobs, track: track, clear: clear };
     }
 
     // ── plugin verification badge ───────────────────────────────────────────
@@ -181,7 +187,10 @@ window.__ModuleLoader__.load({
       var ids = Object.keys(props.jobs);
       if (ids.length === 0) return null;
       return h("div", { className: "mkt_card" },
-        h("p", { className: "mkt_panelTitle" }, "任务"),
+        h("div", { className: "mkt_panelRow" },
+          h("p", { className: "mkt_panelTitle" }, "任务"),
+          props.onClear ? h("span", { className: "mkt_link", onClick: props.onClear }, "清空") : null
+        ),
         ids.map(function (id) {
           var job = props.jobs[id];
           var done = job.status === "completed" || job.status === "failed" || job.status === "killed";
@@ -393,6 +402,7 @@ window.__ModuleLoader__.load({
       var polling = useJobPolling(call, refreshInstalled);
       var track = polling.track;
       var jobs = polling.jobs;
+      var clearJobs = polling.clear;
 
       useEffect(function () {
         doSearch();
@@ -472,10 +482,8 @@ window.__ModuleLoader__.load({
         refreshInstalled();
       }, [refreshInstalled]);
 
-      // 活动任务置顶（紧跟已装面板，点安装立刻看到进度）；全部静止后归档到底部当日志。
-      var jobsActive = false;
-      for (var jid in jobs) { if (jobs[jid] && jobs[jid].status === "running") { jobsActive = true; break; } }
-
+      // 任务面板位置固定（已装面板之后）：不随任务状态在顶部/底部之间
+      // 跳——npm 安装几秒即完成，"完成即落底"曾让结果凭空消失。
       // "只看已验证"开关下的可见项：verify 判定 bundle/client 的才算插件。
       // verifyPending：当前加载的仓库里还有未验证完的（verified map 尚未覆盖）。
       var visibleItems = results === null ? [] : results.items.filter(function (it) {
@@ -516,7 +524,7 @@ window.__ModuleLoader__.load({
         ),
         error ? h("div", { className: "mkt_error" }, error) : null,
         h(InstalledPanel, { installed: installed, removing: removing, updates: updates, onUninstall: doUninstall, onInstallSpec: doInstallSpec }),
-        jobsActive ? h(JobsPanel, { jobs: jobs }) : null,
+        h(JobsPanel, { jobs: jobs, onClear: clearJobs }),
         h("div", { className: "mkt_list" },
           results == null
             ? h("div", { className: "mkt_meta mkt_listHead" }, loading ? "正在加载最热插件…" : "—")
@@ -552,8 +560,7 @@ window.__ModuleLoader__.load({
                   ? h("div", { className: "mkt_loadMore", ref: sentinelRef }, loadingMore ? "加载中…" : Date.now() < retryAt ? "GitHub 限流中，稍后再下滑加载" : "下滑加载更多")
                   : h("div", { className: "mkt_loadMore" }, reachedLimit ? "已达 GitHub 搜索上限（前 1000 个结果）" : "已显示全部 " + results.items.length + " 个")
               )
-        ),
-        jobsActive ? null : h(JobsPanel, { jobs: jobs })
+        )
       );
     }
 
