@@ -171,7 +171,7 @@ window.__ModuleLoader__.load({
         h("div", { className: "mkt_cardActions" },
           h("button", { className: "mkt_btn mkt_btnPrimary", disabled: installDisabled, onClick: function () { props.onInstall(item.fullName); } },
             installLabel),
-          h("a", { className: "mkt_btn", href: item.htmlUrl, target: "_blank", rel: "noreferrer" }, "前往仓库 ↗")
+          h("a", { className: "mkt_btn", href: item.htmlUrl, target: "_blank", rel: "noreferrer" }, "前往仓库")
         )
       );
     }
