@@ -147,7 +147,7 @@ window.__ModuleLoader__.load({
       var item = props.item;
       var installing = props.installing === true;
       var job = props.installJob;
-      var installLabel = "安装";
+      var installLabel = props.alreadyInstalled === true ? "已装" : "安装";
       var installDisabled = installing;
       if (!installing && job) {
         if (job.status === "running") { installLabel = "安装中…"; installDisabled = true; }
@@ -534,12 +534,17 @@ window.__ModuleLoader__.load({
                   for (var jobId in jobs) {
                     if (jobs[jobId] && jobs[jobId].spec === "github:" + item.fullName) { installJob = jobs[jobId]; break; }
                   }
+                  var vInfo = verified[item.fullName];
+                  var alreadyInstalled = vInfo !== undefined && typeof vInfo.name === "string"
+                    && installed !== null && installed.error === undefined
+                    && (installed.deps || []).some(function (dep) { return dep.name === vInfo.name; });
                   return h(RepoCard, {
                     key: item.fullName,
                     item: item,
                     installing: installing[item.fullName] === true || installing["github:" + item.fullName] === true,
                     installJob: installJob,
-                    verified: verified[item.fullName],
+                    verified: vInfo,
+                    alreadyInstalled: alreadyInstalled,
                     onInstall: doInstall,
                   });
                 }),
