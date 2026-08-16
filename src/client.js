@@ -278,7 +278,7 @@ window.__ModuleLoader__.load({
       var _verified = useState({});
       var verified = _verified[0];
       var setVerified = _verified[1];
-      var _verifiedOnly = useState(false);
+      var _verifiedOnly = useState(true);
       var verifiedOnly = _verifiedOnly[0];
       var setVerifiedOnly = _verifiedOnly[1];
       var _updates = useState(null);
@@ -430,11 +430,13 @@ window.__ModuleLoader__.load({
       for (var jid in jobs) { if (jobs[jid] && jobs[jid].status === "running") { jobsActive = true; break; } }
 
       // "只看已验证"开关下的可见项：verify 判定 bundle/client 的才算插件。
+      // verifyPending：当前加载的仓库里还有未验证完的（verified map 尚未覆盖）。
       var visibleItems = results === null ? [] : results.items.filter(function (it) {
         if (verifiedOnly !== true) return true;
         var v = verified[it.fullName];
         return v !== undefined && (v.kind === "bundle" || v.kind === "client");
       });
+      var verifyPending = results !== null && results.items.some(function (it) { return verified[it.fullName] === undefined; });
 
       return h("div", { className: "mkt_root" },
         h("div", { className: "mkt_head" },
@@ -462,7 +464,7 @@ window.__ModuleLoader__.load({
           h("button", { className: "mkt_btn", onClick: refreshInstalled }, "刷新已装"),
           h("label", { className: "mkt_check" },
             h("input", { type: "checkbox", checked: verifiedOnly, onChange: function (e) { setVerifiedOnly(e.target.checked); } }),
-            "只看已验证")
+            "只看已验证插件")
         ),
         error ? h("div", { className: "mkt_error" }, error) : null,
         h(InstalledPanel, { installed: installed, removing: removing, updates: updates, onUninstall: doUninstall, onInstallSpec: doInstallSpec }),
@@ -474,10 +476,10 @@ window.__ModuleLoader__.load({
               ? h("div", { className: "mkt_meta mkt_listHead" }, "没有匹配的仓库。")
               : h(React.Fragment, null,
                 h("div", { className: "mkt_meta mkt_listHead" }, verifiedOnly
-                  ? "已验证 " + visibleItems.length + " · 已显示 " + results.items.length + " · 共 " + results.total + " 个仓库（star≥1）"
+                  ? "已验证插件 " + visibleItems.length + " 个 · 已加载 " + results.items.length + "/" + results.total + " 个仓库（star≥1）" + (verifyPending ? " · 验证中…" : "")
                   : "共 " + results.total + " 个仓库（star≥1）· 已显示 " + results.items.length + " 个"),
                 visibleItems.length === 0 && verifiedOnly
-                  ? h("div", { className: "mkt_meta mkt_listHead" }, "当前结果里没有已验证的 dsh 插件（✓ 徽章）。")
+                  ? h("div", { className: "mkt_meta mkt_listHead" }, verifyPending ? "正在验证仓库是否为 dsh 插件…" : "当前加载的结果里没有已验证的 dsh 插件，下滑加载更多。")
                   : null,
                 visibleItems.map(function (item) {
                   var installJob = null;
