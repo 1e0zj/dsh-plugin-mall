@@ -151,7 +151,7 @@ window.__ModuleLoader__.load({
       var installDisabled = installing;
       if (!installing && job) {
         if (job.status === "running") { installLabel = "安装中…"; installDisabled = true; }
-        else if (job.status === "completed") { installLabel = "✓ 已装 · 重启生效"; installDisabled = true; }
+        else if (job.status === "completed") { installLabel = "已装 · 重启生效"; installDisabled = true; }
         else if (job.status === "failed") { installLabel = "安装失败 · 见任务日志"; }
         else { installLabel = "已取消 · 重试"; }
       }
@@ -190,7 +190,7 @@ window.__ModuleLoader__.load({
               id + " · " + clip(job.spec || "", 40) + " · " + (job.status || "running")),
             job.detail ? h("div", { className: "mkt_desc" }, job.detail) : null,
             done && job.status === "completed"
-              ? h("div", { className: "mkt_ok" }, "✓ 完成 — 重启 dsh 后生效")
+              ? h("div", { className: "mkt_ok" }, "完成 — 重启 dsh 后生效")
               : job.status === "failed"
                 ? h("div", { className: "mkt_error" }, "失败，见下方输出")
                 : null,
@@ -217,7 +217,7 @@ window.__ModuleLoader__.load({
         },
           h("span", { className: "mkt_panelTitle" }, "已装插件"),
           h("span", { className: "mkt_badge" }, count + " 个"),
-          h("span", { className: "mkt_meta mkt_installedToggle" }, open ? "收起 ▲" : "展开 ▼")
+          h("span", { className: "mkt_meta mkt_installedToggle" }, open ? "收起" : "展开")
         ),
         installed.error
           ? h("div", { className: "mkt_error" }, installed.error)
@@ -234,7 +234,7 @@ window.__ModuleLoader__.load({
                   upd && upd.hasUpdate ? h("button", {
                     className: "mkt_btn mkt_btnSm",
                     onClick: function () { props.onInstallSpec(dep.name); },
-                  }, "更新 → " + upd.latest) : null,
+                  }, "更新至 " + upd.latest) : null,
                   h("button", {
                     className: "mkt_btn mkt_btnDanger mkt_btnSm",
                     disabled: busy,
