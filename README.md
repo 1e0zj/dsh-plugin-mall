@@ -1,24 +1,64 @@
 # dsh-plugin-mall
 
-**dsh 插件市场** — 搜索 GitHub `dsh-plugin` 话题下的 DeepSeek Harness 插件仓库，并一键安装到本地 dsh profile。
+**An open plugin marketplace for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh): search every GitHub repo tagged `topic:dsh-plugin`, automatically verify which ones are real dsh plugins, install and update with one click.**
 
-两个入口：
+[中文说明](#中文说明) · [Install](#install) · [Why another marketplace](#why-another-marketplace)
 
-1. **设置 → 插件 → 插件市场 tab**（浏览器 UI，dsh web 模式）：搜索、看详情、点安装/卸载、看进度与已装列表
-2. **会话内 5 个 agent 工具**（所有模式可用）
+Two surfaces: a **Settings → Plugins → Marketplace** tab in the dsh web UI, and five agent tools usable from any session.
 
-| 工具 | 作用 |
+## Why another marketplace?
+
+Curated lists only show what has been reviewed and merged. This marketplace is open by construction: **any repo tagged `topic:dsh-plugin` is discoverable the moment it is pushed** — no submission, no approval queue. To keep that openness usable:
+
+- **Automatic verification** — every search result's `package.json` is fetched (jsDelivr/raw dual-source CDN, no API quota) and checked for the official `dsh.bundle` / `dsh.client` manifest. Verified plugins get a green badge; the default "verified only" view filters out ~73% of topic noise (empty repos and unrelated projects riding the tag).
+- **Anti-squatting** — an install prefers the npm tarball only when the registry entry's `repository` URL points back to the same GitHub repo; anything else falls back to the explicit `github:` spec.
+- **npm-first installs** — registry tarballs are smaller than whole-repo GitHub downloads and come with integrity checks.
+- **Update management** — installed plugins are compared against the registry `latest`; one-click update per plugin.
+- **Resilience** — rate-limit circuit breaker, GitHub's 1000-result search window handled gracefully, `corepack enable pnpm` self-heal when pnpm is missing, one-click dsh restart (loopback-only, `allowRestart: false` to disable).
+
+## Install
+
+```powershell
+# from npm
+dsh plugin --profile web add @1e0zj/dsh-plugin-mall
+
+# from GitHub
+dsh plugin --profile web add github:1e0zj/dsh-plugin-mall
+
+# local development (symlink; restart dsh after edits)
+dsh plugin --profile web add link:C:\path\to\dsh-plugin-mall
+```
+
+Restart dsh after installing.
+
+## Agent tools
+
+| Tool | What it does |
 |---|---|
-| `market_search` | 搜索 GitHub 上带 `topic:dsh-plugin` 标签的仓库（按 star 排序，可按关键词过滤） |
-| `market_info` | 查看单个仓库详情：star、license、package.json、是否声明 `dsh.bundle.patch` / `dsh.client` |
-| `market_install` | 把插件装进某个 profile（后台任务，可用 `job_output` 查看进度） |
-| `market_uninstall` | 把插件从某个 profile 卸载（后台任务：`pnpm remove` + 剔除 bundle 层 + 删除客户端加载行） |
-| `market_installed` | 列出某 profile 已装的插件及其 bundle 状态 |
+| `market_search` | Search GitHub repos tagged `topic:dsh-plugin` (star-ranked, keyword filter, server-side `stars:>=1` noise floor) |
+| `market_info` | Inspect one repo: stars, license, package.json, whether it declares `dsh.bundle.patch` / `dsh.client` |
+| `market_install` | Install a plugin into a profile as a background job (npm-first spec resolution) |
+| `market_uninstall` | Remove a plugin: `pnpm remove` + bundle-layer reconcile + client-row cleanup |
+| `market_installed` | List a profile's installed plugins and their bundle status |
+
+---
+
+# 中文说明
+
+**dsh 插件市场** — 搜索 GitHub `dsh-plugin` 话题下的 DeepSeek Harness 插件仓库，自动验证哪些是真 dsh 插件，一键安装与更新。
+
+与策展列表不同：**任何打上 `topic:dsh-plugin` 的仓库推送后立即可被发现**——无需投稿、无需审批。为保证开放性可用，做了这些事：
+
+- **自动验证**：逐仓库拉取 `package.json`（jsDelivr/raw 双源 CDN，不占 API 配额），按官方 `dsh.bundle` / `dsh.client` 声明打徽章；默认"只看已验证"视图过滤约 73% 的话题噪音
+- **防抢注**：仅当 npm registry 条目的 `repository` 指回同一 GitHub 仓库时才用 npm 安装，否则回退 `github:` 源
+- **npm 优先安装**：registry tarball 比整仓库下载更小且带完整性校验
+- **更新管理**：已装插件与 registry `latest` 比对，逐个一键更新
+- **工程韧性**：限流熔断、GitHub 1000 条搜索上限优雅处理、pnpm 缺失时 `corepack` 自愈、一键重启 dsh（仅 loopback，可 `allowRestart: false` 关闭）
 
 ## 安装
 
 ```powershell
-# 从 npm（发布后）
+# 从 npm
 dsh plugin --profile web add @1e0zj/dsh-plugin-mall
 
 # 从 GitHub
@@ -51,16 +91,19 @@ dsh plugin --profile web add link:C:\path\to\dsh-plugin-mall
   `pnpm remove <package>`，成功后从 `dsh.profile.bundles` 剔除该依赖的
   bundle 条目，并删掉 `cordis.patch.yml` 里由安装流程注册的客户端加载行
   （文本级精准移除，用户手写的行不受影响）。
+- 安装源解析：`github:owner/repo` 优先改写为同名 npm 包（仅当 registry
+  条目的 repository 指回该仓库，防止抢注），否则用 GitHub 全仓库 spec。
 - GitHub 源的插件安装时要跑 prepare 构建脚本，pnpm 默认拦截；本插件检测到
   拦截后会把包名自动合并进 profile 的 `pnpm-workspace.yaml` 的 `allowBuilds`
-  并自动重试一次。
+  并自动重试一次（解析只认合法 npm 包名，写入一律加引号，不会写坏 YAML）。
 - 配置（`cordis.patch.yml` 中可改）：`defaultProfile`（默认装进哪个 profile，
-  默认 `web`）、`apiBase`（GitHub API 地址）、`perPageMax`（搜索单页上限）。
+  默认 `web`）、`apiBase`（GitHub API 地址）、`perPageMax`（搜索单页上限）、
+  `allowRestart`（是否允许一键重启，默认 `true`）。
 
 ## 发布
 
 ```bash
-npm publish
+npm publish --access public
 # 或在 GitHub 建仓库并打上 topic：dsh-plugin
 ```
 
@@ -70,6 +113,10 @@ npm publish
   patch 文件把 `dsh-plugin-mall` 这一行 insert 进装配树；**同一行同时是
   client 插件行**（`dsh.client` 声明让 client-modules 扫描并服务
   `/plugins/<id>/client.js`）。
+- **`@deepseek-ai/*` 框架包必须声明为 `peerDependencies`**：装成 dependencies
+  会把宿主模块副本 hoist 进 profile，cordis loader 双副本加载、Symbol 身份
+  分裂，宿主的工具调度全线崩溃。宿主经 `profiles/node_modules` fallback
+  提供框架包。
 - node 半边导出具名成员 `{ name, inject, Config, apply }`，**不要** `export default`
   （cordis loader 会做 `exports.default ?? exports` 解包，default 会吞掉 inject/Config）；
   client 半边是 `window.__ModuleLoader__.load({id, factory})`，导出 `{ apply, inject }`。
