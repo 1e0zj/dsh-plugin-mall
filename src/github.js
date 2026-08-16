@@ -3,6 +3,8 @@
 // standalone (node src/github.js --self-test).
 
 const SEARCH_TOPIC = "topic:dsh-plugin";
+/** GitHub search never serves past the first 1000 results. */
+const SEARCH_WINDOW = 1000;
 
 export function buildHeaders(token) {
   const headers = {
@@ -81,7 +83,18 @@ export async function searchPlugins({ query, sort = "stars", perPage = 10, page 
   const safePerPage = Math.min(Math.max(Math.trunc(perPage) || 10, 1), 100);
   const safePage = Math.max(Math.trunc(page) || 1, 1);
   const path = `/search/repositories?q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}&order=desc&per_page=${safePerPage}&page=${safePage}`;
-  const body = await requestJson(path, { apiBase, token, signal });
+  let body;
+  try {
+    body = await requestJson(path, { apiBase, token, signal });
+  } catch (error) {
+    // Past the first 1000 results GitHub 422s with "Only the first 1000
+    // search results are available" — surface that as a clean empty
+    // truncated page instead of a hard error.
+    if (/first 1000 search results/i.test(String(error?.message ?? ""))) {
+      return { total: SEARCH_WINDOW, page: safePage, perPage: safePerPage, items: [], truncated: true };
+    }
+    throw error;
+  }
   return {
     total: body.total_count ?? 0,
     page: safePage,

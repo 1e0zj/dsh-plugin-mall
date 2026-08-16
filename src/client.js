@@ -287,6 +287,12 @@ window.__ModuleLoader__.load({
       var _updates = useState(null);
       var updates = _updates[0];
       var setUpdates = _updates[1];
+      var _reachedLimit = useState(false);
+      var reachedLimit = _reachedLimit[0];
+      var setReachedLimit = _reachedLimit[1];
+      var _retryAt = useState(0);
+      var retryAt = _retryAt[0];
+      var setRetryAt = _retryAt[1];
 
       var call = useCallback(function (endpoint, payload) {
         return rpc.call("/market", endpoint, payload || {}).then(function (res) {
@@ -309,6 +315,8 @@ window.__ModuleLoader__.load({
         setLoading(true);
         setError(null);
         setPage(1);
+        setReachedLimit(false);
+        setRetryAt(0);
         call("search", { query: query, sort: sort, perPage: 20 }).then(function (value) {
           setResults(value);
           setVerified({});
@@ -322,11 +330,15 @@ window.__ModuleLoader__.load({
 
       // 无限滚动：哨兵进入视口时拉下一页并追加。GitHub topic 的翻页间数据
       // 可能移动造成重复，按 fullName 去重；已显示数追上 total 即到底。
-      var canLoadMore = results !== null && results.items.length < results.total;
+      var canLoadMore = results !== null && results.items.length < results.total && !reachedLimit;
       var loadMore = useCallback(function () {
         if (!canLoadMore || loading || loadingMore) return;
+        // 限流熔断：失败后 60s 内不再自动请求（哨兵重渲染会反复触发
+        // IntersectionObserver，不熔断会连环 500 直到限流窗口过去）。
+        if (Date.now() < retryAt) return;
         setLoadingMore(true);
         call("search", { query: query, sort: sort, perPage: 20, page: page + 1 }).then(function (value) {
+          if (value.truncated === true) { setReachedLimit(true); return; }
           setPage(page + 1);
           verifyPage(value.items);
           setResults(function (prev) {
@@ -342,10 +354,11 @@ window.__ModuleLoader__.load({
           });
         }).catch(function (e) {
           setError(errorText(e));
+          setRetryAt(Date.now() + 60000);
         }).finally(function () {
           setLoadingMore(false);
         });
-      }, [call, canLoadMore, loading, loadingMore, page, query, sort]);
+      }, [call, canLoadMore, loading, loadingMore, page, query, sort, retryAt]);
 
       useEffect(function () {
         var node = sentinelRef.current;
@@ -499,8 +512,8 @@ window.__ModuleLoader__.load({
                   });
                 }),
                 canLoadMore
-                  ? h("div", { className: "mkt_loadMore", ref: sentinelRef }, loadingMore ? "加载中…" : "下滑加载更多")
-                  : h("div", { className: "mkt_loadMore" }, "已显示全部 " + results.items.length + " 个")
+                  ? h("div", { className: "mkt_loadMore", ref: sentinelRef }, loadingMore ? "加载中…" : Date.now() < retryAt ? "GitHub 限流中，稍后再下滑加载" : "下滑加载更多")
+                  : h("div", { className: "mkt_loadMore" }, reachedLimit ? "已达 GitHub 搜索上限（前 1000 个结果）" : "已显示全部 " + results.items.length + " 个")
               )
         ),
         jobsActive ? null : h(JobsPanel, { jobs: jobs })
