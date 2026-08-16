@@ -36,6 +36,7 @@ window.__ModuleLoader__.load({
       ".mkt_loadMore{grid-column:1/-1;text-align:center;font-size:12px;color:var(--dsw-alias-label-tertiary);padding:10px 0}",
       ".mkt_card{border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:10px 12px;background:var(--dsw-alias-bg-primary,#fff);display:flex;flex-direction:column;gap:6px;min-width:0}",
       ".mkt_cardHead{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}",
+      ".mkt_metaRow{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}",
       ".mkt_name{font-size:13.5px;font-weight:600;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}",
       ".mkt_meta{font-size:12px;color:var(--dsw-alias-label-tertiary)}",
       ".mkt_desc{font-size:12.5px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}",
@@ -134,8 +135,8 @@ window.__ModuleLoader__.load({
     // dsh.bundle/dsh.client 声明，进程内缓存）。unknown 不显示徽章。
     function verifyBadge(verified) {
       if (verified === undefined || verified === null) return null;
-      if (verified.kind === "bundle") return h("span", { className: "mkt_badge mkt_badgeOk" }, "✓ 宿主插件");
-      if (verified.kind === "client") return h("span", { className: "mkt_badge mkt_badgeOk" }, "✓ UI插件");
+      if (verified.kind === "bundle") return h("span", { className: "mkt_badge mkt_badgeOk" }, "宿主插件");
+      if (verified.kind === "client") return h("span", { className: "mkt_badge mkt_badgeOk" }, "UI插件");
       if (verified.kind === "plain") return h("span", { className: "mkt_badge" }, "未声明");
       if (verified.kind === "no-manifest") return h("span", { className: "mkt_badge" }, "无package.json");
       return null;
@@ -158,13 +159,15 @@ window.__ModuleLoader__.load({
         h("div", { className: "mkt_cardHead" },
           h("span", { className: "mkt_name" }, item.fullName),
           verifyBadge(props.verified),
-          h("span", { className: "mkt_meta" }, "★" + item.stars),
-          item.language ? h("span", { className: "mkt_meta" }, item.language) : null,
-          item.license ? h("span", { className: "mkt_meta" }, item.license) : null,
           item.archived ? h("span", { className: "mkt_badge" }, "archived") : null
         ),
         item.description ? h("div", { className: "mkt_desc" }, clip(item.description, 180)) : null,
-        h("div", { className: "mkt_meta" }, "更新 " + (item.updatedAt || "").slice(0, 10)),
+        h("div", { className: "mkt_metaRow" },
+          h("span", { className: "mkt_meta" }, "★" + item.stars),
+          item.language ? h("span", { className: "mkt_meta" }, item.language) : null,
+          item.license ? h("span", { className: "mkt_meta" }, item.license) : null,
+          h("span", { className: "mkt_meta" }, "更新 " + (item.updatedAt || "").slice(0, 10))
+        ),
         h("div", { className: "mkt_cardActions" },
           h("button", { className: "mkt_btn mkt_btnPrimary", disabled: installDisabled, onClick: function () { props.onInstall(item.fullName); } },
             installLabel),
