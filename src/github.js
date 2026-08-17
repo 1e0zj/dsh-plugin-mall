@@ -26,31 +26,58 @@ function apiUrl(apiBase, path) {
   return `${base}${path.replace(/^\//, "")}`;
 }
 
+/**
+ * GET with bounded retries. The GitHub search API 504s under load — a plain
+ * transient that a retry clears — and its cold responses can take 8s+ while
+ * warm ones take 300ms. So: up to 3 attempts, 500ms/1500ms backoff, retrying
+ * only 5xx statuses, network errors, and our own per-attempt timeout. Never
+ * retried: 4xx (deterministic — the 422 "first 1000 results" contract in
+ * searchPlugins depends on failing fast) and caller cancellation, which
+ * propagates immediately.
+ */
+const REQUEST_TIMEOUT = 12000;
+const RETRY_DELAYS = [500, 1500];
+
 async function requestJson(path, { apiBase, token, signal }) {
-  let response;
-  try {
-    response = await fetch(apiUrl(apiBase, path), {
-      headers: buildHeaders(token),
-      signal,
-    });
-  } catch (error) {
-    if (error?.name === "AbortError") throw error;
-    throw new Error(`GitHub API request failed: ${error?.message ?? String(error)}`);
+  const url = apiUrl(apiBase, path);
+  let lastError;
+  for (let attempt = 0; attempt <= RETRY_DELAYS.length; attempt++) {
+    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, RETRY_DELAYS[attempt - 1]));
+    let response;
+    try {
+      const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT);
+      response = await fetch(url, {
+        headers: buildHeaders(token),
+        signal: signal === undefined ? timeoutSignal : AbortSignal.any([signal, timeoutSignal]),
+      });
+    } catch (error) {
+      if (error?.name === "AbortError" && signal?.aborted) throw error; // caller cancelled
+      // 网络错误或单次超时——都值得重试，错误文本留给最后一轮。
+      lastError = new Error(error?.name === "AbortError"
+        ? `GitHub API request timed out after ${REQUEST_TIMEOUT / 1000}s (attempt ${attempt + 1})`
+        : `GitHub API request failed: ${error?.message ?? String(error)}`);
+      continue;
+    }
+    if (response.status >= 500 && attempt < RETRY_DELAYS.length) {
+      lastError = new Error(`GitHub API ${response.status}: ${response.statusText}`);
+      continue; // 5xx 瞬时故障，退避后重试
+    }
+    const remaining = response.headers.get("x-ratelimit-remaining");
+    const resetAt = response.headers.get("x-ratelimit-reset");
+    const body = await response.json().catch(() => undefined);
+    if (response.status === 403 && remaining === "0" && resetAt !== null) {
+      const reset = new Date(Number(resetAt) * 1000).toISOString();
+      throw new Error(`GitHub API rate limit exceeded; resets at ${reset} (UTC). Set GITHUB_TOKEN or DSH_MARKET_GITHUB_TOKEN for a higher limit.`);
+    }
+    if (response.status === 404) {
+      throw new Error(`GitHub API 404: ${body?.message ?? "not found"}`);
+    }
+    if (!response.ok) {
+      throw new Error(`GitHub API ${response.status}: ${body?.message ?? response.statusText}`);
+    }
+    return body;
   }
-  const remaining = response.headers.get("x-ratelimit-remaining");
-  const resetAt = response.headers.get("x-ratelimit-reset");
-  const body = await response.json().catch(() => undefined);
-  if (response.status === 403 && remaining === "0" && resetAt !== null) {
-    const reset = new Date(Number(resetAt) * 1000).toISOString();
-    throw new Error(`GitHub API rate limit exceeded; resets at ${reset} (UTC). Set GITHUB_TOKEN or DSH_MARKET_GITHUB_TOKEN for a higher limit.`);
-  }
-  if (response.status === 404) {
-    throw new Error(`GitHub API 404: ${body?.message ?? "not found"}`);
-  }
-  if (!response.ok) {
-    throw new Error(`GitHub API ${response.status}: ${body?.message ?? response.statusText}`);
-  }
-  return body;
+  throw lastError ?? new Error("GitHub API request failed");
 }
 
 /** Pick the stable, compact fields the tools render. */
