@@ -140,6 +140,14 @@ dsh plugin --profile web add link:C:\path\to\dsh-plugin-mall
   （文本级精准移除，用户手写的行不受影响）。
 - 安装源解析：`github:owner/repo` 优先改写为同名 npm 包（仅当 registry
   条目的 repository 指回该仓库，防止抢注），否则用 GitHub 全仓库 spec。
+- 「更新至 x.y.z」按钮传的是 **`包名@版本`** 而不是裸包名。pnpm 11 有
+  `minimumReleaseAge` 供应链防护，默认拒绝发布不足 24 小时的版本：传裸包名
+  等于让 pnpm 自己挑「最新**可安装**版本」，于是按钮写着「更新至 0.12.3」、
+  pnpm 却回落到 0.12.2 并报 `Already up to date`，点多少次都不动。带上版本号
+  是明确指定，pnpm 照装并自行往 `minimumReleaseAgeExclude` 记一条豁免
+  （这行会出现在任务日志里）。更新检查读的是 registry 的 `/latest` 端点，
+  不经过该策略，所以两边看到的「最新版本」本就可能不同。
+  首次安装（卡片按钮）不带版本，沿用 pnpm 的策略默认值即可。
 - GitHub 源的插件、以及带原生模块的包安装时要跑构建脚本，pnpm 默认拦截；
   本插件检测到拦截后会把包名自动合并进 profile 的 `pnpm-workspace.yaml` 的
   `allowBuilds` 并自动重试一次。合并时跟随文件里已有的形状（pnpm 两种都认：

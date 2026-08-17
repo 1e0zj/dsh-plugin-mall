@@ -244,9 +244,14 @@ window.__ModuleLoader__.load({
                 h("span", { className: "mkt_desc" }, dep.name + "@" + dep.version),
                 h("span", { className: "mkt_depActions" },
                   h("span", { className: "mkt_badge" }, kindLabel(dep.kind)),
+                  // 必须带上版本号。传裸包名等于让 pnpm 自己挑"最新可安装
+                  // 版本"，而 pnpm 11 的 minimumReleaseAge 会拒绝发布不足
+                  // 24 小时的版本并回落到旧版 —— 按钮写着"更新至 0.12.3"，
+                  // pnpm 却报 "Already up to date"，点多少次都不动。
+                  // 带上版本是明确指定，pnpm 照装并自行记一条豁免。
                   upd && upd.hasUpdate ? h("button", {
                     className: "mkt_btn mkt_btnSm",
-                    onClick: function () { props.onInstallSpec(dep.name); },
+                    onClick: function () { props.onInstallSpec(dep.name + "@" + upd.latest); },
                   }, "更新至 " + upd.latest) : null,
                   h("button", {
                     className: "mkt_btn mkt_btnDanger mkt_btnSm",
