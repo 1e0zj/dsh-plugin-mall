@@ -167,10 +167,28 @@ dsh plugin --profile web add link:C:\path\to\dsh-plugin-mall
 
 ## 发布
 
+推一个 `v*` tag,`.github/workflows/release.yml` 完成其余部分:
+
 ```bash
-npm publish --access public
-# 或在 GitHub 建仓库并打上 topic：dsh-plugin
+npm version patch        # 改 package.json 版本并打 tag
+git push --follow-tags
 ```
+
+走 npm **trusted publishing(OIDC)**:仓库里不存任何 npm 凭据,也没有会过期
+需要轮换的 token —— GitHub 签发一个几分钟就失效的身份令牌换取发布权限。
+附带自动生成 **provenance**:把 tarball 哈希、源 commit 和构建它的 workflow
+签名绑定并进公开透明日志,所以「npm 上装到的东西」与「GitHub 上读到的源码」
+之间那道缝是可验证地闭合的(`npm view <pkg> dist.attestations` 可查)。
+
+workflow 会先校验 tag 与 `package.json` 版本一致、再跑离线 fixture,任一不过
+就不发。**它故意不跑 `npm ci`** —— 框架包的 dist-tags 问题会让它 ERESOLVE
+失败(见上方 `link:` 说明),而这个包没有构建步骤,`npm publish` 也不读
+`node_modules`。
+
+> 首次配置需在 npmjs.com 的包设置里添加 Trusted Publisher(GitHub Actions +
+> 仓库名 + `release.yml`),之后所有长期 token 都可以删掉。
+
+插件要被市场发现,在 GitHub 仓库打上 topic:`dsh-plugin`。
 
 ## 开发说明
 

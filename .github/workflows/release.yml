@@ -1,0 +1,57 @@
+# 发布：推一个 v* tag，其余自动。
+#
+# 用 npm trusted publishing（OIDC）——仓库里不存任何 npm 凭据，也没有会过期
+# 需要轮换的东西。GitHub 签发一个几分钟就失效的身份令牌，npm 用它换发布权限。
+# 这条路还顺带自动生成 provenance：把 tarball 的哈希、源 commit、以及构建它
+# 的 workflow 绑在一起签名并进公开透明日志，所以「npm 上装到的东西」与
+# 「GitHub 上读到的源码」之间那道缝是可验证地闭合的。
+name: Publish
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  id-token: write # trusted publishing 的唯一硬要求
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          # trusted publishing 要求 node >= 22.14.0 / npm >= 11.5.1
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+
+      # 这里故意没有 `npm ci`。框架包在 registry 上的 dist-tags 横跨两条发布线
+      # （dsh-tools 的 latest 还在 0.0.1-rc.x，dsh-app-boot 已是 0.1.0-rc.x），
+      # 对 dsh-invariants 的 peer 区间无交集，npm install 必然 ERESOLVE 失败。
+      # 正好也不需要：这个包没有构建步骤，唯一的运行时依赖 js-yaml 由宿主提供，
+      # 而 npm publish 本身不读 node_modules。详见 README 的「本地开发」一节。
+
+      - name: tag 与 package.json 版本必须一致
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p "require('./package.json').version")"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::tag v$TAG 与 package.json 的 $PKG 不一致，拒绝发布"
+            exit 1
+          fi
+          echo "版本一致：$PKG"
+
+      # src/github.js 只 import node: 内置模块，零依赖，裸机可跑。
+      # 守住宿主依赖检测的判据——它当初的实测对象 dsh-TUI 已被修复，
+      # 网络上不再有可复现的回归用例，这组 fixture 是唯一的防线。
+      - name: 离线 fixture
+        run: node src/github.js --self-test --offline
+
+      # src/installer.js 的 10 条 fixture（allowBuilds 合并）需要 js-yaml 与
+      # 宿主框架包，CI 裸机跑不了，只能在已安装副本上手工跑。见 README。
+
+      - name: 发布（无 token，provenance 自动生成）
+        run: npm publish --access public
