@@ -25,11 +25,23 @@ dsh plugin --profile web add @1e0zj/dsh-plugin-mall
 # from GitHub
 dsh plugin --profile web add github:1e0zj/dsh-plugin-mall
 
-# local development (symlink; restart dsh after edits)
+# local development — currently unusable, see the note below
 dsh plugin --profile web add link:C:\path\to\dsh-plugin-mall
 ```
 
 Restart dsh after installing.
+
+> **`link:` cannot be set up right now**, for reasons upstream of this plugin. Under
+> `link:` Node loads from the project's real path, so bare imports must resolve from
+> the project's own `node_modules` — which requires `npm install` inside the project
+> first. That fails: the framework packages' registry dist-tags currently straddle two
+> release trains (`dsh-tools` latest is still `0.0.1-rc.x` while `dsh-app-boot` is on
+> `0.1.0-rc.x`), their peer ranges do not intersect, and npm stops with ERESOLVE.
+> Neither escape hatch helps — `--legacy-peer-deps` skips peers so bare imports still
+> will not resolve, and `--force` plants a mixed-train copy of the framework inside the
+> project, which `link:` would then load instead of the host's, causing exactly the
+> duplicate-module crash described under 开发说明. Until those dist-tags line up,
+> develop by overwriting the installed copy (recipe in the 安装 section below).
 
 ## Agent tools
 
@@ -64,15 +76,35 @@ dsh plugin --profile web add @1e0zj/dsh-plugin-mall
 # 从 GitHub
 dsh plugin --profile web add github:1e0zj/dsh-plugin-mall
 
-# 本地开发（软链，改代码后重启 dsh 即生效）
+# 本地开发 —— 目前装不起来，见下方说明
 dsh plugin --profile web add link:C:\path\to\dsh-plugin-mall
 ```
 
 装完**重启 dsh**（`dsh web` 进程）后生效。
 
-> Windows 下用 `link:` 开发本插件时，Node 会从项目的真实路径加载模块，
-> 因此项目目录里必须先装一次依赖（`npm install`），裸导入才能解析；
-> 通过 npm/GitHub 安装时无此要求（pnpm 会把真实拷贝装进 profile 的 node_modules）。
+> **`link:` 目前用不了**，原因在上游、与本插件无关。`link:` 下 Node 从项目的真实
+> 路径加载模块，裸导入只能从项目自己的 `node_modules` 解析，所以得先在项目里
+> `npm install` 一次 —— 而这一步会失败：框架包在 registry 上的 dist-tags 眼下横跨
+> 两条发布线（`dsh-tools` 的 latest 还停在 `0.0.1-rc.x`，`dsh-app-boot` 已经是
+> `0.1.0-rc.x`），二者对 `dsh-invariants` 的 peer 区间无交集（`^0.0.1-rc.x` 只收
+> `0.0.1-rc.x`，`^0.1.0-rc.x` 只收 `0.1.x`），npm 以 ERESOLVE 中止。
+> 两个逃生口都不解决问题：`--legacy-peer-deps` 跳过 peer，裸导入照样解析不了；
+> `--force` 会在项目里装一套**混版本的框架副本**，`link:` 加载的就是那套而不是宿主
+> 那套 —— 正好踩中下面「开发说明」里讲的双副本身份分裂崩溃。
+>
+> 在上游 dist-tags 对齐前，本地开发用**覆盖法**。注意 pnpm 装出来的文件是**硬链接**
+> （与全局 store 共享 inode），必须**先删后写** —— 直接 `cp` 覆盖会穿透硬链接把
+> pnpm store 里的内容一起改掉，且 pnpm 不会察觉：
+>
+> ```bash
+> D=~/.dsh/profiles/web/node_modules/@1e0zj/dsh-plugin-mall
+> rm -rf "$D/src" "$D/cordis.patch.yml" "$D/package.json"
+> cp -r src "$D/src" && cp cordis.patch.yml package.json "$D/"
+> ```
+>
+> 通过 npm/GitHub 安装则没有上述任何问题：pnpm 把真实拷贝装进 profile 的
+> `node_modules`，框架包由宿主经 `profiles/node_modules` 里指向全局 dsh 的软链提供，
+> 版本天然一致。
 >
 > 另：Windows 上 `file:`/`link:` 的路径**不能含空格**。pnpm 是经 cmd 拉起的，
 > Node 只把参数用空格拼接、不逐参加引号，带空格的路径会被拆成两个参数；
