@@ -41,7 +41,10 @@ Restart dsh after installing.
 > will not resolve, and `--force` plants a mixed-train copy of the framework inside the
 > project, which `link:` would then load instead of the host's, causing exactly the
 > duplicate-module crash described under 开发说明. Until those dist-tags line up,
-> develop by overwriting the installed copy (recipe in the 安装 section below).
+> develop against a local tarball — `npm pack`, then install the `.tgz` with a `file:`
+> spec (recipe in the 安装 section below). Do not hand-overwrite files under
+> `node_modules`: they are hard-linked into pnpm's global store, and any later
+> `pnpm add/remove` rebuilds the tree and restores them anyway.
 
 ## Agent tools
 
@@ -92,15 +95,23 @@ dsh plugin --profile web add link:C:\path\to\dsh-plugin-mall
 > `--force` 会在项目里装一套**混版本的框架副本**，`link:` 加载的就是那套而不是宿主
 > 那套 —— 正好踩中下面「开发说明」里讲的双副本身份分裂崩溃。
 >
-> 在上游 dist-tags 对齐前，本地开发用**覆盖法**。注意 pnpm 装出来的文件是**硬链接**
-> （与全局 store 共享 inode），必须**先删后写** —— 直接 `cp` 覆盖会穿透硬链接把
-> pnpm store 里的内容一起改掉，且 pnpm 不会察觉：
+> 在上游 dist-tags 对齐前，本地开发用**本地 tarball**：
 >
 > ```bash
-> D=~/.dsh/profiles/web/node_modules/@1e0zj/dsh-plugin-mall
-> rm -rf "$D/src" "$D/cordis.patch.yml" "$D/package.json"
-> cp -r src "$D/src" && cp cordis.patch.yml package.json "$D/"
+> npm pack                                    # 产出 1e0zj-dsh-plugin-mall-<ver>.tgz
+> dsh plugin --profile web remove @1e0zj/dsh-plugin-mall
+> dsh plugin --profile web add file:C:\code\dsh-plugin-mall\1e0zj-dsh-plugin-mall-0.1.13.tgz
 > ```
+>
+> 这样 pnpm 的规范副本本身就是新代码，后续任何 `pnpm add/remove` 重建依赖树都不会
+> 把它换掉；顺带还验证了 `files` 字段没漏文件。改完代码重新 `npm pack` + 重装即可。
+>
+> **不要用直接覆盖 `node_modules` 里文件的办法。** 它有两个坑：
+> 一是 pnpm 装出来的文件是**硬链接**（与全局 store 共享 inode），直接 `cp` 覆盖会
+> 穿透硬链接改掉 store 里的内容且 pnpm 不会察觉，必须先 `rm` 再写；二是**任何一次
+> pnpm 操作都会重建整棵树**，按 lockfile 从 store 把你覆盖的文件还原回去 —— 而通过
+> 本插件装/卸任何插件都会触发 `pnpm add/remove`，也就是说测试市场的安装功能这个动作
+> 本身就会抹掉被测代码。（已加载进内存的模块不受影响，重启后才会退回旧版。）
 >
 > 通过 npm/GitHub 安装则没有上述任何问题：pnpm 把真实拷贝装进 profile 的
 > `node_modules`，框架包由宿主经 `profiles/node_modules` 里指向全局 dsh 的软链提供，
