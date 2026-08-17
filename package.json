@@ -1,6 +1,6 @@
 {
   "name": "@1e0zj/dsh-plugin-mall",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "description": "dsh 插件市场：搜索 GitHub dsh-plugin 话题下的插件仓库，一键安装到本地 dsh profile（agent 工具 + 设置页插件市场 tab）",
   "type": "module",
   "main": "src/index.js",

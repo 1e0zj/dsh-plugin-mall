@@ -169,4 +169,7 @@ npm publish --access public
 - node 半边导出具名成员 `{ name, inject, Config, apply }`，**不要** `export default`
   （cordis loader 会做 `exports.default ?? exports` 解包，default 会吞掉 inject/Config）；
   client 半边是 `window.__ModuleLoader__.load({id, factory})`，导出 `{ apply, inject }`。
-- 单测 `src/github.js`（无 harness 依赖）：`node src/github.js --self-test`。
+- 单测 `src/github.js`（无 harness 依赖）：`node src/github.js --self-test`，
+  加 `--offline` 只跑不联网的 fixture（宿主依赖检测的判据固化在那里 ——
+  它当初的实测对象 dsh-TUI 已被上报修复，网络上不再有可复现的回归用例，
+  所以改 `HOST_PACKAGES` 前请先跑这组）。

@@ -289,7 +289,17 @@ export function compareVersions(a, b) {
 
 /** Cap on concurrent outbound requests — shared by verification and update checks. */
 export const NETWORK_CONCURRENCY = 8;
+// repo -> {kind, name, version, hostDeps, ts}
 const verifyCache = new Map();
+// Verdicts expire. Caching a success for the process lifetime freezes the badge
+// on whatever the repo looked like the first time it was seen: when dsh-TUI
+// moved its @deepseek-ai/* deps to peerDependencies, the red "宿主依赖风险"
+// badge stayed up until dsh restarted, still accusing a repo that had been
+// fixed. Ten minutes keeps a browsing session on cache while letting a fix
+// surface on its own.
+const VERIFY_TTL = 600000;
+// Network failures retry sooner — "unknown" carries no information worth keeping.
+const VERIFY_TTL_UNKNOWN = 60000;
 
 /**
  * Run `task` over `items` with at most `limit` workers in flight. The one
@@ -354,10 +364,21 @@ async function fetchRawPackageJson(repo, signal, sources) {
  * peerDependencies) installs real copies into the profile — the loader then
  * holds two module instances, symbol identities split, and every tool call
  * crashes with an undiagnosable "reading 'prepare'". See installer docs.
+ *
+ * ONLY the @deepseek-ai scope belongs here. This used to also match the bare
+ * upstream `cosmokit` and `schemastery` on the theory that dsh forked the
+ * cordis trio and therefore shipped those too. It does not: the host tree has
+ * no bare copy at any depth, and none of its 195 @deepseek-ai packages depends
+ * on one — the fork is complete and cut its ties to the upstream names. A
+ * plugin depending on bare `schemastery` shadows nothing, so flagging it was a
+ * pure false positive, and an expensive one: it hard-blocked 7 real plugins in
+ * the topic's top 300, `omdsh-dev/DSH-better-sidebar` (★1832) among them —
+ * every one of which declares its @deepseek-ai/* deps as peers correctly.
+ * Fixtures at the bottom of this file pin the distinction.
  */
-const HOST_PACKAGES = /^(@deepseek-ai\/|cosmokit$|schemastery$)/;
+const HOST_PACKAGES = /^@deepseek-ai\//;
 
-/** The @deepseek-ai/* (and cordis runtime) entries inside `dependencies`. */
+/** The @deepseek-ai/* entries inside `dependencies`. */
 function hostShadowDependencies(pkg) {
   if (pkg === undefined || typeof pkg !== "object") return undefined;
   const deps = Object.keys(pkg.dependencies ?? {});
@@ -376,11 +397,12 @@ export async function verifyPlugins({ repos, signal, sources }) {
   // which caller passes them in.
   const wanted = [...new Set((Array.isArray(repos) ? repos : []).map(String)
     .filter((repo) => /^[^@/\s][^/\s]*\/[^/\s]+$/.test(repo) && !repo.includes("..")))];
-  // "unknown"（网络失败）60s 后过期重试；成功结果进程内永久缓存。
+  // 每条判定都带时间戳：成功 10 分钟过期，网络失败 60 秒过期。
   const pending = wanted.filter((repo) => {
     const cached = verifyCache.get(repo);
     if (cached === undefined) return true;
-    return cached.kind === "unknown" && Date.now() - (cached.ts ?? 0) > 60000;
+    const ttl = cached.kind === "unknown" ? VERIFY_TTL_UNKNOWN : VERIFY_TTL;
+    return Date.now() - (cached.ts ?? 0) > ttl;
   });
   await mapLimit(pending, NETWORK_CONCURRENCY, async (repo) => {
     try {
@@ -389,18 +411,17 @@ export async function verifyPlugins({ repos, signal, sources }) {
         : typeof pkg.dsh?.bundle?.patch === "string" ? "bundle"
           : pkg.dsh?.client !== undefined ? "client"
             : "plain";
-      verifyCache.set(repo, { kind, name: pkg?.name, version: pkg?.version, hostDeps: hostShadowDependencies(pkg) });
+      verifyCache.set(repo, { kind, name: pkg?.name, version: pkg?.version, hostDeps: hostShadowDependencies(pkg), ts: Date.now() });
     } catch (error) {
       if (error?.name === "AbortError") throw error;
       verifyCache.set(repo, { kind: "unknown", ts: Date.now() });
     }
   });
+  // 一律重建对象：内部的 ts 不该出现在发给浏览器的响应里。
   const results = {};
   for (const repo of wanted) {
     const cached = verifyCache.get(repo);
-    results[repo] = cached === undefined || cached.ts !== undefined
-      ? { kind: cached?.kind ?? "unknown", name: cached?.name, version: cached?.version, hostDeps: cached?.hostDeps }
-      : cached;
+    results[repo] = { kind: cached?.kind ?? "unknown", name: cached?.name, version: cached?.version, hostDeps: cached?.hostDeps };
   }
   return { results };
 }
@@ -445,8 +466,69 @@ export async function repoInfo({ repo, apiBase, token, signal }) {
   };
 }
 
-// Self-test entry: node src/github.js
+// ── offline fixtures ────────────────────────────────────────────────────────
+//
+// The host-shadow check has no live regression case any more: dsh-TUI, the
+// plugin it was built against, moved its @deepseek-ai/* deps to
+// peerDependencies after being reported, and nothing else on the network pins
+// the bare-vs-scoped distinction. These manifests do. Shapes are taken from
+// real repositories in the dsh-plugin topic, trimmed to the relevant fields.
+const HOST_SHADOW_FIXTURES = [
+  {
+    label: "omdsh-dev/DSH-better-sidebar — 上游裸包，宿主不提供，放行",
+    pkg: {
+      dependencies: { schemastery: "^3.18.0", ws: "^8.18.0", clsx: "^2.1.1", "node-pty": "^1.1.0" },
+      peerDependencies: { "@deepseek-ai/dsh-tools": "^0.1.0-rc.6", "@deepseek-ai/cordis": "^4.0.1" },
+    },
+    expect: undefined,
+  },
+  {
+    label: "裸 cordis / cosmokit — fork 已与上游断开，放行",
+    pkg: { dependencies: { cordis: "^4.0.0-rc.7", cosmokit: "^1.6.3" } },
+    expect: undefined,
+  },
+  {
+    label: "作用域包写进 dependencies — 真·宿主重复，拦截",
+    pkg: { dependencies: { "@deepseek-ai/schemastery": "^1.0.0" } },
+    expect: ["@deepseek-ai/schemastery"],
+  },
+  {
+    label: "合法 peer + 非法 dep 混合 — 仍须拦截",
+    pkg: {
+      dependencies: { "@deepseek-ai/dsh-settings": "*", clsx: "^2" },
+      peerDependencies: { "@deepseek-ai/dsh-tools": "*" },
+    },
+    expect: ["@deepseek-ai/dsh-settings"],
+  },
+  {
+    label: "只在 peerDependencies 声明 — 正确写法，放行",
+    pkg: { peerDependencies: { "@deepseek-ai/dsh-tools": "*", "@deepseek-ai/cordis": "^4.0.1" } },
+    expect: undefined,
+  },
+  { label: "无 dependencies 字段", pkg: {}, expect: undefined },
+  { label: "非对象清单", pkg: undefined, expect: undefined },
+];
+
+/** Run the offline fixtures; returns the failure count. */
+function runHostShadowFixtures() {
+  let failed = 0;
+  for (const { label, pkg, expect } of HOST_SHADOW_FIXTURES) {
+    const actual = hostShadowDependencies(pkg);
+    const ok = JSON.stringify(actual ?? null) === JSON.stringify(expect ?? null);
+    if (!ok) failed++;
+    console.log(`  ${ok ? "PASS" : "FAIL"} ${label}${ok ? "" : `  期望 ${JSON.stringify(expect)}，实得 ${JSON.stringify(actual)}`}`);
+  }
+  return failed;
+}
+
+// Self-test entry: node src/github.js --self-test
+// Offline fixtures run first and gate the network smoke test below.
 if (process.argv[1]?.endsWith("github.js") && process.argv.includes("--self-test")) {
+  console.log("宿主依赖检测 fixtures:");
+  const failed = runHostShadowFixtures();
+  console.log(`${HOST_SHADOW_FIXTURES.length - failed}/${HOST_SHADOW_FIXTURES.length} passed\n`);
+  if (failed > 0) process.exit(1);
+  if (process.argv.includes("--offline")) process.exit(0);
   const apiBase = "https://api.github.com";
   const result = await searchPlugins({ query: "", perPage: 3, apiBase });
   console.log(`total=${result.total} page=${result.page} perPage=${result.perPage}`);
