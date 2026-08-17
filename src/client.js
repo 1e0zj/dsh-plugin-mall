@@ -63,6 +63,7 @@ window.__ModuleLoader__.load({
       ".mkt_approvePkg{display:flex;flex-direction:column;gap:4px}",
       ".mkt_approveName{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary);margin-right:8px;overflow-wrap:anywhere}",
       ".mkt_approveCmd{max-height:none;margin:0}",
+      ".mkt_jobDone{display:flex;align-items:center;gap:8px;flex-wrap:wrap}",
     ].join("\n");
     var tagId = "@1e0zj/dsh-plugin-mall/market-tab.css";
     if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId) + "]") === null) {
@@ -263,7 +264,13 @@ window.__ModuleLoader__.load({
               })
               : job.detail ? h("div", { className: "mkt_desc" }, job.detail) : null,
             done && job.status === "completed"
-              ? h("div", { className: "mkt_ok" }, "完成 — 重启 dsh 后生效")
+              ? h("div", { className: "mkt_jobDone" },
+                h("span", { className: "mkt_ok" }, "完成"),
+                h("button", {
+                  className: "mkt_btn mkt_btnPrimary mkt_btnSm",
+                  disabled: props.restarting === true,
+                  onClick: props.onRestart,
+                }, props.restarting ? "重启中…" : "重启 dsh 生效"))
               : job.status === "failed" && !(job.needsApproval && job.needsApproval.length > 0)
                 ? h("div", { className: "mkt_error" }, "失败，见下方输出")
                 : null,
@@ -619,6 +626,8 @@ window.__ModuleLoader__.load({
           onClear: clearJobs,
           onApprove: doApprove,
           onDismiss: dropJob,
+          onRestart: doRestart,
+          restarting: restarting,
           approving: Object.keys(installing).filter(function (s) { return installing[s]; })[0],
         }),
         h("div", { className: "mkt_list" },
