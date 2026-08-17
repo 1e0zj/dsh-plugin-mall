@@ -217,7 +217,7 @@ export async function preferNpmSpec({ spec, registry, sources }) {
  * Extract the bare npm package name: "name", "name@version", "@s/n@version"
  * → "name"/"@s/n". Returns null for anything that is not an npm name shape.
  */
-function npmNameOf(raw) {
+export function npmNameOf(raw) {
   if (typeof raw !== "string" || raw.length === 0) return null;
   if (raw.startsWith("@")) {
     const match = /^(@[^/@\s]+\/[^/@\s]+?)(?:@[^/\s]+)?$/.exec(raw);
@@ -258,6 +258,63 @@ export async function assertSafeToInstall({ spec, registry, sources }) {
   if (hostDeps !== undefined && hostDeps !== null && hostDeps.length > 0) {
     throw new Error(`${raw} declares ${hostDeps.length} host framework package(s) as dependencies (${hostDeps.slice(0, 3).join(", ")}${hostDeps.length > 3 ? ", …" : ""}) — installing it would duplicate host modules and crash dsh tool scheduling. Ask the plugin author to move @deepseek-ai/* to peerDependencies.`);
   }
+}
+
+// ── install-script disclosure ───────────────────────────────────────────────
+//
+// pnpm blocks dependency lifecycle scripts by default; the marketplace used to
+// silently allow them and retry. Allowing them is a real decision — those
+// commands run on the user's machine with the user's privileges, before any
+// plugin code loads — so the caller has to be able to show WHAT it is asking
+// approval for, not just a package name. Everything here is one registry
+// request per blocked package (there are typically 0-3).
+
+/**
+ * Look up what a blocked package would actually execute.
+ * @param entries - `{name, version}` pairs (version optional → falls back to latest).
+ * @param options - `registry` to query; `installedName` marks which entry, if
+ *   any, is the package the user actually asked for — everything else is a
+ *   transitive dependency they never chose, which is the part worth flagging.
+ * @returns one record per entry; fields absent when the registry is unreachable.
+ */
+export async function describeBuildScripts(entries, { registry, installedName } = {}) {
+  const base = normalizeRegistry(registry);
+  const list = (Array.isArray(entries) ? entries : []).map((entry) => (
+    typeof entry === "string" ? { name: entry } : { name: entry?.name, version: entry?.version }
+  )).filter((entry) => typeof entry.name === "string" && entry.name.length > 0);
+  const out = [];
+  await mapLimit(list, NETWORK_CONCURRENCY, async ({ name, version }) => {
+    const record = { name, version, direct: installedName !== undefined && name === installedName };
+    try {
+      const point = version === undefined ? "latest" : encodeURIComponent(version);
+      const response = await fetch(`${base}/${name.replace("/", "%2F")}/${point}`, {
+        headers: { "User-Agent": "dsh-plugin-mall", Accept: "application/json" },
+      });
+      if (response.ok) {
+        const body = await response.json();
+        record.version = body.version ?? version;
+        const scripts = body.scripts ?? {};
+        record.scripts = {};
+        for (const key of ["preinstall", "install", "postinstall"]) {
+          if (typeof scripts[key] === "string") record.scripts[key] = scripts[key];
+        }
+        record.provenance = body.dist?.attestations !== undefined;
+        record.unpackedSize = body.dist?.unpackedSize;
+      }
+    } catch {
+      /* 查不到就只报名字。绝不因为查询失败而放行，也不因此阻断——
+         这里只负责补充事实，是否放行由用户决定。 */
+    }
+    try {
+      // 下载量只在 npmjs 的统计 API 上有，镜像用户可能打不通；纯可选信息。
+      const stats = await fetch(`https://api.npmjs.org/downloads/point/last-week/${name.replace("/", "%2F")}`);
+      if (stats.ok) record.weeklyDownloads = (await stats.json())?.downloads;
+    } catch {
+      /* 可选 */
+    }
+    out.push(record);
+  });
+  return out.sort((a, b) => Number(b.direct) - Number(a.direct) || a.name.localeCompare(b.name));
 }
 
 /** Loose semver-ish comparison: "0.2.10" vs "0.2.9" → 1. Non-numeric parts

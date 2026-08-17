@@ -244,7 +244,12 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
         return rpcFail(new Error(`invalid profile: ${error.message}`));
       }
       try {
-        const jobId = tracker.start({ profile, spec });
+        // 构建脚本的同意是「点名」的：只放行清单里这几个包。重试时被拦的集合
+        // 变了（依赖更新、换了版本），旧的同意不会顺延到新出现的包上。
+        const allowBuildScripts = Array.isArray(payload?.allowBuildScripts)
+          ? payload.allowBuildScripts.map((name) => String(name))
+          : undefined;
+        const jobId = tracker.start({ profile, spec, allowBuildScripts });
         return rpcOk({ jobId, profile, spec });
       } catch (error) {
         return rpcFail(error);
@@ -345,7 +350,7 @@ export function apply(ctx, config = {}) {
   ctx.systemPrompt.section({
     name: "tool:market",
     order: 120,
-    text: "The dsh plugin marketplace tools are available: market_search discovers plugins on the GitHub dsh-plugin topic, market_info inspects one repository, market_install installs a plugin into a dsh profile as a background job (poll with job_output), market_uninstall removes an installed plugin from a dsh profile as a background job, and market_installed lists a profile's plugins. A successful market_install or market_uninstall only takes effect after the dsh process restarts — remind the user to restart. Prefer plugins with meaningful stars and a dsh.bundle declaration (market_info shows both).",
+    text: "The dsh plugin marketplace tools are available: market_search discovers plugins on the GitHub dsh-plugin topic, market_info inspects one repository, market_install installs a plugin into a dsh profile as a background job (poll with job_output), market_uninstall removes an installed plugin from a dsh profile as a background job, and market_installed lists a profile's plugins. A successful market_install or market_uninstall only takes effect after the dsh process restarts — remind the user to restart. Prefer plugins with meaningful stars and a dsh.bundle declaration (market_info shows both). If market_install stops for install-script approval, that decision is the user's: show them the reported package names and commands and wait for an answer — never approve on their behalf.",
   });
 
   ctx.tools.register(defineTool({
@@ -423,7 +428,7 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register(defineTool({
     name: "market_install",
-    description: "Install a plugin into a local dsh profile by running `pnpm add` in that profile's directory, reconciling the profile's bundle layer list, and — for browser-side UI plugins (`dsh.client`) — registering a loader row in the profile's cordis.patch.yml. Same flow as `dsh plugin --profile <name> add <spec>`. ALWAYS runs as a background job: the call returns a job id immediately; poll with job_output and cancel with job_kill. GitHub-hosted installs whose build scripts pnpm blocks are retried once automatically after merging the names into the profile's allowBuilds. A successful install only takes effect after the dsh process restarts.",
+    description: "Install a plugin into a local dsh profile by running `pnpm add` in that profile's directory, reconciling the profile's bundle layer list, and — for browser-side UI plugins (`dsh.client`) — registering a loader row in the profile's cordis.patch.yml. Same flow as `dsh plugin --profile <name> add <spec>`. ALWAYS runs as a background job: the call returns a job id immediately; poll with job_output and cancel with job_kill. If pnpm blocks a dependency's install scripts, the job STOPS and reports which packages want to run install-time code, what those commands are, and whether each is the plugin itself or a transitive dependency the user never chose — nothing is executed and the profile is left untouched. Relay that list to the user verbatim, and only call again with `allowBuildScripts` naming the packages they approved. A successful install only takes effect after the dsh process restarts.",
     parameters: {
       spec: {
         type: "string",
@@ -433,6 +438,11 @@ export function apply(ctx, config = {}) {
       profile: {
         type: "string",
         description: `Target profile under $DSH_HOME/profiles. Defaults to "${defaultProfile}".`,
+      },
+      allowBuildScripts: {
+        type: "array",
+        items: { type: "string" },
+        description: "Package names whose install-time scripts the USER has approved. pnpm blocks dependency install scripts by default; when the job reports that approval is needed it lists exactly which packages want to run code and what those commands are. Show that list to the user, get their answer, and only then call again with the names they approved. Never fill this in on your own initiative.",
       },
     },
     output: {
@@ -462,11 +472,14 @@ export function apply(ctx, config = {}) {
       if (!existsSync(join(profileDir, "package.json"))) {
         ensureProfile(profile);
       }
+      const allowBuildScripts = Array.isArray(args.allowBuildScripts)
+        ? args.allowBuildScripts.map((name) => String(name))
+        : undefined;
       const jobId = ctx.jobs.start({
         kind: "dsh-plugin-install",
         label: `dsh plugin --profile ${profile} add ${spec}`,
         ...exec.agent ? { owner: exec.agent } : {},
-        run: () => runInstall({ profile, spec }),
+        run: () => runInstall({ profile, spec, allowBuildScripts }),
       });
       return { kind: "background", jobId };
     },

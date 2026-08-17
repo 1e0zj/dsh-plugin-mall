@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { createRequire } from "node:module";
 import { load } from "js-yaml";
 import { DEFAULT_PROFILE_BUNDLES, PROFILE_TEMPLATES, initProfile, resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
+import { describeBuildScripts, npmNameOf } from "./github.js";
 
 // ── spec normalization ──────────────────────────────────────────────────────
 
@@ -369,8 +370,13 @@ export function removeClientRow(profileDir, packageName) {
 /** Valid npm package name (scoped or bare) — anything else is not a name. */
 const NPM_NAME_RE = /^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/i;
 
+/**
+ * @returns `{name, version}` per blocked package. The version matters: the
+ * disclosure has to show the scripts of the version that would actually run,
+ * not whatever `latest` happens to be today.
+ */
 function parseIgnoredBuilds(output) {
-  const names = new Set();
+  const found = new Map();
   // Only pnpm's own notice line is a parsing source. "allowBuilds" also
   // appears in pnpm's advice/error text (never followed by a name list), and
   // matching it fed error echoes into the allow-list, corrupting the YAML.
@@ -380,15 +386,16 @@ function parseIgnoredBuilds(output) {
     for (const raw of match[1].split(",")) {
       const candidate = raw.trim();
       if (candidate.length === 0) continue;
-      // Strip a trailing @version or @tarball-url so `foo@1.2.3` -> `foo`,
-      // `@s/n@1.0.0` -> `@s/n`, `@s/n@https://…` -> `@s/n`. Whatever remains
-      // must be a valid npm name; pnpm error echoes ("9 | - pkg", advice
-      // sentences) are dropped instead of being written to the YAML.
-      const name = candidate.replace(/@(?:[\w.+-]+|https?:\/\/\S+|file:\S+|link:\S+|github:\S+)$/, "");
-      if (NPM_NAME_RE.test(name)) names.add(name);
+      // Split a trailing @version or @tarball-url so `foo@1.2.3` -> `foo` +
+      // `1.2.3`, `@s/n@1.0.0` -> `@s/n` + `1.0.0`. Whatever remains must be a
+      // valid npm name; pnpm error echoes ("9 | - pkg", advice sentences) are
+      // dropped instead of being written to the YAML.
+      const suffix = /@(?:([\w.+-]+)|https?:\/\/\S+|file:\S+|link:\S+|github:\S+)$/.exec(candidate);
+      const name = suffix === null ? candidate : candidate.slice(0, suffix.index);
+      if (NPM_NAME_RE.test(name) && !found.has(name)) found.set(name, { name, version: suffix?.[1] });
     }
   }
-  return [...names];
+  return [...found.values()];
 }
 
 /**
@@ -514,10 +521,10 @@ export function createJobTracker() {
     }
   };
   return {
-    start({ profile, spec, verb = "add" }) {
+    start({ profile, spec, verb = "add", allowBuildScripts }) {
       const id = `market-${++trackerCounter}`;
       const kind = verb === "remove" ? "dsh-plugin-uninstall" : "dsh-plugin-install";
-      const producer = verb === "remove" ? runRemove({ profile, packageName: spec }) : runInstall({ profile, spec });
+      const producer = verb === "remove" ? runRemove({ profile, packageName: spec }) : runInstall({ profile, spec, allowBuildScripts });
       const record = {
         id,
         kind,
@@ -533,6 +540,9 @@ export function createJobTracker() {
       producer.done.then((outcome) => {
         record.status = outcome.status ?? "failed";
         record.detail = outcome.detail;
+        // 待批准的构建脚本清单：浏览器侧据此渲染「允许并继续」，没有它就只有
+        // 一段文本，用户看不出要批准的到底是什么。
+        record.needsApproval = outcome.needsApproval;
         record.finishedAt = Date.now();
       });
       records.set(id, record);
@@ -549,6 +559,8 @@ export function createJobTracker() {
           label: record.label,
           status: record.status,
           detail: record.detail,
+          needsApproval: record.needsApproval,
+          spec: record.spec,
           startedAt: record.startedAt,
           finishedAt: record.finishedAt,
         },
@@ -623,7 +635,38 @@ async function enablePnpmViaCorepack(push) {
  * A failure whose output lists ignored build scripts gets one automatic
  * retry after merging those names into `allowBuilds`.
  */
-export function runInstall({ profile, spec }) {
+/**
+ * Render "here is exactly what you would be approving". Deliberately avoids
+ * any wording like "security check passed" — approving these scripts says
+ * nothing about what the plugin does once it is loaded.
+ */
+function renderApprovalNeeded(spec, disclosure) {
+  const lines = [
+    `installing ${spec} requires running install-time code — approval needed.`,
+    "No install script ran and no plugin code loaded. pnpm did leave the downloaded",
+    "files and a dependency entry in the profile (unusable until the scripts run);",
+    "approving continues from there, and market_uninstall removes them if you cancel.",
+    "",
+  ];
+  for (const entry of disclosure) {
+    const origin = entry.direct
+      ? "the plugin itself"
+      : "a transitive dependency — NOT the package you asked for";
+    lines.push(`  ${entry.name}${entry.version ? `@${entry.version}` : ""}   (${origin})`);
+    for (const [key, command] of Object.entries(entry.scripts ?? {})) lines.push(`      ${key}: ${command}`);
+    const facts = [];
+    if (typeof entry.weeklyDownloads === "number") facts.push(`${entry.weeklyDownloads.toLocaleString()} weekly downloads`);
+    facts.push(entry.provenance === true ? "has provenance" : "no provenance");
+    if (typeof entry.unpackedSize === "number") facts.push(`${Math.round(entry.unpackedSize / 104857.6) / 10} MB unpacked`);
+    lines.push(`      ${facts.join(" · ")}`);
+  }
+  lines.push("");
+  lines.push("These commands run on your machine, with your privileges, before any plugin code loads.");
+  lines.push(`To proceed, install again with allowBuildScripts: [${disclosure.map((entry) => JSON.stringify(entry.name)).join(", ")}]`);
+  return lines.join("\n");
+}
+
+export function runInstall({ profile, spec, allowBuildScripts }) {
   const profileDir = ensureProfile(profile);
   // Dependency keys BEFORE pnpm add, so reconcile only manages entries that
   // were (or became) dependencies and never touches template bundles.
@@ -709,13 +752,31 @@ export function runInstall({ profile, spec }) {
     if (ignored.length === 0) {
       return { status: "failed", detail: `pnpm add ${spec} failed (exit code ${outcome.exitCode}). See job output.` };
     }
-    // 放行构建脚本 = 允许这些包在安装期执行自己的任意代码，正是 pnpm 默认
-    // 拦下来的东西。说明白，别让它淹在 pnpm 的刷屏输出里。
-    push(`\n[dsh-plugin-mall] pnpm blocked install scripts for: ${ignored.join(", ")}\n`);
-    push(`[dsh-plugin-mall] allowing them in the profile's pnpm-workspace.yaml and retrying once — these packages will run their own install-time code.\n`);
+    // 放行构建脚本 = 让这些包在用户机器上、以用户的权限、在任何插件代码加载
+    // 之前执行任意命令。这个决定属于用户，不属于我们。所以没有点名同意时就停
+    // 在这里——pnpm 拦截的位置恰好在「已下载」与「已执行」之间，此刻什么都还
+    // 没跑，profile 也一个字节没动。
+    const consented = new Set((Array.isArray(allowBuildScripts) ? allowBuildScripts : []).map((name) => String(name)));
+    const missing = ignored.filter((entry) => !consented.has(entry.name));
+    if (missing.length > 0) {
+      push(`\n[dsh-plugin-mall] pnpm blocked install scripts for: ${ignored.map((entry) => entry.name).join(", ")}\n`);
+      push("[dsh-plugin-mall] stopping for approval — no install script ran, nothing is loadable yet.\n");
+      let disclosure;
+      try {
+        disclosure = await describeBuildScripts(missing, {
+          registry: await resolveRegistry(profile),
+          installedName: npmNameOf(spec) ?? undefined,
+        });
+      } catch {
+        disclosure = missing.map((entry) => ({ ...entry, direct: false }));
+      }
+      return { status: "failed", detail: renderApprovalNeeded(spec, disclosure), needsApproval: disclosure };
+    }
+    push(`\n[dsh-plugin-mall] approved install scripts: ${ignored.map((entry) => entry.name).join(", ")}\n`);
+    push("[dsh-plugin-mall] allowing them in the profile's pnpm-workspace.yaml and retrying once.\n");
     let rollbackAllowBuilds;
     try {
-      rollbackAllowBuilds = ensureAllowBuilds(profileDir, ignored);
+      rollbackAllowBuilds = ensureAllowBuilds(profileDir, ignored.map((entry) => entry.name));
     } catch (error) {
       return { status: "failed", detail: `could not allow the blocked build scripts: ${error.message}. The profile was left untouched — approve them yourself with \`pnpm approve-builds\` in ${profileDir}, then retry.` };
     }

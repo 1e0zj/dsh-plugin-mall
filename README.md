@@ -148,12 +148,15 @@ dsh plugin --profile web add link:C:\path\to\dsh-plugin-mall
   （这行会出现在任务日志里）。更新检查读的是 registry 的 `/latest` 端点，
   不经过该策略，所以两边看到的「最新版本」本就可能不同。
   首次安装（卡片按钮）不带版本，沿用 pnpm 的策略默认值即可。
-- GitHub 源的插件、以及带原生模块的包安装时要跑构建脚本，pnpm 默认拦截；
-  本插件检测到拦截后会把包名自动合并进 profile 的 `pnpm-workspace.yaml` 的
-  `allowBuilds` 并自动重试一次。合并时跟随文件里已有的形状（pnpm 两种都认：
-  序列 `- name` 和映射 `name: true`，但**混在一起就是无效 YAML**），没有已有
-  形状时用 pnpm 自己写的映射格式；pnpm 留下的未决占位符
-  （`name: set this to true or false`）会被改写成 `true` 而不是当作已放行。
+- **安装期代码要用户点头**：pnpm 默认拦掉依赖的构建脚本，放行等于让那些命令
+  以用户的权限在其机器上运行（早于任何插件代码加载）——这个决定属于用户。
+  所以被拦时安装**停下**，如实列出要批准的到底是什么：包名@版本、确切的
+  命令、周下载量、有无 provenance、以及「是你要装的插件本身，还是一个你
+  从没选过的传递依赖」（多数情况是后者）。用户同意后带**点名**的
+  `allowBuildScripts` 重新发起，同意不顺延到重试时新出现的包上。措辞刻意
+  不写「安全检查」——批准这些脚本对插件装好之后会做什么一无所证。
+  topic 里 77 个真插件自带 install 脚本的实测为 0，所以这道确认只在拖着
+  原生模块/构建步骤的少数插件上出现，同意一次后 `allowBuilds` 记住、不再问。
 - **对 profile 配置的每一次写入都是先写后校验、解析不过就回滚**
   （`writeChecked`）：装别人的插件失败，绝不能留下 dsh 或 pnpm 加载不了的
   profile。覆盖 `pnpm-workspace.yaml`、`package.json`、`cordis.patch.yml`
