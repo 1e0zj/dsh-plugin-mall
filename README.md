@@ -140,9 +140,17 @@ dsh plugin --profile web add link:C:\path\to\dsh-plugin-mall
   （文本级精准移除，用户手写的行不受影响）。
 - 安装源解析：`github:owner/repo` 优先改写为同名 npm 包（仅当 registry
   条目的 repository 指回该仓库，防止抢注），否则用 GitHub 全仓库 spec。
-- GitHub 源的插件安装时要跑 prepare 构建脚本，pnpm 默认拦截；本插件检测到
-  拦截后会把包名自动合并进 profile 的 `pnpm-workspace.yaml` 的 `allowBuilds`
-  并自动重试一次（解析只认合法 npm 包名，写入一律加引号，不会写坏 YAML）。
+- GitHub 源的插件、以及带原生模块的包安装时要跑构建脚本，pnpm 默认拦截；
+  本插件检测到拦截后会把包名自动合并进 profile 的 `pnpm-workspace.yaml` 的
+  `allowBuilds` 并自动重试一次。合并时跟随文件里已有的形状（pnpm 两种都认：
+  序列 `- name` 和映射 `name: true`，但**混在一起就是无效 YAML**），没有已有
+  形状时用 pnpm 自己写的映射格式；pnpm 留下的未决占位符
+  （`name: set this to true or false`）会被改写成 `true` 而不是当作已放行。
+- **对 profile 配置的每一次写入都是先写后校验、解析不过就回滚**
+  （`writeChecked`）：装别人的插件失败，绝不能留下 dsh 或 pnpm 加载不了的
+  profile。覆盖 `pnpm-workspace.yaml`、`package.json`、`cordis.patch.yml`
+  三处。`allowBuilds` 是持久化的安全配置，所以安装最终失败时这次放宽会被
+  **撤销** —— 否则一个没装成的插件会让那个包名从此静默获得构建脚本执行权。
 - 配置（`cordis.patch.yml` 中可改）：`defaultProfile`（默认装进哪个 profile，
   默认 `web`）、`apiBase`（GitHub API 地址）、`npmRegistry`（npm 查询源，留空
   则跟随 pnpm 实际安装源）、`rawSources`（验证用的 package.json 源模板列表，
@@ -173,3 +181,6 @@ npm publish --access public
   加 `--offline` 只跑不联网的 fixture（宿主依赖检测的判据固化在那里 ——
   它当初的实测对象 dsh-TUI 已被上报修复，网络上不再有可复现的回归用例，
   所以改 `HOST_PACKAGES` 前请先跑这组）。
+- `src/installer.js` 也有一组 fixture，固化 `allowBuilds` 合并的全部形状
+  （改 `mergeAllowBuilds` 前必跑）。它有宿主依赖，所以要从**已安装副本**运行：
+  `node ~/.dsh/profiles/web/node_modules/@1e0zj/dsh-plugin-mall/src/installer.js --self-test`

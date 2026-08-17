@@ -7,7 +7,7 @@
 // @deepseek-ai/dsh-app-boot APIs for profile resolution and initialization.
 
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 import { load } from "js-yaml";
@@ -29,6 +29,69 @@ export function normalizeSpec(raw) {
   if (/^(?:github:|git\+|git:|ssh:|npm:|file:|link:|https?:\/\/|\.{1,2}(?:[/\\]|$))/i.test(spec)) return spec;
   if (/^[^@/\s]+\/[^@/\s]+$/.test(spec)) return `github:${spec}`;
   return spec; // bare npm package name
+}
+
+// ── guarded config writes ───────────────────────────────────────────────────
+//
+// Installing someone else's plugin must never be able to leave a profile that
+// dsh or pnpm refuses to load. Every write to a shared profile config goes
+// through here: the new bytes are parsed back, and anything that does not
+// parse is rolled back to the previous bytes before the error propagates. A
+// bug in our own editing then costs a failed install, not a profile the user
+// has to repair by hand.
+//
+// This is not hypothetical. Editing `allowBuilds` as a YAML sequence while
+// pnpm had already written its own mapping stub produced a file no parser
+// accepted, and every later pnpm operation in that profile — install,
+// uninstall, update, any plugin at all — failed until the file was fixed
+// manually.
+
+/**
+ * Write a config file only if the result still parses.
+ * @param filePath - the file to write.
+ * @param nextContent - the full new contents.
+ * @param parse - throws when the content is not valid.
+ * @param label - file name used in error messages.
+ * @returns a rollback function restoring the pre-write bytes.
+ */
+function writeChecked(filePath, nextContent, parse, label) {
+  const previous = existsSync(filePath) ? readFileSync(filePath, "utf8") : undefined;
+  const rollback = () => {
+    if (previous === undefined) rmSync(filePath, { force: true });
+    else writeFileSync(filePath, previous);
+  };
+  writeFileSync(filePath, nextContent);
+  try {
+    parse(nextContent);
+  } catch (error) {
+    rollback();
+    throw new Error(`${label} would not parse after the edit and was restored unchanged (${error.message}) — this is a bug in dsh-plugin-mall, please report it`);
+  }
+  return rollback;
+}
+
+/** writeChecked for YAML profile configs. */
+function writeYamlChecked(filePath, nextContent, label) {
+  return writeChecked(filePath, nextContent, (text) => load(text), label);
+}
+
+/** writeChecked for JSON profile configs. */
+function writeJsonChecked(filePath, nextContent, label) {
+  return writeChecked(filePath, nextContent, (text) => JSON.parse(text), label);
+}
+
+/**
+ * writeChecked for cordis.patch.yml — the loader patch layer. Beyond parsing,
+ * the contract is a top-level array; anything else and dsh fails to boot, so
+ * that is checked here too rather than discovered at the next start.
+ */
+function writePatchChecked(filePath, nextContent) {
+  return writeChecked(filePath, nextContent, (text) => {
+    const doc = load(text);
+    if (doc !== null && doc !== undefined && !Array.isArray(doc)) {
+      throw new Error("expected a top-level array of patch entries");
+    }
+  }, "cordis.patch.yml");
 }
 
 // ── profile management ──────────────────────────────────────────────────────
@@ -115,7 +178,7 @@ export function reconcileBundles(profileDir, beforeDeps = new Set()) {
         bundles: result,
       },
     };
-    writeFileSync(manifestPath, JSON.stringify(manifest, undefined, 2) + "\n");
+    writeJsonChecked(manifestPath, JSON.stringify(manifest, undefined, 2) + "\n", "package.json");
   }
   return result;
 }
@@ -263,12 +326,12 @@ export function ensureClientRow(profileDir, packageName) {
   if (alreadyByName) return { added: false };
   const rowId = clientRowId(packageName);
   const block = `- insert:\n    - id: ${rowId}\n      name: '${packageName}'\n`;
-  if (Array.isArray(parsed) && parsed.length === 0) {
+  const next = (Array.isArray(parsed) && parsed.length === 0)
     // The stock template is a comment plus `[]`; replace it wholesale.
-    writeFileSync(patchPath, block);
-  } else {
-    writeFileSync(patchPath, content.endsWith("\n") ? `${content}${block}` : `${content}\n${block}`);
-  }
+    ? block
+    : content.endsWith("\n") ? `${content}${block}` : `${content}\n${block}`;
+  // 这个文件是 dsh 的装配补丁层：写坏了宿主直接起不来。
+  writePatchChecked(patchPath, next);
   return { added: true, rowId };
 }
 
@@ -296,7 +359,7 @@ export function removeClientRow(profileDir, packageName) {
   }
   if (!removed) return { removed: false };
   const next = lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
-  writeFileSync(patchPath, next.length === 0 ? "[]\n" : `${next}\n`);
+  writePatchChecked(patchPath, next.length === 0 ? "[]\n" : `${next}\n`);
   return { removed: true, rowId };
 }
 
@@ -328,40 +391,95 @@ function parseIgnoredBuilds(output) {
   return [...names];
 }
 
-/** Merge new names into the profile's pnpm-workspace.yaml `allowBuilds` list. */
-function ensureAllowBuilds(profileDir, names) {
-  const valid = names.filter((name) => NPM_NAME_RE.test(name));
-  if (valid.length === 0) return;
-  const workspacePath = join(profileDir, "pnpm-workspace.yaml");
-  let content = existsSync(workspacePath)
-    ? readFileSync(workspacePath, "utf8")
-    : "packages:\n  - .\n\nnodeLinker: hoisted\n";
+/**
+ * Merge names into the profile's `pnpm-workspace.yaml` `allowBuilds`.
+ *
+ * pnpm accepts both shapes — a sequence (`- name`) and a mapping
+ * (`name: true`) — but never both under one key, and pnpm writes a mapping
+ * stub of its own (`name: set this to true or false`) when it blocks a build.
+ * Appending a sequence item to that stub is what produced an unparseable file.
+ * So: read the current shape through a real YAML parse, match it, and default
+ * to pnpm's own mapping shape when there is nothing to match, which keeps our
+ * edits and pnpm's from ever colliding again.
+ *
+ * A name already present as a mapping entry whose value is NOT `true` (pnpm's
+ * undecided stub) is rewritten rather than skipped — treating the stub as
+ * "already allowed" would leave the build still blocked on retry.
+ *
+ * Pure: takes the current file contents, returns the new contents (or
+ * undefined when nothing needs changing). The fs half is ensureAllowBuilds.
+ * Split out because this text surgery is the part that broke a profile, so it
+ * is the part the fixtures at the bottom of this file have to pin.
+ *
+ * @param content - current pnpm-workspace.yaml contents.
+ * @param names - package names to allow.
+ * @returns the new contents, or undefined when already satisfied.
+ * @throws when `content` does not parse as YAML.
+ */
+export function mergeAllowBuilds(content, names) {
+  const valid = (Array.isArray(names) ? names : []).filter((name) => NPM_NAME_RE.test(name));
+  if (valid.length === 0) return undefined;
+  // A file that is already broken is not ours to edit — we could only make it
+  // worse, and the user needs to see the real reason.
+  let parsed;
+  try {
+    parsed = load(content);
+  } catch (error) {
+    throw new Error(`pnpm-workspace.yaml does not parse, refusing to edit it: ${error.message}`);
+  }
+  const current = parsed?.allowBuilds;
+  const asSequence = Array.isArray(current);
+  const asMapping = !asSequence && current !== null && typeof current === "object";
+  const allowed = new Set(asSequence
+    ? current.map((entry) => String(entry))
+    : asMapping ? Object.entries(current).filter(([, value]) => value === true).map(([key]) => key) : []);
+  // pnpm 的未决占位符（值不是 true）要改写，不能当成已放行跳过。
+  const stubs = asMapping ? valid.filter((name) => name in current && current[name] !== true) : [];
+  const additions = valid.filter((name) => !allowed.has(name) && !stubs.includes(name));
+  if (additions.length === 0 && stubs.length === 0) return undefined;
+
+  // Quote sequence entries: a bare `@scope/name` opens with YAML's reserved
+  // `@` indicator. Mapping keys do not need it.
+  const render = (name) => (asSequence ? `  - '${name}'` : `  ${name}: true`);
   const lines = content.split("\n");
+  for (const name of stubs) {
+    const pattern = new RegExp(`^(\\s*)(['"]?)${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\2\\s*:.*$`);
+    const index = lines.findIndex((line) => pattern.test(line));
+    if (index !== -1) lines[index] = `  ${name}: true`;
+  }
+  let next;
   const keyIndex = lines.findIndex((line) => /^allowBuilds\s*:/.test(line));
   if (keyIndex === -1) {
-    if (!content.endsWith("\n")) content += "\n";
-    // Quote every entry: a bare `@scope/name` starts with YAML's reserved
-    // `@` indicator and fails to parse.
-    content += `\nallowBuilds:\n${valid.map((name) => `  - '${name}'`).join("\n")}\n`;
+    const base = lines.join("\n");
+    next = `${base.endsWith("\n") ? base : `${base}\n`}\nallowBuilds:\n${additions.map(render).join("\n")}\n`;
   } else {
-    const existing = new Set();
+    // 块内 = 缩进行；空行不终止块；顶格行是下一个 key。
     let insertIndex = keyIndex + 1;
     for (let index = keyIndex + 1; index < lines.length; index++) {
-      const item = /^\s*-\s+(.+?)\s*$/.exec(lines[index]);
-      if (item) {
-        existing.add(item[1].replace(/^['"](.*)['"]$/, "$1"));
-        insertIndex = index + 1;
-        continue;
-      }
-      if (/^\S/.test(lines[index])) break;
+      if (lines[index].trim().length === 0) continue;
+      if (/^\s/.test(lines[index])) { insertIndex = index + 1; continue; }
+      break;
     }
-    const additions = valid.filter((name) => !existing.has(name));
-    if (additions.length > 0) {
-      lines.splice(insertIndex, 0, ...additions.map((name) => `  - '${name}'`));
-      content = lines.join("\n");
-    }
+    if (additions.length > 0) lines.splice(insertIndex, 0, ...additions.map(render));
+    next = lines.join("\n");
   }
-  writeFileSync(workspacePath, content);
+  return next;
+}
+
+/** Default pnpm-workspace.yaml for a profile that has none yet. */
+const DEFAULT_WORKSPACE_YAML = "packages:\n  - .\n\nnodeLinker: hoisted\n";
+
+/**
+ * Apply mergeAllowBuilds to the profile's pnpm-workspace.yaml through the
+ * guarded writer.
+ * @returns a rollback function, or undefined when nothing needed changing.
+ */
+function ensureAllowBuilds(profileDir, names) {
+  const workspacePath = join(profileDir, "pnpm-workspace.yaml");
+  const content = existsSync(workspacePath) ? readFileSync(workspacePath, "utf8") : DEFAULT_WORKSPACE_YAML;
+  const next = mergeAllowBuilds(content, names);
+  if (next === undefined) return undefined;
+  return writeYamlChecked(workspacePath, next, "pnpm-workspace.yaml");
 }
 
 // ── in-process install tracker (browser RPC surface) ────────────────────────
@@ -591,18 +709,39 @@ export function runInstall({ profile, spec }) {
     if (ignored.length === 0) {
       return { status: "failed", detail: `pnpm add ${spec} failed (exit code ${outcome.exitCode}). See job output.` };
     }
-    push(`\n[dsh-plugin-mall] pnpm blocked build scripts: ${ignored.join(", ")} — merging into allowBuilds and retrying once\n`);
-    ensureAllowBuilds(profileDir, ignored);
+    // 放行构建脚本 = 允许这些包在安装期执行自己的任意代码，正是 pnpm 默认
+    // 拦下来的东西。说明白，别让它淹在 pnpm 的刷屏输出里。
+    push(`\n[dsh-plugin-mall] pnpm blocked install scripts for: ${ignored.join(", ")}\n`);
+    push(`[dsh-plugin-mall] allowing them in the profile's pnpm-workspace.yaml and retrying once — these packages will run their own install-time code.\n`);
+    let rollbackAllowBuilds;
+    try {
+      rollbackAllowBuilds = ensureAllowBuilds(profileDir, ignored);
+    } catch (error) {
+      return { status: "failed", detail: `could not allow the blocked build scripts: ${error.message}. The profile was left untouched — approve them yourself with \`pnpm approve-builds\` in ${profileDir}, then retry.` };
+    }
+    // allowBuilds 是持久化的安全配置。为一次没装成的插件单向放宽它，等于以后
+    // 这个包名再出现（哪怕是别人的传递依赖）就静默放行——失败必须收回。
+    const revert = () => {
+      if (rollbackAllowBuilds === undefined) return;
+      try {
+        rollbackAllowBuilds();
+        push("[dsh-plugin-mall] install failed — reverted the allowBuilds change, the profile is as it was\n");
+      } catch {
+        /* 还原失败不该盖掉真正的失败原因 */
+      }
+    };
     const retry = spawnAdd();
     current = retry.proc;
     const retryOutcome = await retry.done;
     if (retryOutcome.spawnError !== undefined) {
+      revert();
       return { status: "failed", detail: `retry could not start pnpm: ${retryOutcome.spawnError.message}` };
     }
     if (retryOutcome.exitCode === 0) {
       return finalizeSuccess();
     }
-    return { status: "failed", detail: `pnpm add ${spec} still failed after allowing build scripts (exit code ${retryOutcome.exitCode}). See job output.` };
+    revert();
+    return { status: "failed", detail: `pnpm add ${spec} still failed after allowing build scripts (exit code ${retryOutcome.exitCode}). See job output. The allowBuilds change was reverted; pnpm may still have left the dependency in the profile's package.json — market_uninstall removes it.` };
   };
 
   const first = spawnAdd();
@@ -709,4 +848,107 @@ export function runRemove({ profile, packageName }, selfHealed = false) {
       return deltaQueue.splice(0).join("");
     },
   };
+}
+
+// ── offline fixtures ────────────────────────────────────────────────────────
+//
+// mergeAllowBuilds is the text surgery that bricked a profile: it appended a
+// YAML sequence item under a key pnpm had already written as a mapping, and
+// the resulting file parsed nowhere, so every later pnpm operation in that
+// profile failed until it was repaired by hand. These cases pin every shape it
+// can meet. Run them from an INSTALLED copy (the bare imports at the top of
+// this file resolve through the host, not through a bare checkout):
+//   node ~/.dsh/profiles/web/node_modules/@1e0zj/dsh-plugin-mall/src/installer.js --self-test
+const BASE_WS = "packages:\n  - .\n\nnodeLinker: hoisted\nautoInstallPeers: false\n";
+
+const ALLOW_BUILDS_FIXTURES = [
+  {
+    label: "没有 allowBuilds —— 新建，用 pnpm 自己的映射格式",
+    content: BASE_WS,
+    names: ["node-pty"],
+    check: (out) => load(out).allowBuilds?.["node-pty"] === true,
+  },
+  {
+    label: "pnpm 的未决占位符 —— 改写成 true，而不是当作已放行跳过",
+    content: `${BASE_WS}allowBuilds:\n  node-pty: set this to true or false\n`,
+    names: ["node-pty"],
+    check: (out) => load(out).allowBuilds?.["node-pty"] === true,
+  },
+  {
+    label: "已有映射条目 —— 追加同为映射，不混格式",
+    content: `${BASE_WS}allowBuilds:\n  esbuild: true\n`,
+    names: ["node-pty"],
+    check: (out) => { const a = load(out).allowBuilds; return a?.esbuild === true && a?.["node-pty"] === true; },
+  },
+  {
+    label: "已有序列条目 —— 追加同为序列，不混格式（正是砖化那次的形状）",
+    content: `${BASE_WS}allowBuilds:\n  - 'esbuild'\n`,
+    names: ["node-pty"],
+    check: (out) => { const a = load(out).allowBuilds; return Array.isArray(a) && a.includes("esbuild") && a.includes("node-pty"); },
+  },
+  {
+    label: "序列里已存在 —— 无需改动",
+    content: `${BASE_WS}allowBuilds:\n  - 'node-pty'\n`,
+    names: ["node-pty"],
+    expectNoChange: true,
+  },
+  {
+    label: "映射里已是 true —— 无需改动",
+    content: `${BASE_WS}allowBuilds:\n  node-pty: true\n`,
+    names: ["node-pty"],
+    expectNoChange: true,
+  },
+  {
+    label: "scoped 包名在序列里要加引号（@ 是 YAML 保留指示符）",
+    content: `${BASE_WS}allowBuilds:\n  - 'esbuild'\n`,
+    names: ["@scope/native-thing"],
+    check: (out) => load(out).allowBuilds?.includes("@scope/native-thing"),
+  },
+  {
+    label: "allowBuilds 后面还有别的 key —— 不插到别人块里",
+    content: `packages:\n  - .\n\nallowBuilds:\n  esbuild: true\n\nnodeLinker: hoisted\n`,
+    names: ["node-pty"],
+    check: (out) => { const d = load(out); return d.allowBuilds?.["node-pty"] === true && d.nodeLinker === "hoisted"; },
+  },
+  {
+    label: "非法包名被过滤，无合法名时不动文件",
+    content: BASE_WS,
+    names: ["9 | - pkg", "Run \"pnpm approve-builds\""],
+    expectNoChange: true,
+  },
+  {
+    label: "文件本来就坏 —— 拒绝编辑，不让它更坏",
+    content: "allowBuilds:\n  - 'a'\n  a: b\n",
+    names: ["node-pty"],
+    expectThrow: true,
+  },
+];
+
+function runAllowBuildsFixtures() {
+  let failed = 0;
+  for (const fx of ALLOW_BUILDS_FIXTURES) {
+    let out, error;
+    try { out = mergeAllowBuilds(fx.content, fx.names); } catch (e) { error = e; }
+    let ok;
+    if (fx.expectThrow) ok = error !== undefined;
+    else if (error !== undefined) ok = false;
+    else if (fx.expectNoChange) ok = out === undefined;
+    else ok = out !== undefined && (() => { try { return fx.check(out) === true; } catch { return false; } })();
+    // 任何产出都必须是可解析的 YAML —— 这是这组用例存在的全部理由。
+    if (ok && out !== undefined) {
+      try { load(out); } catch { ok = false; }
+    }
+    if (!ok) failed++;
+    console.log(`  ${ok ? "PASS" : "FAIL"} ${fx.label}`);
+    if (!ok && out !== undefined) console.log(`       产出:\n${out.split("\n").map((l) => `       | ${l}`).join("\n")}`);
+    if (!ok && error !== undefined) console.log(`       抛错: ${error.message}`);
+  }
+  return failed;
+}
+
+if (process.argv[1]?.endsWith("installer.js") && process.argv.includes("--self-test")) {
+  console.log("allowBuilds 合并 fixtures:");
+  const failed = runAllowBuildsFixtures();
+  console.log(`${ALLOW_BUILDS_FIXTURES.length - failed}/${ALLOW_BUILDS_FIXTURES.length} passed`);
+  process.exit(failed === 0 ? 0 : 1);
 }
