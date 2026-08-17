@@ -19,8 +19,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
-import { repoInfo, searchPlugins, verifyPlugins, preferNpmSpec, npmPackageInfo, compareVersions, assertSafeToInstall } from "./github.js";
-import { ensureProfile, listInstalled, normalizeSpec, runInstall, runRemove, createJobTracker, assertSafeSpec } from "./installer.js";
+import { repoInfo, searchPlugins, verifyPlugins, preferNpmSpec, npmPackageInfo, compareVersions, assertSafeToInstall, mapLimit, NETWORK_CONCURRENCY } from "./github.js";
+import { ensureProfile, listInstalled, normalizeSpec, runInstall, runRemove, createJobTracker, assertSafeSpec, resolveRegistry } from "./installer.js";
 
 export const name = "@1e0zj/dsh-plugin-mall";
 export const inject = ["tools", "jobs", "systemPrompt"];
@@ -28,9 +28,22 @@ export const inject = ["tools", "jobs", "systemPrompt"];
 export const Config = z.object({
   defaultProfile: z.string().default("web"),
   apiBase: z.string().default("https://api.github.com"),
+  npmRegistry: z.string().default(""),
+  rawSources: z.array(z.string()).default([]),
   perPageMax: z.number().default(30),
   allowRestart: z.boolean().default(true),
 });
+
+/**
+ * The registry to query for a profile: an explicit `npmRegistry` config wins,
+ * otherwise follow whatever pnpm installs from (profile .npmrc → pnpm config →
+ * npmjs). Never npmjs-by-assumption: a mirror user would silently lose
+ * anti-squatting, update checks, and the host-shadow guard all at once.
+ */
+async function registryFor(profile, npmRegistry) {
+  const explicit = String(npmRegistry ?? "").trim();
+  return explicit.length > 0 ? explicit.replace(/\/+$/, "") : await resolveRegistry(profile);
+}
 
 /** Clip long strings for compact model-facing output. */
 function clip(text, max) {
@@ -150,7 +163,7 @@ function rpcFail(error) {
  * @returns the {ok, value|error} envelope.
  */
 async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
-  const { defaultProfile = "web", apiBase = "https://api.github.com", perPageMax = 30, allowRestart = true } = config;
+  const { defaultProfile = "web", apiBase = "https://api.github.com", perPageMax = 30, allowRestart = true, npmRegistry = "", rawSources = [] } = config;
   switch (endpoint) {
     case "search": {
       const perPage = Math.min(Math.max(Math.trunc(payload?.perPage ?? 10) || 10, 1), Math.trunc(perPageMax) || 30);
@@ -166,7 +179,7 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
       return rpcOk(result);
     }
     case "verify": {
-      const result = await verifyPlugins({ repos: payload?.repos });
+      const result = await verifyPlugins({ repos: payload?.repos, sources: rawSources });
       return rpcOk(result);
     }
     case "updates": {
@@ -178,14 +191,16 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
       } catch (error) {
         return rpcFail(new Error(`invalid profile: ${error.message}`));
       }
+      const registry = await registryFor(profile, npmRegistry);
       const results = {};
-      await Promise.all(deps.map(async (dep) => {
+      // 同 verifyPlugins 的 worker 池，而不是对所有依赖一次性扇出。
+      await mapLimit(deps, NETWORK_CONCURRENCY, async (dep) => {
         if (dep.kind === "missing") { results[dep.name] = { latest: null }; return; }
-        const info = await npmPackageInfo(dep.name);
+        const info = await npmPackageInfo(dep.name, { registry });
         results[dep.name] = info === null
           ? { latest: null }
           : { latest: info.latest, hasUpdate: compareVersions(info.latest, dep.version) > 0 };
-      }));
+      });
       return rpcOk(results);
     }
     case "info": {
@@ -211,12 +226,14 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
         return rpcFail(error);
       }
       // npm tarball 优先（小而快、带 integrity）；registry 条目不同源的包名
-      // 视为抢注，回退 github: 全仓库 spec。
-      spec = await preferNpmSpec({ spec });
+      // 视为抢注，回退 github: 全仓库 spec。查的 registry 必须是 pnpm 实际
+      // 安装用的那个，否则镜像用户这里永远比对不上、次次退化成全仓库克隆。
+      const registry = await registryFor(profile, npmRegistry);
+      spec = await preferNpmSpec({ spec, registry, sources: rawSources });
       // 宿主依赖硬拦：dependencies 里拖着 @deepseek-ai/* 的包装进 profile
       // 就是双模块实例 + 全工具调度崩溃（宿主无任何护栏，市场是最后防线）。
       try {
-        await assertSafeToInstall({ spec });
+        await assertSafeToInstall({ spec, registry, sources: rawSources });
       } catch (error) {
         return rpcFail(error);
       }
@@ -322,7 +339,7 @@ function registerRpcChannel(ctx, config, token) {
 }
 
 export function apply(ctx, config = {}) {
-  const { defaultProfile = "web", apiBase = "https://api.github.com", perPageMax = 30 } = config;
+  const { defaultProfile = "web", apiBase = "https://api.github.com", perPageMax = 30, npmRegistry = "", rawSources = [] } = config;
   const token = process.env.GITHUB_TOKEN ?? process.env.DSH_MARKET_GITHUB_TOKEN;
 
   ctx.systemPrompt.section({
@@ -433,8 +450,9 @@ export function apply(ctx, config = {}) {
       const profile = String(args.profile ?? defaultProfile).trim();
       const normalized = normalizeSpec(args.spec);
       assertSafeSpec(normalized);
-      const spec = await preferNpmSpec({ spec: normalized });
-      await assertSafeToInstall({ spec });
+      const registry = await registryFor(profile, npmRegistry);
+      const spec = await preferNpmSpec({ spec: normalized, registry, sources: rawSources });
+      await assertSafeToInstall({ spec, registry, sources: rawSources });
       let profileDir;
       try {
         profileDir = resolveProfileDir(profile);

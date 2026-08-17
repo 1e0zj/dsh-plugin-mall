@@ -116,25 +116,50 @@ export async function searchPlugins({ query, sort = "stars", perPage = 10, page 
 // points back at that GitHub repo, which doubles as an anti-squatting check
 // (an unrelated package squatting the name never matches, install falls back
 // to the explicit github: spec).
+//
+// The registry to query is the CALLER's business (see resolveRegistry in
+// installer.js): it has to be the one pnpm installs from. Querying npmjs while
+// pnpm installs from a mirror fails three ways at once and all of them are
+// silent — anti-squatting never matches (every install degrades to a whole-repo
+// GitHub clone plus a prepare build), `latest` comes back null (the update
+// button disappears), and assertSafeToInstall sees no manifest, so the
+// host-shadow guard stops guarding.
 
-const NPM_REGISTRY = "https://registry.npmjs.org";
-const npmCache = new Map(); // name -> {info, at} — null misses expire after 5 min
+export const DEFAULT_NPM_REGISTRY = "https://registry.npmjs.org";
+// `${registry}|${name}` -> {info, at}. Keyed by registry so a config change
+// cannot serve answers from a different registry.
+const npmCache = new Map();
+// Success and failure expire alike. A never-expiring success cache means
+// `hasUpdate` is frozen for the process lifetime: the author publishes, and no
+// amount of "刷新已装" shows it until dsh restarts — self-defeating for a
+// marketplace whose selling point is update management.
+const NPM_CACHE_TTL = 300000;
+
+/** Strip trailing slashes so `${base}/${name}` never doubles up. */
+function normalizeRegistry(registry) {
+  const value = String(registry ?? "").trim();
+  return (value.length > 0 ? value : DEFAULT_NPM_REGISTRY).replace(/\/+$/, "");
+}
 
 /**
- * Look up a package on the npm registry (abbreviated metadata). Successful
- * lookups cache for the process lifetime; "not found / unreachable" (null)
- * expires after 5 minutes so a transient registry failure self-heals.
+ * Look up a package's `latest` manifest on an npm registry.
+ * @param name - the npm package name.
+ * @param options - `registry` defaults to npmjs; pass what pnpm installs from.
+ * @returns `{latest, repositoryUrl, hostDeps}`, or null when unknown/unreachable.
  */
-export async function npmPackageInfo(name) {
+export async function npmPackageInfo(name, { registry } = {}) {
   const clean = String(name ?? "").trim();
   if (clean.length === 0 || !/^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/i.test(clean)) return null;
-  const cached = npmCache.get(clean);
-  if (cached !== undefined && (cached.info !== null || Date.now() - cached.at < 300000)) return cached.info;
+  const base = normalizeRegistry(registry);
+  const key = `${base}|${clean}`;
+  const cached = npmCache.get(key);
+  if (cached !== undefined && Date.now() - cached.at < NPM_CACHE_TTL) return cached.info;
   let info = null;
   try {
     // 单版本端点返回 latest 的完整 manifest（dependencies + repository 都在）。
     // abbreviated packument 不含 repository，防抢注比对会永远落空。
-    const response = await fetch(`${NPM_REGISTRY}/${clean.replace("/", "%2F")}/latest`, {
+    // 镜像（npmmirror 等）的同名端点响应格式一致，两个字段都保留。
+    const response = await fetch(`${base}/${clean.replace("/", "%2F")}/latest`, {
       headers: { "User-Agent": "dsh-plugin-mall", Accept: "application/json" },
     });
     if (response.ok) {
@@ -152,7 +177,7 @@ export async function npmPackageInfo(name) {
   } catch {
     info = null; // registry unreachable — caller falls back
   }
-  npmCache.set(clean, { info, at: Date.now() });
+  npmCache.set(key, { info, at: Date.now() });
   return info;
 }
 
@@ -161,15 +186,20 @@ export async function npmPackageInfo(name) {
  * that package exists on npm AND its repository URL points back at the repo
  * (anti-squatting). Anything else passes through untouched.
  */
-export async function preferNpmSpec({ spec }) {
+export async function preferNpmSpec({ spec, registry, sources }) {
   const raw = String(spec ?? "");
+  // A scoped npm name ("@scope/name", "@scope/name@1.2.3") is shaped exactly
+  // like owner/repo and matches the regex below, sending every such install
+  // off to verify a repository that cannot exist — two wasted CDN requests and
+  // a bogus cache entry. Same guard normalizeSpec already uses.
+  if (raw.startsWith("@")) return raw;
   const githubMatch = /^(?:github:)?([^/\s]+\/[^/\s]+?)(?:\.git)?$/i.exec(raw);
   if (githubMatch === null) return raw;
   const repo = githubMatch[1];
-  const { results } = await verifyPlugins({ repos: [repo] }); // cache hit after first verify
+  const { results } = await verifyPlugins({ repos: [repo], sources }); // cache hit after first verify
   const declaredName = results[repo]?.name;
   if (typeof declaredName !== "string") return raw;
-  const info = await npmPackageInfo(declaredName);
+  const info = await npmPackageInfo(declaredName, { registry });
   if (info === null || info.repositoryUrl === undefined) return raw;
   const pointsBack = new RegExp(`github\\.com[/:]${repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(/|\\.git|$)`, "i").test(info.repositoryUrl);
   return pointsBack ? declaredName : raw;
@@ -197,7 +227,7 @@ function npmNameOf(raw) {
   return match === null ? null : match[1];
 }
 
-export async function assertSafeToInstall({ spec }) {
+export async function assertSafeToInstall({ spec, registry, sources }) {
   const raw = String(spec ?? "");
   let hostDeps;
   if (/^(?:file:|link:)/i.test(raw)) {
@@ -211,7 +241,7 @@ export async function assertSafeToInstall({ spec }) {
     }
   } else if (/^github:([^/\s]+\/[^/\s]+?)(?:\.git)?(?:#.+)?$/i.test(raw)) {
     const repo = /^github:([^/\s]+\/[^/\s]+?)(?:\.git)?(?:#.+)?$/i.exec(raw)[1];
-    const { results } = await verifyPlugins({ repos: [repo] });
+    const { results } = await verifyPlugins({ repos: [repo], sources });
     hostDeps = results[repo]?.hostDeps;
   } else if (/^https?:\/\//i.test(raw)) {
     return; // 远程 tarball 下载前无法廉价检查；罕见路径，放行
@@ -222,7 +252,7 @@ export async function assertSafeToInstall({ spec }) {
       // 无法识别形状的 spec 一律拒绝，而不是静默跳过检查。
       throw new Error(`cannot analyze install spec ${JSON.stringify(raw)} for host-shadow dependencies — refusing to install`);
     }
-    const info = await npmPackageInfo(name);
+    const info = await npmPackageInfo(name, { registry });
     hostDeps = info?.hostDeps;
   }
   if (hostDeps !== undefined && hostDeps !== null && hostDeps.length > 0) {
@@ -257,25 +287,52 @@ export function compareVersions(a, b) {
 // for the process lifetime; a fetch failure caches "unknown" rather than
 // retrying forever.
 
-const RAW_BASE = "https://raw.githubusercontent.com";
-const VERIFY_CONCURRENCY = 8;
+/** Cap on concurrent outbound requests — shared by verification and update checks. */
+export const NETWORK_CONCURRENCY = 8;
 const verifyCache = new Map();
+
+/**
+ * Run `task` over `items` with at most `limit` workers in flight. The one
+ * fan-out primitive for this module's network work, so nothing accidentally
+ * bursts every item at once.
+ */
+export async function mapLimit(items, limit, task) {
+  const list = Array.isArray(items) ? items : [];
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < list.length) {
+      const index = cursor++;
+      await task(list[index], index);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, list.length) }, worker));
+}
 
 // package.json is fetched from CDNs, not the REST API, so verification never
 // burns API quota. jsDelivr first (reachable where raw.githubusercontent.com
 // is blocked), raw as fallback; a 404 only means "no manifest" once EVERY
 // reachable source 404s (jsDelivr lags new pushes, so one 404 is not final).
-const RAW_SOURCES = [
-  (repo) => `https://cdn.jsdelivr.net/gh/${repo}@HEAD/package.json`,
-  (repo) => `${RAW_BASE}/${repo}/HEAD/package.json`,
+// URL templates, `{repo}` substituted with owner/name — overridable through
+// the `rawSources` config for self-hosted reverse proxies.
+export const DEFAULT_RAW_SOURCES = [
+  "https://cdn.jsdelivr.net/gh/{repo}@HEAD/package.json",
+  "https://raw.githubusercontent.com/{repo}/HEAD/package.json",
 ];
 
-async function fetchRawPackageJson(repo, signal) {
+/** The configured source templates, or the built-in pair. */
+function rawSourcesOf(sources) {
+  const list = (Array.isArray(sources) ? sources : [])
+    .map((entry) => String(entry ?? "").trim())
+    .filter((entry) => entry.length > 0 && entry.includes("{repo}"));
+  return list.length > 0 ? list : DEFAULT_RAW_SOURCES;
+}
+
+async function fetchRawPackageJson(repo, signal, sources) {
   let saw404 = false;
   let lastError;
-  for (const buildUrl of RAW_SOURCES) {
+  for (const template of rawSourcesOf(sources)) {
     try {
-      const response = await fetch(buildUrl(repo), {
+      const response = await fetch(template.replace("{repo}", repo), {
         headers: { "User-Agent": "dsh-plugin-mall", Accept: "application/json" },
         signal,
       });
@@ -310,36 +367,34 @@ function hostShadowDependencies(pkg) {
 
 /**
  * Verify repositories as real dsh plugins by their package.json declaration.
- * @param {{repos: string[], signal?: AbortSignal}} options - "owner/name" list.
+ * @param {{repos: string[], signal?: AbortSignal, sources?: string[]}} options - "owner/name" list.
  * @returns the {results} map: fullName -> {kind: "bundle"|"client"|"plain"|"no-manifest"|"unknown", name?, version?, hostDeps?}.
  */
-export async function verifyPlugins({ repos, signal }) {
+export async function verifyPlugins({ repos, signal, sources }) {
+  // A GitHub owner never starts with "@", so rejecting that shape here keeps
+  // scoped npm names ("@scope/name") out of repository verification no matter
+  // which caller passes them in.
   const wanted = [...new Set((Array.isArray(repos) ? repos : []).map(String)
-    .filter((repo) => /^[^/\s]+\/[^/\s]+$/.test(repo) && !repo.includes("..")))];
+    .filter((repo) => /^[^@/\s][^/\s]*\/[^/\s]+$/.test(repo) && !repo.includes("..")))];
   // "unknown"（网络失败）60s 后过期重试；成功结果进程内永久缓存。
   const pending = wanted.filter((repo) => {
     const cached = verifyCache.get(repo);
     if (cached === undefined) return true;
     return cached.kind === "unknown" && Date.now() - (cached.ts ?? 0) > 60000;
   });
-  let cursor = 0;
-  const worker = async () => {
-    while (cursor < pending.length) {
-      const repo = pending[cursor++];
-      try {
-        const pkg = await fetchRawPackageJson(repo, signal);
-        const kind = pkg === undefined ? "no-manifest"
-          : typeof pkg.dsh?.bundle?.patch === "string" ? "bundle"
-            : pkg.dsh?.client !== undefined ? "client"
-              : "plain";
-        verifyCache.set(repo, { kind, name: pkg?.name, version: pkg?.version, hostDeps: hostShadowDependencies(pkg) });
-      } catch (error) {
-        if (error?.name === "AbortError") throw error;
-        verifyCache.set(repo, { kind: "unknown", ts: Date.now() });
-      }
+  await mapLimit(pending, NETWORK_CONCURRENCY, async (repo) => {
+    try {
+      const pkg = await fetchRawPackageJson(repo, signal, sources);
+      const kind = pkg === undefined ? "no-manifest"
+        : typeof pkg.dsh?.bundle?.patch === "string" ? "bundle"
+          : pkg.dsh?.client !== undefined ? "client"
+            : "plain";
+      verifyCache.set(repo, { kind, name: pkg?.name, version: pkg?.version, hostDeps: hostShadowDependencies(pkg) });
+    } catch (error) {
+      if (error?.name === "AbortError") throw error;
+      verifyCache.set(repo, { kind: "unknown", ts: Date.now() });
     }
-  };
-  await Promise.all(Array.from({ length: Math.min(VERIFY_CONCURRENCY, pending.length) }, worker));
+  });
   const results = {};
   for (const repo of wanted) {
     const cached = verifyCache.get(repo);

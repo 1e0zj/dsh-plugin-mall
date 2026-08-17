@@ -144,6 +144,91 @@ export function listInstalled(profile) {
   return { dir, deps };
 }
 
+// ── npm registry resolution ─────────────────────────────────────────────────
+//
+// Registry lookups (anti-squatting, update checks, the host-shadow guard) have
+// to hit the same registry pnpm installs from. Hardcoding npmjs while the user
+// is on a mirror breaks all three silently — see the header comment in
+// github.js. Resolution order mirrors pnpm's own: the profile's .npmrc, then
+// `pnpm config get registry` (which folds in the user and global .npmrc
+// chain), then npmjs. Cached per profile for the process lifetime; changing a
+// registry needs a dsh restart anyway, like every other profile setting.
+
+const DEFAULT_NPM_REGISTRY = "https://registry.npmjs.org";
+const registryCache = new Map(); // profile -> Promise<string>
+
+/** The `registry=` value from a profile-local .npmrc, if it sets one. */
+function registryFromNpmrc(profileDir) {
+  const npmrcPath = join(profileDir, ".npmrc");
+  if (!existsSync(npmrcPath)) return undefined;
+  try {
+    for (const line of readFileSync(npmrcPath, "utf8").split("\n")) {
+      const match = /^\s*registry\s*=\s*(\S+)\s*$/.exec(line);
+      if (match !== null) return match[1];
+    }
+  } catch {
+    /* unreadable .npmrc — fall through to pnpm */
+  }
+  return undefined;
+}
+
+/** `pnpm config get registry`, or undefined if pnpm is missing, slow, or unset. */
+function registryFromPnpm() {
+  return new Promise((resolve) => {
+    let proc;
+    try {
+      proc = spawn("pnpm", ["config", "get", "registry"], {
+        env: process.env,
+        shell: process.platform === "win32",
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+    } catch {
+      resolve(undefined);
+      return;
+    }
+    let out = "";
+    // 一次安装不该被一个探测子进程拖住：5s 没结果就当没有，走兜底。
+    const timer = setTimeout(() => {
+      proc.kill();
+      resolve(undefined);
+    }, 5000);
+    proc.stdout?.on("data", (data) => { out += data.toString(); });
+    proc.on("error", () => { clearTimeout(timer); resolve(undefined); });
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      const value = out.trim();
+      // pnpm prints "undefined" for an unset key — only take a real URL.
+      resolve(code === 0 && /^https?:\/\//i.test(value) ? value : undefined);
+    });
+  });
+}
+
+/**
+ * The registry pnpm installs from for this profile.
+ * @param profile - profile name.
+ * @returns a promise for the registry base URL, without a trailing slash.
+ */
+export function resolveRegistry(profile) {
+  const key = String(profile ?? "");
+  const cached = registryCache.get(key);
+  if (cached !== undefined) return cached;
+  const pending = (async () => {
+    let dir;
+    try {
+      dir = resolveProfileDir(key);
+    } catch {
+      dir = undefined; // invalid profile name — the caller reports it, we just fall back
+    }
+    const fromNpmrc = dir === undefined ? undefined : registryFromNpmrc(dir);
+    if (fromNpmrc !== undefined) return fromNpmrc.replace(/\/+$/, "");
+    const fromPnpm = await registryFromPnpm();
+    return (fromPnpm ?? DEFAULT_NPM_REGISTRY).replace(/\/+$/, "");
+  })();
+  registryCache.set(key, pending);
+  return pending;
+}
+
 // ── client-plugin row registration ──────────────────────────────────────────
 
 /** Profile patch file name (the user's own layer, applied after bundle layers). */
@@ -370,8 +455,16 @@ const UNSAFE_SPEC_RE = /[;&|`$()<>^"!*\n\r]/;
 
 /** Reject install/remove specs carrying shell metacharacters. */
 export function assertSafeSpec(spec) {
-  if (UNSAFE_SPEC_RE.test(String(spec ?? ""))) {
-    throw new Error(`spec contains characters that are not allowed in an install spec: ${JSON.stringify(String(spec))}`);
+  const value = String(spec ?? "");
+  if (UNSAFE_SPEC_RE.test(value)) {
+    throw new Error(`spec contains characters that are not allowed in an install spec: ${JSON.stringify(value)}`);
+  }
+  // Windows 下 pnpm 走 shell，而 Node 只是把参数用空格 join 后交给 cmd，
+  // 不逐参加引号——带空格的本地路径会被拆成两个参数，pnpm 报一个和路径
+  // 毫无关系的错。用户也没法自己加引号绕过：`"` 就在上面的黑名单里。
+  // 与其让它以看不懂的方式失败，不如在这里说清楚。
+  if (process.platform === "win32" && /^(?:file:|link:)/i.test(value) && /\s/.test(value)) {
+    throw new Error(`local path specs cannot contain spaces on Windows — pnpm is spawned through cmd, which would split the path into two arguments: ${JSON.stringify(value)}`);
   }
 }
 

@@ -12,7 +12,7 @@ Curated lists only show what has been reviewed and merged. This marketplace is o
 
 - **Automatic verification** — every search result's `package.json` is fetched (jsDelivr/raw dual-source CDN, no API quota) and checked for the official `dsh.bundle` / `dsh.client` manifest. Verified plugins get a green badge; the default "verified only" view filters out ~73% of topic noise (empty repos and unrelated projects riding the tag).
 - **Anti-squatting** — an install prefers the npm tarball only when the registry entry's `repository` URL points back to the same GitHub repo; anything else falls back to the explicit `github:` spec.
-- **npm-first installs** — registry tarballs are smaller than whole-repo GitHub downloads and come with integrity checks.
+- **npm-first installs** — registry tarballs are smaller than whole-repo GitHub downloads and come with integrity checks. Lookups follow the registry pnpm actually installs from (profile `.npmrc` → `pnpm config get registry` → npmjs), so a mirror user keeps npm-first instead of silently falling back to whole-repo clones.
 - **Update management** — installed plugins are compared against the registry `latest`; one-click update per plugin.
 - **Resilience** — rate-limit circuit breaker, GitHub's 1000-result search window handled gracefully, `corepack enable pnpm` self-heal when pnpm is missing, one-click dsh restart (loopback-only, `allowRestart: false` to disable).
 
@@ -51,7 +51,7 @@ Restart dsh after installing.
 
 - **自动验证**：逐仓库拉取 `package.json`（jsDelivr/raw 双源 CDN，不占 API 配额），按官方 `dsh.bundle` / `dsh.client` 声明打徽章；默认"只看已验证"视图过滤约 73% 的话题噪音
 - **防抢注**：仅当 npm registry 条目的 `repository` 指回同一 GitHub 仓库时才用 npm 安装，否则回退 `github:` 源
-- **npm 优先安装**：registry tarball 比整仓库下载更小且带完整性校验
+- **npm 优先安装**：registry tarball 比整仓库下载更小且带完整性校验；查询用的 registry 跟随 pnpm 实际安装源（profile `.npmrc` → `pnpm config get registry` → npmjs），换了镜像也不会退化成整仓库克隆
 - **更新管理**：已装插件与 registry `latest` 比对，逐个一键更新
 - **工程韧性**：限流熔断、GitHub 1000 条搜索上限优雅处理、pnpm 缺失时 `corepack` 自愈、一键重启 dsh（仅 loopback，可 `allowRestart: false` 关闭）
 
@@ -73,6 +73,10 @@ dsh plugin --profile web add link:C:\path\to\dsh-plugin-mall
 > Windows 下用 `link:` 开发本插件时，Node 会从项目的真实路径加载模块，
 > 因此项目目录里必须先装一次依赖（`npm install`），裸导入才能解析；
 > 通过 npm/GitHub 安装时无此要求（pnpm 会把真实拷贝装进 profile 的 node_modules）。
+>
+> 另：Windows 上 `file:`/`link:` 的路径**不能含空格**。pnpm 是经 cmd 拉起的，
+> Node 只把参数用空格拼接、不逐参加引号，带空格的路径会被拆成两个参数；
+> 自己加引号也不行（`"` 属于被拦截的 shell 元字符）。市场会直接拒绝并说明原因。
 
 ## 工作原理
 
@@ -97,8 +101,10 @@ dsh plugin --profile web add link:C:\path\to\dsh-plugin-mall
   拦截后会把包名自动合并进 profile 的 `pnpm-workspace.yaml` 的 `allowBuilds`
   并自动重试一次（解析只认合法 npm 包名，写入一律加引号，不会写坏 YAML）。
 - 配置（`cordis.patch.yml` 中可改）：`defaultProfile`（默认装进哪个 profile，
-  默认 `web`）、`apiBase`（GitHub API 地址）、`perPageMax`（搜索单页上限）、
-  `allowRestart`（是否允许一键重启，默认 `true`）。
+  默认 `web`）、`apiBase`（GitHub API 地址）、`npmRegistry`（npm 查询源，留空
+  则跟随 pnpm 实际安装源）、`rawSources`（验证用的 package.json 源模板列表，
+  `{repo}` 会替换成 owner/name，留空用内置的 jsDelivr + raw 双源）、
+  `perPageMax`（搜索单页上限）、`allowRestart`（是否允许一键重启，默认 `true`）。
 
 ## 发布
 

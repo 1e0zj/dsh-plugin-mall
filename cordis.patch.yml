@@ -9,5 +9,17 @@
         defaultProfile: web
         # GitHub REST API base (override for self-hosted mirrors/proxies).
         apiBase: https://api.github.com
+        # npm registry for anti-squatting, update checks and the host-dependency
+        # guard. Empty = follow whatever pnpm installs from (the profile's
+        # .npmrc, then `pnpm config get registry`, then npmjs), which is what
+        # you want on a mirror — set this only to pin a different one.
+        npmRegistry: ''
+        # package.json sources for plugin verification, tried in order until one
+        # answers; `{repo}` is replaced with owner/name. Empty = jsDelivr then
+        # raw.githubusercontent.com. Override for a self-hosted reverse proxy.
+        rawSources: []
         # Upper bound for market_search perPage.
         perPageMax: 30
+        # Whether the marketplace tab may restart the dsh process. Set false when
+        # something else (systemd, pm2, …) owns the process lifecycle.
+        allowRestart: true
