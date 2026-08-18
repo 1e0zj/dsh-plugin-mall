@@ -11,6 +11,7 @@ Two surfaces: a **Settings → Plugins → Marketplace** tab in the dsh web UI, 
 Curated lists only show what has been reviewed and merged. This marketplace is open by construction: **any repo tagged `topic:dsh-plugin` is discoverable the moment it is pushed** — no submission, no approval queue. To keep that openness usable:
 
 - **Automatic verification** — every search result's `package.json` is fetched (jsDelivr/raw dual-source CDN, no API quota) and checked for the official `dsh.bundle` / `dsh.client` manifest. Verified plugins get a green badge; the default "verified only" view filters out ~73% of topic noise (empty repos and unrelated projects riding the tag).
+- **Browse-time compatibility badges** — each card is also statically scanned against your profile before you click anything: declared conflicts, exclusive groups, loader-id collisions (from the repo's patch file), host-module shadowing, and peer/Node/OS ranges. Cards show 适配 / 有风险 / 冲突 / 适配未知 accordingly — advisory only; the install preflight remains the enforcing gate.
 - **Anti-squatting** — an install prefers the npm tarball only when the registry entry's `repository` URL points back to the same GitHub repo; anything else falls back to the explicit `github:` spec.
 - **npm-first installs** — registry tarballs are smaller than whole-repo GitHub downloads and come with integrity checks. Lookups follow the registry pnpm actually installs from (profile `.npmrc` → `pnpm config get registry` → npmjs), so a mirror user keeps npm-first instead of silently falling back to whole-repo clones.
 - **Update management** — installed plugins are compared against the registry `latest`; one-click update per plugin.
@@ -100,6 +101,7 @@ Limitations: the grace window is the probation period — a failure that only su
 与策展列表不同：**任何打上 `topic:dsh-plugin` 的仓库推送后立即可被发现**——无需投稿、无需审批。为保证开放性可用，做了这些事：
 
 - **自动验证**：逐仓库拉取 `package.json`（jsDelivr/raw 双源 CDN，不占 API 配额），按官方 `dsh.bundle` / `dsh.client` 声明打徽章；默认"只看已验证"视图过滤约 73% 的话题噪音
+- **浏览期适配徽章**：点安装之前，每张卡片就已对照你的 profile 做过一次静态扫描——声明冲突、独占组、loader-id 冲突（取自仓库补丁文件）、宿主模块遮蔽、peer/Node/OS 范围；卡片上直接显示 适配 / 有风险 / 冲突 / 适配未知。徽章只是提示，真正的拦截闸门仍是安装预检
 - **防抢注**：仅当 npm registry 条目的 `repository` 指回同一 GitHub 仓库时才用 npm 安装，否则回退 `github:` 源
 - **npm 优先安装**：registry tarball 比整仓库下载更小且带完整性校验；查询用的 registry 跟随 pnpm 实际安装源（profile `.npmrc` → `pnpm config get registry` → npmjs），换了镜像也不会退化成整仓库克隆
 - **更新管理**：已装插件与 registry `latest` 比对，逐个一键更新

@@ -373,7 +373,7 @@ export function compareVersions(a, b) {
 
 /** Cap on concurrent outbound requests — shared by verification and update checks. */
 export const NETWORK_CONCURRENCY = 8;
-// repo -> {kind, name, version, hostDeps, ts}
+// repo -> {kind, name, version, hostDeps, manifest, ts}
 const verifyCache = new Map();
 // Verdicts expire. Caching a success for the process lifetime freezes the badge
 // on whatever the repo looked like the first time it was seen: when dsh-TUI
@@ -443,6 +443,44 @@ async function fetchRawPackageJson(repo, signal, sources) {
 }
 
 /**
+ * Fetch an arbitrary repo file as text from the same raw sources. The path
+ * comes from a plugin manifest's `dsh.bundle.patch`, i.e. untrusted input:
+ * anything absolute, parent-traversing, or backslashed is rejected before a
+ * URL is ever built. Source templates carry `package.json` as their path; the
+ * tail is swapped for the requested file so custom `rawSources` keep working.
+ * Returns undefined when every reachable source 404s.
+ */
+export async function fetchRawFile(repo, filePath, { signal, sources } = {}) {
+  const parts = String(filePath ?? "").split("/").filter((part) => part.length > 0 && part !== ".");
+  if (parts.length === 0 || parts.some((part) => part === ".." || part.includes("\\") || part.includes(":"))) {
+    throw new Error(`unsafe repo file path: ${JSON.stringify(filePath)}`);
+  }
+  const tail = parts.map(encodeURIComponent).join("/");
+  let saw404 = false;
+  let lastError;
+  for (const template of rawSourcesOf(sources)) {
+    const base = template.replace("{repo}", repo);
+    const url = base.includes("{path}")
+      ? base.replace("{path}", tail)
+      : base.replace(/package\.json$/, tail);
+    try {
+      const response = await fetch(url, {
+        headers: { "User-Agent": "dsh-plugin-mall", Accept: "text/plain, */*" },
+        signal,
+      });
+      if (response.status === 404) { saw404 = true; continue; }
+      if (!response.ok) throw new Error(`source returned ${response.status}`);
+      return await response.text();
+    } catch (error) {
+      if (error?.name === "AbortError") throw error;
+      lastError = error;
+    }
+  }
+  if (saw404) return undefined;
+  throw lastError ?? new Error("no raw source reachable");
+}
+
+/**
  * Framework packages the host provides via the profiles/node_modules fallback.
  * A plugin declaring any of these as `dependencies` (instead of
  * peerDependencies) installs real copies into the profile — the loader then
@@ -495,19 +533,28 @@ export async function verifyPlugins({ repos, signal, sources }) {
         : typeof pkg.dsh?.bundle?.patch === "string" ? "bundle"
           : pkg.dsh?.client !== undefined ? "client"
             : "plain";
-      verifyCache.set(repo, { kind, name: pkg?.name, version: pkg?.version, hostDeps: hostShadowDependencies(pkg), ts: Date.now() });
+      verifyCache.set(repo, { kind, name: pkg?.name, version: pkg?.version, hostDeps: hostShadowDependencies(pkg), manifest: pkg, ts: Date.now() });
     } catch (error) {
       if (error?.name === "AbortError") throw error;
       verifyCache.set(repo, { kind: "unknown", ts: Date.now() });
     }
   });
-  // 一律重建对象：内部的 ts 不该出现在发给浏览器的响应里。
+  // 一律重建对象：内部的 ts 与完整 manifest 不该出现在发给浏览器的响应里。
   const results = {};
   for (const repo of wanted) {
     const cached = verifyCache.get(repo);
     results[repo] = { kind: cached?.kind ?? "unknown", name: cached?.name, version: cached?.version, hostDeps: cached?.hostDeps };
   }
   return { results };
+}
+
+/**
+ * The cached full manifest for a repo already seen by verifyPlugins, or
+ * undefined. Server-side only — the browsing-time compat scan needs the whole
+ * package.json (peers, engines, dsh.conflicts), not just the badge metadata.
+ */
+export function cachedRepoManifest(repo) {
+  return verifyCache.get(String(repo ?? ""))?.manifest;
 }
 
 /**
@@ -612,6 +659,27 @@ if (process.argv[1]?.endsWith("github.js") && process.argv.includes("--self-test
   const failed = runHostShadowFixtures();
   console.log(`${HOST_SHADOW_FIXTURES.length - failed}/${HOST_SHADOW_FIXTURES.length} passed\n`);
   if (failed > 0) process.exit(1);
+  // fetchRawFile 路径钳制：来自插件清单的 dsh.bundle.patch 是不可信输入，
+  // 越界/绝对/反斜杠路径必须在拼 URL 之前被拒绝（这些用例零网络）。
+  {
+    const deadSource = ["http://127.0.0.1:1/{repo}/package.json"];
+    let clampFailed = 0;
+    for (const bad of ["../secret", "a/../../b", "dir\\win.yml", "c:/abs.yml", ""]) {
+      let rejected = false;
+      try { await fetchRawFile("owner/repo", bad, { sources: deadSource }); } catch { rejected = true; }
+      if (!rejected) { clampFailed++; console.log(`  FAIL 危险路径应拒绝: ${JSON.stringify(bad)}`); }
+      else console.log(`  PASS 危险路径拒绝: ${JSON.stringify(bad)}`);
+    }
+    // 合法相对路径要通过钳制、真正走到网络（dead source 必失败，但报错不能是钳制错误）。
+    {
+      let reached = false;
+      try { await fetchRawFile("owner/repo", "subdir/patch file.yml", { sources: deadSource }); }
+      catch (error) { reached = !/unsafe repo file path/.test(error?.message ?? ""); }
+      if (!reached) { clampFailed++; console.log("  FAIL 合法路径应通过钳制并尝试网络"); }
+      else console.log("  PASS 合法路径通过钳制（网络不可达按预期失败）");
+    }
+    if (clampFailed > 0) process.exit(1);
+  }
   if (process.argv.includes("--offline")) process.exit(0);
   const apiBase = "https://api.github.com";
   const result = await searchPlugins({ query: "", perPage: 3, apiBase });

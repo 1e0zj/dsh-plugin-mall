@@ -23,9 +23,9 @@ import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
-import { repoInfo, searchPlugins, verifyPlugins, preferNpmSpec, npmPackageInfo, compareVersions, assertSafeToInstall, mapLimit, NETWORK_CONCURRENCY } from "./github.js";
+import { repoInfo, searchPlugins, verifyPlugins, cachedRepoManifest, fetchRawFile, preferNpmSpec, npmPackageInfo, compareVersions, assertSafeToInstall, mapLimit, NETWORK_CONCURRENCY } from "./github.js";
 import { ensureProfile, listInstalled, normalizeSpec, runInstall, runRemove, assertSafeSpec, resolveRegistry, serializeCanonicalProof } from "./installer.js";
-import { preflightInstall } from "./guard.js";
+import { preflightInstall, inspectRemoteCandidate } from "./guard.js";
 
 export const name = "@1e0zj/dsh-plugin-mall";
 export const inject = ["tools", "jobs", "systemPrompt"];
@@ -132,6 +132,28 @@ export function computeProfileFingerprint(profileDir) {
 }
 
 // `${profileDir}\u0000${spec}` -> { report, fingerprint, at, pinnedAt }
+// ── browsing-time compat badge cache ────────────────────────────────────────
+// `${fingerprint}::${repo}` -> { entry, at }. Keyed by the profile fingerprint
+// so any install/uninstall/profile edit invalidates every badge at once; the
+// TTL only bounds how long a badge survives the plugin repo itself changing.
+const compatCache = new Map();
+const COMPAT_TTL = 600000;
+
+function compatCacheGet(key) {
+  const cached = compatCache.get(key);
+  if (cached === undefined) return undefined;
+  if (Date.now() - cached.at > COMPAT_TTL) {
+    compatCache.delete(key);
+    return undefined;
+  }
+  return cached.entry;
+}
+
+function compatCacheSet(key, entry) {
+  if (compatCache.size > 500) compatCache.clear();
+  compatCache.set(key, { entry, at: Date.now() });
+}
+
 const preflightCache = new Map();
 
 function preflightCacheKey(profileDir, spec) {
@@ -1028,6 +1050,54 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
     case "verify": {
       const result = await verifyPlugins({ repos: payload?.repos, sources: rawSources });
       return rpcOk(result);
+    }
+    case "compat": {
+      // Browsing-time conflict badge: statically scan each repo's manifest
+      // (and declared bundle patch, fetched as text) against the profile —
+      // the same checks the install preflight runs, minus the probe install.
+      const profile = String(payload?.profile ?? defaultProfile).trim();
+      let profileDir;
+      try {
+        profileDir = resolveProfileDir(profile);
+      } catch (error) {
+        return rpcFail(new Error(`invalid profile: ${error.message}`));
+      }
+      const repos = [...new Set((Array.isArray(payload?.repos) ? payload.repos : []).map(String)
+        .filter((repo) => /^[^@/\s][^/\s]*\/[^/\s]+$/.test(repo) && !repo.includes("..")))].slice(0, 30);
+      if (repos.length === 0) return rpcOk({ results: {} });
+      await verifyPlugins({ repos, sources: rawSources }); // populates the manifest cache
+      let fingerprint;
+      const results = {};
+      await mapLimit(repos, NETWORK_CONCURRENCY, async (repo) => {
+        const manifest = cachedRepoManifest(repo);
+        if (manifest === undefined || typeof manifest !== "object") {
+          results[repo] = { state: "unknown", summary: "无法获取插件清单，兼容性未知" };
+          return;
+        }
+        try {
+          let patchText;
+          if (typeof manifest.dsh?.bundle?.patch === "string") {
+            patchText = await fetchRawFile(repo, manifest.dsh.bundle.patch, { sources: rawSources });
+          }
+          fingerprint ??= computeProfileFingerprint(profileDir);
+          const cacheKey = `${fingerprint}::${repo}`;
+          const hit = compatCacheGet(cacheKey);
+          if (hit !== undefined) { results[repo] = hit; return; }
+          const report = inspectRemoteCandidate({ profileDir, manifest, patchText, spec: `github:${repo}` });
+          const entry = {
+            state: report.verdict === "blocked" ? "conflict" : report.verdict === "warning" ? "warning" : "compatible",
+            name: report.candidate.name,
+            summary: report.summary,
+            issues: report.issues.slice(0, 3).map(({ severity, title }) => ({ severity, title })),
+            patchChecked: typeof manifest.dsh?.bundle?.patch === "string" ? report.issues.every((item) => item.code !== "patch-unverified") : true,
+          };
+          compatCacheSet(cacheKey, entry);
+          results[repo] = entry;
+        } catch {
+          results[repo] = { state: "unknown", summary: "兼容性检查失败" };
+        }
+      });
+      return rpcOk({ results });
     }
     case "updates": {
       const profile = String(payload?.profile ?? defaultProfile).trim();
