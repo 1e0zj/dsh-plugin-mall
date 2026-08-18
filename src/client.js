@@ -66,6 +66,12 @@ window.__ModuleLoader__.load({
       ".mkt_approveCmd{max-height:none;margin:0}",
       ".mkt_jobDone{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:2px}",
       ".mkt_logBlock{display:flex;flex-direction:column;gap:4px;align-items:flex-start}",
+      ".mkt_depOff{opacity:.5;text-decoration:line-through}",
+      ".mkt_switch{position:relative;width:34px;height:18px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-secondary,#e5e7eb);cursor:pointer;padding:0;transition:background .15s,border-color .15s}",
+      ".mkt_switch:disabled{opacity:.55;cursor:default}",
+      ".mkt_switchOn{background:var(--dsw-alias-state-business-primary,#2b6cb0);border-color:transparent}",
+      ".mkt_switchKnob{position:absolute;top:1px;left:1px;width:14px;height:14px;border-radius:50%;background:#fff;transition:transform .15s;box-shadow:0 1px 2px rgba(0,0,0,.25)}",
+      ".mkt_switchOn .mkt_switchKnob{transform:translateX(16px)}",
       ".mkt_issueList{list-style:none;display:flex;flex-direction:column;gap:8px;margin:0;padding:0}",
       ".mkt_issue{border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:8px 10px;background:var(--dsw-alias-bg-secondary,#fff)}",
       ".mkt_issueBlock{border-color:var(--dsw-alias-state-error-primary)}",
@@ -338,6 +344,8 @@ window.__ModuleLoader__.load({
       );
     }
 
+    var MARKET_PACKAGE = "@1e0zj/dsh-plugin-mall";
+
     function jobKindLabel(kind) {
       if (kind === "dsh-plugin-preflight") return "预检 ";
       if (kind === "dsh-plugin-uninstall") return "卸载 ";
@@ -462,10 +470,23 @@ window.__ModuleLoader__.load({
             : h("div", { className: "mkt_depList" }, (installed.deps || []).map(function (dep) {
               var busy = (props.removing || {})[dep.name] === true;
               var upd = (props.updates || {})[dep.name];
+              var entry = (props.entries || {})[dep.name];
+              // 没在装配树里的依赖（普通依赖、或声明了 client 但没挂载的）
+              // 没有可切换的东西，不给开关。
+              var togglable = entry !== undefined && dep.name !== MARKET_PACKAGE;
+              var enabled = entry === undefined ? true : entry.enabled !== false;
+              var toggling = (props.toggling || {})[dep.name] === true;
               return h("div", { key: dep.name, className: "mkt_depRow" },
-                h("span", { className: "mkt_desc" }, dep.name + "@" + dep.version),
+                h("span", { className: "mkt_desc" + (enabled ? "" : " mkt_depOff") }, dep.name + "@" + dep.version),
                 h("span", { className: "mkt_depActions" },
-                  h("span", { className: "mkt_badge" }, kindLabel(dep.kind)),
+                  h("span", { className: "mkt_badge" }, enabled ? kindLabel(dep.kind) : "已停用"),
+                  togglable ? h("button", {
+                    className: "mkt_switch" + (enabled ? " mkt_switchOn" : ""),
+                    disabled: toggling,
+                    title: enabled ? "停用（立即生效，不卸载）" : "启用（立即生效）",
+                    "aria-pressed": enabled ? "true" : "false",
+                    onClick: function () { props.onToggle(dep.name, !enabled); },
+                  }, h("span", { className: "mkt_switchKnob" })) : null,
                   upd && upd.hasUpdate ? h("button", {
                     className: "mkt_btn mkt_btnSm",
                     onClick: function () { props.onInstallSpec(dep.name + "@" + upd.latest); },
@@ -506,6 +527,9 @@ window.__ModuleLoader__.load({
       var _removing = useState({});
       var removing = _removing[0];
       var setRemoving = _removing[1];
+      var _toggling = useState({});
+      var toggling = _toggling[0];
+      var setToggling = _toggling[1];
       var _page = useState(1);
       var page = _page[0];
       var setPage = _page[1];
@@ -630,6 +654,26 @@ window.__ModuleLoader__.load({
         observer.observe(node);
         return function () { observer.disconnect(); };
       }, [loadMore]);
+
+      // 启用/停用：热生效，不重启也不重装——所以成功后只刷新已装列表，
+      // 不提示重启，也不动任务面板（它不是一个需要看日志的长任务）。
+      var doToggle = useCallback(function (packageName, enabled) {
+        setToggling(function (prev) { return Object.assign({}, prev, { [packageName]: true }); });
+        setError(null);
+        call("togglePlugin", { package: packageName, enabled: enabled }).then(function (value) {
+          setInstalled(function (prev) {
+            return prev && !prev.error ? Object.assign({}, prev, { entries: value.entries }) : prev;
+          });
+        }).catch(function (e) {
+          setError(errorText(e));
+        }).finally(function () {
+          setToggling(function (prev) {
+            var next = Object.assign({}, prev);
+            delete next[packageName];
+            return next;
+          });
+        });
+      }, [call]);
 
       var refreshInstalled = useCallback(function () {
         call("installed", {}).then(function (value) {
@@ -828,7 +872,16 @@ window.__ModuleLoader__.load({
             "只看已验证插件")
         ),
         error ? h("div", { className: "mkt_error" }, error) : null,
-        h(InstalledPanel, { installed: installed, removing: removing, updates: updates, onUninstall: doUninstall, onInstallSpec: preflightAndInstall }),
+        h(InstalledPanel, {
+          installed: installed,
+          removing: removing,
+          updates: updates,
+          entries: installed && !installed.error ? installed.entries : undefined,
+          toggling: toggling,
+          onToggle: doToggle,
+          onUninstall: doUninstall,
+          onInstallSpec: preflightAndInstall,
+        }),
         h(JobsPanel, {
           jobs: jobs,
           onClear: function () {

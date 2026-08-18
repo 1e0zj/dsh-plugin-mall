@@ -28,7 +28,12 @@ import { ensureProfile, listInstalled, normalizeSpec, runInstall, runRemove, ass
 import { preflightInstall, inspectRemoteCandidate, recoverProfile } from "./guard.js";
 
 export const name = "@1e0zj/dsh-plugin-mall";
-export const inject = ["tools", "jobs", "systemPrompt"];
+// `loader` 是启用/停用的写入侧：ctx.loader.update(id, {disabled}) 一次调用既
+// dispose/init 运行中的 fiber，又把改动写回配置文件。官方的
+// @deepseek-ai/dsh-host-plugin-inventory 也是 inject ["loader"]，只是它只读
+// （"Read-only Remote projection of current Cordis Loader plugin state"），
+// 写入侧留白，正是这里要补的位置。loader 必然存在——没有它我们根本加载不了。
+export const inject = ["tools", "jobs", "systemPrompt", "loader"];
 
 export const Config = z.object({
   defaultProfile: z.string().default("web"),
@@ -973,6 +978,32 @@ export function createJobTracker({ producerFactory } = {}) {
   };
 }
 
+/**
+ * Group the loader's mounted entries by the package that provides them, so a
+ * profile dependency can be shown (and toggled) as one row.
+ *
+ * One package can insert several rows, so `enabled` means EVERY row of that
+ * package is live — a half-disabled package is reported as disabled, and
+ * toggling acts on the whole set. Group rows are skipped, mirroring the
+ * official read-only projection in @deepseek-ai/dsh-host-plugin-inventory.
+ */
+export function loaderEntriesByPackage(ctx) {
+  const byPackage = {};
+  try {
+    for (const entry of ctx.loader.entries()) {
+      if (entry.options?.group) continue;
+      const moduleName = entry.options?.name;
+      if (typeof moduleName !== "string" || moduleName.length === 0) continue;
+      const bucket = byPackage[moduleName] ??= { entryIds: [], enabled: true };
+      bucket.entryIds.push(entry.id);
+      if (entry.disabled) bucket.enabled = false;
+    }
+  } catch {
+    /* loader 读不到就不给开关，安装/卸载照常可用 */
+  }
+  return byPackage;
+}
+
 /** Render one preflight issue as a compact line for model/error output. */
 function renderPreflightIssue(entry) {
   const badge = entry.severity === "block" ? "BLOCK" : "WARN";
@@ -1193,7 +1224,33 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
       } catch (error) {
         return rpcFail(new Error(`invalid profile: ${error.message}`));
       }
-      return rpcOk(listInstalled(profile));
+      // 带上每个依赖在装配树里的启用状态，浏览器据此渲染开关。
+      return rpcOk({ ...listInstalled(profile), entries: loaderEntriesByPackage(ctx) });
+    }
+    case "togglePlugin": {
+      // 启用/停用：热生效，不重启、不重装。loader 精确 dispose/init 那几个
+      // fiber，其余插件不受影响；重新启用时，因依赖它而 PENDING 的插件也会
+      // 一并回来（cordis-tutorial/06-composition-and-hmr）。
+      const packageName = String(payload?.package ?? "").trim();
+      const enabled = payload?.enabled === true;
+      if (packageName.length === 0) return rpcFail(new Error("togglePlugin: package name is required"));
+      if (packageName === name) {
+        // 停用市场自己 = 关掉正在操作的这个界面，之后只能手改配置文件才能回来。
+        return rpcFail(new Error("refusing to disable the marketplace itself — you would lose the UI needed to re-enable it"));
+      }
+      const byPackage = loaderEntriesByPackage(ctx);
+      const targets = byPackage[packageName]?.entryIds ?? [];
+      if (targets.length === 0) {
+        return rpcFail(new Error(`no loader entry found for ${packageName} — it may not be mounted in this profile`));
+      }
+      try {
+        for (const entryId of targets) {
+          await ctx.loader.update(entryId, { disabled: enabled ? undefined : true });
+        }
+      } catch (error) {
+        return rpcFail(new Error(`could not ${enabled ? "enable" : "disable"} ${packageName}: ${error.message}`));
+      }
+      return rpcOk({ package: packageName, enabled, entries: loaderEntriesByPackage(ctx) });
     }
     case "preflight": {
       // 预检本身做成 job：点击安装的瞬间任务就出现在面板里，探针的 pnpm
@@ -2235,6 +2292,26 @@ export async function runSelfTests() {
       "tracker rejection fixture 使用注入 producer，不触碰真实 profile",
       producerCalls === 1 && trackerSnapshot.status === "failed" && settledOutcome?.status === "failed",
     );
+
+    // ── 8. 启用/停用：装配树条目按包分组 ─────────────────────────────────
+    // 一个包可以插入多行，所以分组、以及「有一行停用就算整体停用」是这块最
+    // 容易写错的地方；group 行必须跳过（照 dsh-host-plugin-inventory 的读法）。
+    const fakeLoaderCtx = (entries) => ({ loader: { entries: () => entries } });
+    const grouped = loaderEntriesByPackage(fakeLoaderCtx([
+      { id: "e1", options: { name: "dsh-at-file" }, disabled: false },
+      { id: "e2", options: { name: "multi-row" }, disabled: false },
+      { id: "e3", options: { name: "multi-row" }, disabled: true },
+      { id: "g1", options: { name: "some-group", group: true }, disabled: false },
+      { id: "e4", options: {}, disabled: false },
+    ]));
+    check("单行包：分组并标记启用", grouped["dsh-at-file"]?.entryIds.length === 1 && grouped["dsh-at-file"].enabled === true);
+    check("多行包：合并为一项", grouped["multi-row"]?.entryIds.length === 2);
+    check("多行包有一行停用 → 整体判为停用", grouped["multi-row"]?.enabled === false);
+    check("group 行被跳过", grouped["some-group"] === undefined);
+    check("无名条目被跳过", Object.keys(grouped).length === 2);
+    check("loader 抛错时降级为空表，不拖垮已装列表", Object.keys(loaderEntriesByPackage({
+      loader: { entries: () => { throw new Error("loader unavailable"); } },
+    })).length === 0);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
