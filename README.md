@@ -282,8 +282,10 @@ CI 只在该隔离目录运行 `npm ci --ignore-scripts`。
   加 `--offline` 只跑不联网的 fixture（宿主依赖检测的判据固化在那里 ——
   它当初的实测对象 dsh-TUI 已被上报修复，网络上不再有可复现的回归用例，
   所以改 `HOST_PACKAGES` 前请先跑这组）。
-- `src/installer.js` 也有一组 fixture，固化 `allowBuilds` 合并的全部形状
-  （改 `mergeAllowBuilds` 前必跑）。它有宿主依赖，所以要从**已安装副本**运行：
+- `src/installer.js` 也有一组 fixture，固化 `allowBuilds` 合并 + 事务串行化/回滚
+  的形状（改 `mergeAllowBuilds` 或事务逻辑前必跑）。它 import 宿主
+  `@deepseek-ai/dsh-app-boot`，CI 会从专用 fixture lock 重放宿主及 peer 依赖后跑
+  `node src/installer.js --self-test`；本地也可从**已安装副本**运行同一命令：
   `node ~/.dsh/profiles/web/node_modules/@1e0zj/dsh-plugin-mall/src/installer.js --self-test`
 - `src/guard.js` 与 `src/cli.js` 各自带一组离线 fixture（无网络、无 pnpm/dsh、
   无宿主框架依赖），固化冲突扫描、快照/pending/回滚，以及 CLI 参数与启动缓刑
@@ -291,3 +293,7 @@ CI 只在该隔离目录运行 `npm ci --ignore-scripts`。
   import `js-yaml` + `semver` 两个叶子包，裸 checkout 里单点装这两个即可跑：
   `npm install --no-save --no-package-lock --ignore-scripts --legacy-peer-deps
   js-yaml@4 semver@7`，或从已安装副本跑同两条命令。改 guard 逻辑前必跑这组。
+- `src/index.js` 的离线 fixture 固化 profile fingerprint、构建脚本审批 token
+  与 job/session 隔离：`node src/index.js --self-test`。它会静态 import
+  `installer.js` 及宿主的 `dsh-tools` / `schemastery`，所以由发布 CI 在隔离目录
+  从 `.github/fixtures/guard-tests/package-lock.json` 重放同发布线的最小宿主依赖后运行。

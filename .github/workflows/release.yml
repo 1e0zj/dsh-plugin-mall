@@ -62,10 +62,16 @@ jobs:
 
       # src/guard.js 与 src/cli.js 的离线 fixture 固化冲突扫描、快照/pending/
       # 回滚，以及 CLI 参数/启动缓刑的判据——主机无关、无网络、无 pnpm、无 dsh。
+      # src/installer.js 的 fixture 固化 allowBuilds 合并与事务串行化/回滚；
+      # src/index.js 的 fixture 覆盖 fingerprint、审批 token 与 job/session 隔离。
+      # 两者经 node_modules 软链解析上面的最小宿主依赖；测试本身无网络、
+      # 无 pnpm、无 dsh，也不触碰真实 profile。
       - name: guard fixture
         run: |
           node src/guard.js --self-test
           node src/cli.js self-test
+          node src/installer.js --self-test
+          node src/index.js --self-test
 
       - name: 发布（无 token，provenance 自动生成）
         run: npm publish --access public
