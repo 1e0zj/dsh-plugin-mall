@@ -90,6 +90,33 @@ profile's pending-install marker before starting the command after `--`:
 Limitations: the grace window is the probation period — a failure that only surfaces **after** it (a plugin that crashes minutes in, or on a specific interaction) cannot be rolled back automatically, because committing deletes the active snapshot and `guard recover` then has nothing to restore. `guard validate` still diagnoses the on-disk state, but a post-commit failure needs manual repair — uninstall and reinstall the plugin, or restore a backup you kept separately. Both commands do only **static on-disk validation**; neither proves the plugin actually loads. A corrupt pending marker fails closed: the command is not launched and no unvalidated path is deleted. Preserve the snapshot and repair or restore a trustworthy marker, then run `guard recover`; quarantine the marker only after you have independently verified the profile, or decided to abandon automatic recovery.
 
 
+## dsh won't start after an update? (affects 0.2.0 – 0.3.1, fixed in 0.3.2)
+
+Symptom: `dsh web` exits with `cannot resolve profile bundle "<package>"`.
+
+Cause: in those versions, an **update of an already-installed plugin** that ended in
+a rollback (most commonly: the target carries build scripts and the flow paused at
+the approval card) could lose the package — the rollback's offline rebuild was
+fooled by pnpm's "Already up to date" short-circuit, so the plugin vanished from
+node_modules while its bundles declaration stayed. Fresh installs and removals are
+unaffected.
+
+Recovery (either one; replace the package and profile dir with yours):
+
+```powershell
+# A. the official recovery path: run the 0.3.2 guard CLI on the fly
+npx -p @1e0zj/dsh-plugin-mall@0.3.2 dsh-plugin-guard recover "$env:USERPROFILE\.dsh\profiles\web"
+
+# B. or just install the missing package back at 0.3.2 (recover + upgrade in one step)
+pnpm --dir "$env:USERPROFILE\.dsh\profiles\web" add "@1e0zj/dsh-plugin-mall@0.3.2" --ignore-scripts
+```
+
+Then `dsh web`. If npmmirror has not synced 0.3.2 yet, append
+`--registry=https://registry.npmjs.org` to B. As of 0.3.2 the rollback rebuild
+carries a per-package `pnpm add` fallback and the approval pause no longer rolls
+back, so this cannot happen anymore.
+
+
 ## Agent tools
 
 | Tool | What it does |
@@ -205,6 +232,30 @@ node <profile>/node_modules/@1e0zj/dsh-plugin-mall/src/cli.js guard launch --pro
 - **缓刑期内崩溃或非零退出** —— 回滚 profile，并用恢复后的状态**原样重启同一命令一次**（绝不循环），透传重启进程的退出码。支持的平台会把 SIGINT/SIGTERM 转发给子进程；Windows 上 `.cmd`/`.bat` 经 `%ComSpec%` 启动，逐参数严格加引号。
 
 限制：缓刑期就是观察期——**之后**才暴露的故障（跑了几分钟才崩、或某个特定操作才触发）无法自动回滚：提交会删掉当前快照，此时 `guard recover` 已无可恢复的东西。`guard validate` 仍能诊断落盘状态，但提交之后的故障只能手工修复——卸载并重装插件（或恢复你另行保留的备份）。两条命令都只做**静态落盘校验**，都不证明插件真的能加载。pending 标记损坏时关闭式失败：不启动命令、不删除任何未校验路径。要**保留快照**、修复或恢复一个可信的标记后再跑 `guard recover`；只有在你已经独立核实过 profile、或决定放弃自动恢复之后，才去隔离（删除/移走）标记。
+
+
+## 升级后 dsh 起不来？（0.2.0 – 0.3.1 受影响，0.3.2 已修复）
+
+症状：`dsh web` 报 `cannot resolve profile bundle "<包名>"` 直接退出。
+
+原因：这两个版本里，**更新已有插件**时若安装走到失败回滚（最常见：目标插件
+带构建脚本、流程停在批准卡），回滚里「离线重建旧版本」的一步会被 pnpm 的
+"Already up to date" 空转骗过——插件从 node_modules 消失而 bundles 声明
+还在，profile 就此卡死。新装、卸载不受影响。
+
+恢复（任选其一；`<包名>` 换成报错点名的包，`<profile>` 换成 profile 目录）：
+
+```powershell
+# A. 官方恢复路径：临时拉 0.3.2 的 guard CLI，把 profile 恢复到升级前状态
+npx -p @1e0zj/dsh-plugin-mall@0.3.2 dsh-plugin-guard recover "$env:USERPROFILE\.dsh\profiles\web"
+
+# B. 直接把报错点名的包装回来（以市场为例；一步恢复 + 升级）
+pnpm --dir "$env:USERPROFILE\.dsh\profiles\web" add "@1e0zj/dsh-plugin-mall@0.3.2" --ignore-scripts
+```
+
+然后 `dsh web`。npmmirror 尚未同步 0.3.2 时，给 B 追加
+`--registry=https://registry.npmjs.org`。0.3.2 起，回滚重建带 per-package
+add 兜底、批准暂停不再触发回滚，该问题不再发生。
 
 
 ## 工作原理
