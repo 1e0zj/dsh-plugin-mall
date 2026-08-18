@@ -49,6 +49,7 @@ window.__ModuleLoader__.load({
       ".mkt_ok{color:var(--dsw-alias-state-success-primary,#2f855a)}",
       ".mkt_badge{display:inline-block;border-radius:999px;padding:1px 8px;font-size:11px;border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-tertiary)}",
       ".mkt_badgeOk{border-color:var(--dsw-alias-state-success-primary,#2f855a);color:var(--dsw-alias-state-success-primary,#2f855a)}",
+      ".mkt_badgeWarn{border-color:var(--dsw-alias-state-warning-primary,#b7791f);color:var(--dsw-alias-state-warning-primary,#b7791f)}",
       ".mkt_badgeBad{border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary)}",
       ".mkt_check{display:flex;align-items:center;gap:4px;font-size:12.5px;color:var(--dsw-alias-label-secondary);cursor:pointer;white-space:nowrap}",
       ".mkt_link{color:var(--dsw-alias-state-business-primary);font-size:12px;text-decoration:none;cursor:pointer}",
@@ -196,6 +197,19 @@ window.__ModuleLoader__.load({
       return null;
     }
 
+    // ── browsing-time compat badge ──────────────────────────────────────────
+    // Static server-side scan of the repo manifest/patch against the profile.
+    // Advisory only: the install preflight remains the enforcing gate.
+    function compatBadge(compat) {
+      if (compat === undefined || compat === null) return null;
+      var titles = (compat.issues || []).map(function (item) { return (item.severity === "block" ? "[阻断] " : "[警告] ") + item.title; });
+      var tip = (compat.summary || "") + (titles.length > 0 ? "\n" + titles.join("\n") : "") + (compat.patchChecked === false ? "\n补丁未获取，加载冲突未检查" : "");
+      if (compat.state === "conflict") return h("span", { className: "mkt_badge mkt_badgeBad", title: tip }, "冲突");
+      if (compat.state === "warning") return h("span", { className: "mkt_badge mkt_badgeWarn", title: tip }, "有风险");
+      if (compat.state === "compatible") return h("span", { className: "mkt_badge mkt_badgeOk", title: tip }, "适配");
+      return h("span", { className: "mkt_badge", title: tip || "兼容性未知" }, "适配未知");
+    }
+
     // ── repo card ───────────────────────────────────────────────────────────
     function RepoCard(props) {
       var item = props.item;
@@ -213,6 +227,7 @@ window.__ModuleLoader__.load({
         h("div", { className: "mkt_cardHead" },
           h("span", { className: "mkt_name" }, item.fullName),
           verifyBadge(props.verified),
+          compatBadge(props.compat),
           item.archived ? h("span", { className: "mkt_badge" }, "archived") : null
         ),
         item.description ? h("div", { className: "mkt_desc" }, item.description) : null,
@@ -429,9 +444,13 @@ window.__ModuleLoader__.load({
       var loadingMore = _loadingMore[0];
       var setLoadingMore = _loadingMore[1];
       var sentinelRef = useRef(null);
+      var resultsRef = useRef(null);
       var _verified = useState({});
       var verified = _verified[0];
       var setVerified = _verified[1];
+      var _compat = useState({});
+      var compat = _compat[0];
+      var setCompat = _compat[1];
       var _verifiedOnly = useState(true);
       var verifiedOnly = _verifiedOnly[0];
       var setVerifiedOnly = _verifiedOnly[1];
@@ -475,6 +494,9 @@ window.__ModuleLoader__.load({
         call("verify", { repos: repos }).then(function (value) {
           setVerified(function (prev) { return Object.assign({}, prev, value.results); });
         }).catch(function () { /* optional */ });
+        call("compat", { repos: repos }).then(function (value) {
+          setCompat(function (prev) { return Object.assign({}, prev, value.results); });
+        }).catch(function () { /* optional */ });
       }, [call]);
 
       var doSearch = useCallback(function () {
@@ -486,6 +508,7 @@ window.__ModuleLoader__.load({
         call("search", { query: query, sort: sort, perPage: 20 }).then(function (value) {
           setResults(value);
           setVerified({});
+          setCompat({});
           verifyPage(value.items);
         }).catch(function (e) {
           setError(errorText(e));
@@ -550,10 +573,14 @@ window.__ModuleLoader__.load({
 
       var onJobSettled = useCallback(function (id, snapshot) {
         refreshInstalled();
+        // 装/卸改变了 profile，旧适配徽标全部失效，按当前列表重扫。
+        setCompat({});
+        var items = resultsRef.current ? resultsRef.current.items : [];
+        if (items.length > 0) verifyPage(items);
         if (snapshot && (snapshot.status === "completed" || (snapshot.status === "failed" && !snapshot.needsApproval) || snapshot.status === "killed")) {
           if (snapshot.spec) delete approvalTokensRef.current[snapshot.spec];
         }
-      }, [refreshInstalled]);
+      }, [refreshInstalled, verifyPage]);
 
       var onApprovalToken = useCallback(function (spec, token) {
         if (spec && token) {
@@ -691,6 +718,7 @@ window.__ModuleLoader__.load({
         return v !== undefined && (v.kind === "bundle" || v.kind === "client")
           && !(v.hostDeps !== undefined && v.hostDeps.length > 0);
       });
+      resultsRef.current = results;
       var verifyPending = results !== null && results.items.some(function (it) { return verified[it.fullName] === undefined; });
 
       return h("div", { className: "mkt_root" },
@@ -785,6 +813,7 @@ window.__ModuleLoader__.load({
                     installing: installing[item.fullName] === true || installing["github:" + item.fullName] === true,
                     installJob: installJob,
                     verified: vInfo,
+                    compat: compat[item.fullName],
                     alreadyInstalled: alreadyInstalled,
                     onInstall: doInstall,
                   });
