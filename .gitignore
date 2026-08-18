@@ -1,5 +1,7 @@
 node_modules/
 package-lock.json
+# 例外：CI 离线 fixture 的完整依赖树必须提交（release workflow 用它 npm ci）
+!.github/fixtures/guard-tests/package-lock.json
 pnpm-lock.yaml
 *.tgz
 .DS_Store
