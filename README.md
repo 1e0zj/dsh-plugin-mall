@@ -101,24 +101,34 @@ fooled by pnpm's "Already up to date" short-circuit, so the plugin vanished from
 node_modules while its bundles declaration stayed. Fresh installs and removals are
 unaffected.
 
-Recovery (either one; replace the package and profile dir with yours):
+Recovery depends on **which install source the broken plugin used** (see its entry in the profile's `package.json`):
+
+**npm packages** (`"name": "^1.2.3"`) — `guard recover` can fix these automatically, or install the package straight back:
 
 ```powershell
 # Windows PowerShell
-# A. the official recovery path: run the 0.3.2 guard CLI on the fly
 npx -p @1e0zj/dsh-plugin-mall@0.3.2 dsh-plugin-guard recover "$env:USERPROFILE\.dsh\profiles\web"
-
-# B. or just install the missing package back at 0.3.2 (recover + upgrade in one step)
+# or install the latest straight back (recover + upgrade in one step; add
+# --registry=https://registry.npmjs.org if npmmirror has not synced it yet)
 pnpm --dir "$env:USERPROFILE\.dsh\profiles\web" add "@1e0zj/dsh-plugin-mall@0.3.2" --ignore-scripts
 ```
 
 ```bash
 # Linux / macOS
-# A. the official recovery path
 npx -p @1e0zj/dsh-plugin-mall@0.3.2 dsh-plugin-guard recover ~/.dsh/profiles/web
-
-# B. or just install the missing package back (recover + upgrade in one step)
 pnpm --dir ~/.dsh/profiles/web add "@1e0zj/dsh-plugin-mall@0.3.2" --ignore-scripts
+```
+
+**GitHub sources** (`"name": "github:owner/repo"`) — the rollback rebuild does not
+cover git dependencies; if `guard recover` could not repair it (dsh still won't
+start), install it back manually, online:
+
+```powershell
+pnpm --dir "$env:USERPROFILE\.dsh\profiles\web" add "github:owner/repo" --ignore-scripts
+```
+
+```bash
+pnpm --dir ~/.dsh/profiles/web add "github:owner/repo" --ignore-scripts
 ```
 
 Then `dsh web`. If npmmirror has not synced 0.3.2 yet, append
@@ -253,24 +263,32 @@ node <profile>/node_modules/@1e0zj/dsh-plugin-mall/src/cli.js guard launch --pro
 "Already up to date" 空转骗过——插件从 node_modules 消失而 bundles 声明
 还在，profile 就此卡死。新装、卸载不受影响。
 
-恢复（任选其一；`<包名>` 换成报错点名的包，`<profile>` 换成 profile 目录）：
+恢复方式**取决于出问题的插件是什么安装源**（看 profile `package.json` 里它的依赖写法）：
+
+**npm 包**（`"名字": "^1.2.3"` 这类）——guard recover 能自动修，也可以直接装回：
 
 ```powershell
 # Windows PowerShell
-# A. 官方恢复路径：临时拉 0.3.2 的 guard CLI，把 profile 恢复到升级前状态
 npx -p @1e0zj/dsh-plugin-mall@0.3.2 dsh-plugin-guard recover "$env:USERPROFILE\.dsh\profiles\web"
-
-# B. 直接把报错点名的包装回来（以市场为例；一步恢复 + 升级）
+# 或者直接装回最新版（一步恢复 + 升级；npmmirror 未同步时加 --registry=https://registry.npmjs.org）
 pnpm --dir "$env:USERPROFILE\.dsh\profiles\web" add "@1e0zj/dsh-plugin-mall@0.3.2" --ignore-scripts
 ```
 
 ```bash
 # Linux / macOS
-# A. 官方恢复路径
 npx -p @1e0zj/dsh-plugin-mall@0.3.2 dsh-plugin-guard recover ~/.dsh/profiles/web
-
-# B. 直接装回（一步恢复 + 升级）
 pnpm --dir ~/.dsh/profiles/web add "@1e0zj/dsh-plugin-mall@0.3.2" --ignore-scripts
+```
+
+**GitHub 源**（`"名字": "github:owner/repo"` 这类）——guard recover 的回滚重建
+不覆盖 git 依赖；若它没能自动修复（dsh 仍起不来），手动联网装回：
+
+```powershell
+pnpm --dir "$env:USERPROFILE\.dsh\profiles\web" add "github:owner/repo" --ignore-scripts
+```
+
+```bash
+pnpm --dir ~/.dsh/profiles/web add "github:owner/repo" --ignore-scripts
 ```
 
 然后 `dsh web`。npmmirror 尚未同步 0.3.2 时，给 B 追加
