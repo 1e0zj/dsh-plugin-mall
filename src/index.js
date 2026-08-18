@@ -24,15 +24,15 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
 import { repoInfo, searchPlugins, verifyPlugins, cachedRepoManifest, fetchRawFile, preferNpmSpec, npmPackageInfo, compareVersions, assertSafeToInstall, mapLimit, NETWORK_CONCURRENCY } from "./github.js";
-import { ensureProfile, listInstalled, normalizeSpec, runInstall, runRemove, assertSafeSpec, resolveRegistry, serializeCanonicalProof } from "./installer.js";
+import { ensureProfile, listInstalled, normalizeSpec, runInstall, runRemove, assertSafeSpec, resolveRegistry, serializeCanonicalProof, persistPluginDisabled } from "./installer.js";
 import { preflightInstall, inspectRemoteCandidate, recoverProfile } from "./guard.js";
 
 export const name = "@1e0zj/dsh-plugin-mall";
-// `loader` 是启用/停用的写入侧：ctx.loader.update(id, {disabled}) 一次调用既
-// dispose/init 运行中的 fiber，又把改动写回配置文件。官方的
-// @deepseek-ai/dsh-host-plugin-inventory 也是 inject ["loader"]，只是它只读
+// `loader` 用来读装配树、并对单个 entry 做热开关（entry.update）。读法照抄
+// 官方的 @deepseek-ai/dsh-host-plugin-inventory —— 它是只读投影
 // （"Read-only Remote projection of current Cordis Loader plugin state"），
-// 写入侧留白，正是这里要补的位置。loader 必然存在——没有它我们根本加载不了。
+// 写入侧留白，正是这里补的位置。持久化不走 loader（见 togglePlugin 的说明）。
+// loader 必然存在——没有它我们根本加载不了。
 export const inject = ["tools", "jobs", "systemPrompt", "loader"];
 
 export const Config = z.object({
@@ -994,14 +994,35 @@ export function loaderEntriesByPackage(ctx) {
       if (entry.options?.group) continue;
       const moduleName = entry.options?.name;
       if (typeof moduleName !== "string" || moduleName.length === 0) continue;
-      const bucket = byPackage[moduleName] ??= { entryIds: [], enabled: true };
+      const bucket = byPackage[moduleName] ??= { entryIds: [], entries: [], enabled: true };
+      // 两个 id 必须分清：
+      //   entry.id        运行时全路径，父链拼出来的（`include:dsh-at-file`）
+      //   entry.options.id 配置文件里写的那个（`dsh-at-file`）
+      // patch 层的 id 定向覆盖按后者匹配（applyEntryPatches 从组装数据建
+      // entryMap，键是各 patch 声明的 id）。拿前者去写 patch，那条覆盖行
+      // 永远匹配不到目标，dsh 只会 warn 一句然后忽略——停用看着成功了，
+      // 重启后插件照常回来。
+      const configId = entry.options?.id;
       bucket.entryIds.push(entry.id);
+      bucket.entries.push({ id: entry.id, configId, entry });
       if (entry.disabled) bucket.enabled = false;
     }
   } catch {
     /* loader 读不到就不给开关，安装/卸载照常可用 */
   }
   return byPackage;
+}
+
+/**
+ * The serializable half of loaderEntriesByPackage — live `entry` objects must
+ * never reach the RPC envelope (they carry the whole fiber graph).
+ */
+function serializableEntries(byPackage) {
+  const out = {};
+  for (const [moduleName, bucket] of Object.entries(byPackage)) {
+    out[moduleName] = { entryIds: bucket.entryIds, enabled: bucket.enabled };
+  }
+  return out;
 }
 
 /** Render one preflight issue as a compact line for model/error output. */
@@ -1225,12 +1246,19 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
         return rpcFail(new Error(`invalid profile: ${error.message}`));
       }
       // 带上每个依赖在装配树里的启用状态，浏览器据此渲染开关。
-      return rpcOk({ ...listInstalled(profile), entries: loaderEntriesByPackage(ctx) });
+      return rpcOk({ ...listInstalled(profile), entries: serializableEntries(loaderEntriesByPackage(ctx)) });
     }
     case "togglePlugin": {
-      // 启用/停用：热生效，不重启、不重装。loader 精确 dispose/init 那几个
-      // fiber，其余插件不受影响；重新启用时，因依赖它而 PENDING 的插件也会
-      // 一并回来（cordis-tutorial/06-composition-and-hmr）。
+      // 启用/停用，三层（同 cynch18/plugin-switch 的做法）：
+      //   1. 内存 —— entry.update({disabled}) 立即 dispose/start 对应 fiber
+      //   2. 持久化 —— 文本改写用户的 cordis.patch.yml，由 dsh 自己的
+      //      watchUserPatches 事务性重放（启动时若无 HMR 会当场创建一个，
+      //      见 @deepseek-ai/dsh 的 profile-boot：ctx.loader.create(hmr) →
+      //      watchUserPatches(profile patch) + watchUserPatches(home patch)）
+      //   3. 保险 —— 写前备份到 <profile>/backups/，留最近 20 份
+      // 刻意不用 ctx.loader.update()：它的 tree.write() 写的是 cordis.yml，
+      // 那是组装产物；用户的选择该留在自己的 patch 层。
+      const profile = String(payload?.profile ?? defaultProfile).trim();
       const packageName = String(payload?.package ?? "").trim();
       const enabled = payload?.enabled === true;
       if (packageName.length === 0) return rpcFail(new Error("togglePlugin: package name is required"));
@@ -1238,19 +1266,39 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
         // 停用市场自己 = 关掉正在操作的这个界面，之后只能手改配置文件才能回来。
         return rpcFail(new Error("refusing to disable the marketplace itself — you would lose the UI needed to re-enable it"));
       }
-      const byPackage = loaderEntriesByPackage(ctx);
-      const targets = byPackage[packageName]?.entryIds ?? [];
+      let profileDir;
+      try {
+        profileDir = resolveProfileDir(profile);
+      } catch (error) {
+        return rpcFail(new Error(`invalid profile: ${error.message}`));
+      }
+      const targets = loaderEntriesByPackage(ctx)[packageName]?.entries ?? [];
       if (targets.length === 0) {
         return rpcFail(new Error(`no loader entry found for ${packageName} — it may not be mounted in this profile`));
       }
+      // 先持久化：patch 层写不了（!!js 表达式等）就整个放弃，不留下
+      // 「内存里关了、重启又回来」的错位状态。
+      const backups = [];
       try {
-        for (const entryId of targets) {
-          await ctx.loader.update(entryId, { disabled: enabled ? undefined : true });
+        for (const target of targets) {
+          // 用 options.id（配置文件里的 id），不是 entry.id（运行时全路径）。
+          if (typeof target.configId !== "string" || target.configId.length === 0) {
+            throw new Error(`${packageName} has a loader entry without a configured id — it cannot be targeted from the patch layer`);
+          }
+          const result = persistPluginDisabled(profileDir, target.configId, !enabled, packageName);
+          if (result.backup !== undefined) backups.push(result.backup);
         }
       } catch (error) {
-        return rpcFail(new Error(`could not ${enabled ? "enable" : "disable"} ${packageName}: ${error.message}`));
+        return rpcFail(error);
       }
-      return rpcOk({ package: packageName, enabled, entries: loaderEntriesByPackage(ctx) });
+      try {
+        for (const target of targets) {
+          await target.entry.update({ disabled: enabled ? undefined : true });
+        }
+      } catch (error) {
+        return rpcFail(new Error(`${packageName} was written to the patch layer but the live toggle failed: ${error.message} — restart dsh to apply it`));
+      }
+      return rpcOk({ package: packageName, enabled, backups, entries: serializableEntries(loaderEntriesByPackage(ctx)) });
     }
     case "preflight": {
       // 预检本身做成 job：点击安装的瞬间任务就出现在面板里，探针的 pnpm
@@ -2312,6 +2360,19 @@ export async function runSelfTests() {
     check("loader 抛错时降级为空表，不拖垮已装列表", Object.keys(loaderEntriesByPackage({
       loader: { entries: () => { throw new Error("loader unavailable"); } },
     })).length === 0);
+
+    // entry.id 是运行时全路径（父链拼接，`include:dsh-at-file`），
+    // entry.options.id 才是配置文件里的 id（`dsh-at-file`）。patch 层的
+    // id 定向覆盖按后者匹配——用错了那条覆盖行永远命中不了目标，
+    // 停用看着成功、重启后插件照常回来（真实环境踩过）。
+    const prefixed = loaderEntriesByPackage(fakeLoaderCtx([
+      { id: "include:dsh-at-file", options: { id: "dsh-at-file", name: "dsh-at-file" }, disabled: false },
+    ]));
+    check("运行时 id 与配置 id 分别保留", prefixed["dsh-at-file"]?.entries[0].id === "include:dsh-at-file"
+      && prefixed["dsh-at-file"]?.entries[0].configId === "dsh-at-file");
+    check("configId 缺失时可被识别（调用方据此拒绝写 patch）", loaderEntriesByPackage(fakeLoaderCtx([
+      { id: "anon-1", options: { name: "no-id-pkg" }, disabled: false },
+    ]))["no-id-pkg"]?.entries[0].configId === undefined);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -368,6 +368,134 @@ export function removeClientRow(profileDir, packageName) {
   return { removed: true, rowId };
 }
 
+// ── enable / disable persistence ────────────────────────────────────────────
+//
+// Toggling a plugin is three layers, and only the middle one lives here:
+//   1. memory — `entry.update({disabled})` disposes/starts the fiber (index.js)
+//   2. persistence — rewrite the profile's cordis.patch.yml, replayed
+//      transactionally by dsh's own `watchUserPatches` (this file)
+//   3. safety — back the file up before every edit so a bad write is undoable
+//
+// Persistence deliberately does NOT go through `loader.update()` even though
+// that would write for us: its `tree.write()` targets `cordis.yml`, the
+// composed artifact. A user's choice belongs in the patch layer they own, not
+// baked into the thing composition regenerates. Same conclusion as
+// cynch18/plugin-switch, which spells it out in its header comment.
+
+/** A patch row's `disabled:` line, when it is a plain literal we may rewrite. */
+const DISABLED_LINE_RE = /^(\s*)disabled\s*:\s*(.*?)\s*$/;
+
+/**
+ * Text-level edit of one entry's `disabled` in a patch file, preserving every
+ * other byte (comments included — users hand-write this file).
+ *
+ * A profile's patch layer normally starts EMPTY (`[]`): plugins are mounted by
+ * the bundle layers, not by the user's file. So "no row for this id" is the
+ * common case, not an error — we append an id-targeted override row, which is
+ * exactly what the patch layer is for (dsh-app-boot's applyEntryPatches treats
+ * a non-insert row as "override these keys on the entry with this id", and
+ * warns on a `name` mismatch, so we pass `name` as a guard).
+ *
+ * @param content - current cordis.patch.yml text.
+ * @param entryId - the loader entry id whose row to edit.
+ * @param disabled - desired state.
+ * @param moduleName - the entry's module name, written alongside a NEW row so
+ *   dsh can detect a stale patch if the id is ever reused.
+ * @returns the new text, or undefined when it already reads that way.
+ * @throws when the row's `disabled` is a `!!js` expression.
+ */
+export function setPatchRowDisabled(content, entryId, disabled, moduleName) {
+  const lines = String(content ?? "").split("\n");
+  // 行尾允许跟注释：`- id: at-file   # 我的备注` 是用户会写的形状。
+  const idPattern = new RegExp(`^(\\s*)-?\\s*id\\s*:\\s*['"]?${entryId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}['"]?\\s*(?:#.*)?$`);
+  const rowIndex = lines.findIndex((line) => idPattern.test(line));
+  if (rowIndex === -1) {
+    // patch 层里还没有这一条——这是常态（profile 的 patch 层默认是空的 `[]`，
+    // 插件由 bundle 层挂载）。追加一条 id 定向覆盖行。
+    if (!disabled) return undefined; // 没有覆盖行 = 本来就是启用状态
+    const block = moduleName === undefined
+      ? `- id: ${entryId}\n  disabled: true\n`
+      : `- id: ${entryId}\n  name: '${moduleName}'\n  disabled: true\n`;
+    const trimmed = String(content ?? "").trim();
+    // 模板是注释 + `[]`，整体替换掉那个空数组；否则在末尾追加。
+    if (trimmed.endsWith("[]")) {
+      return `${trimmed.slice(0, trimmed.lastIndexOf("[]")).trimEnd()}\n${block}`.replace(/^\n/, "");
+    }
+    return `${trimmed.length === 0 ? "" : `${trimmed}\n`}${block}`;
+  }
+  const indent = (idPattern.exec(lines[rowIndex])[1] ?? "").length;
+  // 同一条目的后续行：缩进更深，或与 `- id:` 的内容对齐。遇到下一个条目/顶格即止。
+  let existing = -1;
+  for (let index = rowIndex + 1; index < lines.length; index++) {
+    const line = lines[index];
+    if (line.trim().length === 0) continue;
+    const lead = line.length - line.trimStart().length;
+    if (lead <= indent && /^\s*-\s/.test(line)) break; // 下一个条目
+    if (lead < indent) break;                          // 退出该块
+    const match = DISABLED_LINE_RE.exec(line);
+    if (match !== null) { existing = index; break; }
+  }
+  if (existing !== -1) {
+    const value = DISABLED_LINE_RE.exec(lines[existing])[2];
+    // 用户写的是条件逻辑（如「只在 Windows 上停用」）。我们的开关只有两态，
+    // 覆盖它等于把条件永久压成固定值，而且用户不会察觉——拒绝接管，让人手改。
+    if (value.startsWith("!!js")) {
+      throw new Error(`cannot toggle ${entryId}: its "disabled" is a !!js expression — edit cordis.patch.yml by hand`);
+    }
+    if ((value === "true") === disabled) return undefined; // 已是目标状态
+    lines[existing] = lines[existing].replace(DISABLED_LINE_RE, `$1disabled: ${disabled}`);
+    return lines.join("\n");
+  }
+  if (!disabled) return undefined; // 没有 disabled 行本就是启用状态
+  // 插在 id 行之后，缩进与 id 的内容列对齐。
+  lines.splice(rowIndex + 1, 0, `${" ".repeat(indent + 2)}disabled: true`);
+  return lines.join("\n");
+}
+
+/** Keep the most recent N backups of a profile file, oldest pruned first. */
+const PATCH_BACKUP_KEEP = 20;
+
+/**
+ * Snapshot cordis.patch.yml before editing it. The file is hand-editable and
+ * carries the user's own rows; a bad automated write must be undoable without
+ * reaching for git.
+ * @returns the backup path, or undefined when there was nothing to back up.
+ */
+export function backupProfilePatch(profileDir) {
+  const patchPath = join(profileDir, PROFILE_PATCH_FILENAME);
+  if (!existsSync(patchPath)) return undefined;
+  const dir = join(profileDir, "backups");
+  mkdirSync(dir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const target = join(dir, `cordis.patch.${stamp}.yml`);
+  writeFileSync(target, readFileSync(patchPath, "utf8"));
+  try {
+    const kept = readdirSync(dir).filter((entry) => /^cordis\.patch\..*\.yml$/.test(entry)).sort();
+    for (const stale of kept.slice(0, Math.max(0, kept.length - PATCH_BACKUP_KEEP))) {
+      rmSync(join(dir, stale), { force: true });
+    }
+  } catch {
+    /* 清理失败不该让切换失败 */
+  }
+  return target;
+}
+
+/**
+ * Persist a toggle into the profile's patch layer: back up, edit, write through
+ * the checked writer. dsh's own `watchUserPatches` replays the file
+ * transactionally, so this is also what makes the change survive a restart.
+ * @returns `{changed, backup?}`; `changed:false` means it already read that way.
+ */
+export function persistPluginDisabled(profileDir, entryId, disabled, moduleName) {
+  const patchPath = join(profileDir, PROFILE_PATCH_FILENAME);
+  const content = existsSync(patchPath) ? readFileSync(patchPath, "utf8") : "[]\n";
+  const next = setPatchRowDisabled(content, entryId, disabled, moduleName);
+  if (next === undefined) return { changed: false };
+  const backup = backupProfilePatch(profileDir);
+  writePatchChecked(patchPath, next);
+  return { changed: true, backup };
+}
+
 // ── build-script allow-listing ──────────────────────────────────────────────
 
 /** Extract package names from pnpm's "Ignored build scripts: ..." output. */
@@ -2492,9 +2620,76 @@ async function runTransactionFixtures() {
   return failed;
 }
 
+/**
+ * The patch-layer edit behind enable/disable. Text surgery on a file users
+ * hand-write, so every shape it can meet is pinned here.
+ */
+function runToggleFixtures() {
+  let failed = 0;
+  const check = (label, ok, extra = "") => {
+    if (!ok) failed++;
+    console.log(`  ${ok ? "PASS" : "FAIL"} ${label}${ok ? "" : `  ${extra}`}`);
+  };
+  // 真实环境里 patch 层默认就是这个样子——注释 + 空数组。插件由 bundle 层
+  // 挂载，用户文件里一条都没有。第一版只测了「行已存在」的情形，于是停用
+  // 被静默跳过、重启后插件又回来了。这组用例先钉死这个场景。
+  const stockTemplate = "# Your patch layer for this dsh profile\n[]\n";
+  const fresh = setPatchRowDisabled(stockTemplate, "at-file", true, "dsh-at-file");
+  check("空 patch 层（模板 []）→ 追加 id 定向覆盖行", /- id: at-file/.test(fresh ?? "") && /disabled: true/.test(fresh ?? ""), JSON.stringify(fresh));
+  check("空 patch 层：替换掉 [] 而不是留着", !/\[\]/.test(fresh ?? ""), JSON.stringify(fresh));
+  check("空 patch 层：保留原有注释", (fresh ?? "").includes("# Your patch layer"));
+  check("新建行带 name 便于 dsh 校验陈旧 patch", /name: 'dsh-at-file'/.test(fresh ?? ""));
+  check("空 patch 层 + 要启用 → 不改动", setPatchRowDisabled(stockTemplate, "at-file", false, "dsh-at-file") === undefined);
+  check("新建的行能被 YAML 解析且是数组", (() => {
+    try { return Array.isArray(load(fresh)); } catch { return false; }
+  })());
+  check("新建行的语义正确（id + disabled）", (() => {
+    try { const doc = load(fresh); return doc[0].id === "at-file" && doc[0].disabled === true; } catch { return false; }
+  })());
+
+  const base = "- id: at-file\n  name: dsh-at-file\n";
+
+  const off = setPatchRowDisabled(base, "at-file", true);
+  check("无 disabled 行 → 插入 disabled: true", /^\s{2}disabled: true$/m.test(off ?? ""), JSON.stringify(off));
+  check("插入后其余字节不变", (off ?? "").includes("name: dsh-at-file"));
+
+  const on = setPatchRowDisabled(`- id: at-file\n  name: dsh-at-file\n  disabled: true\n`, "at-file", false);
+  check("已停用 → 改回 false", /disabled: false/.test(on ?? ""), JSON.stringify(on));
+
+  check("已是目标状态 → 不改动", setPatchRowDisabled(`- id: at-file\n  disabled: true\n`, "at-file", true) === undefined);
+  check("本就启用且要启用 → 不改动", setPatchRowDisabled(base, "at-file", false) === undefined);
+  check("条目不在 patch 层 → 追加新行，原有条目不动", (() => {
+    const out = setPatchRowDisabled(base, "other-id", true, "pkg-other");
+    return /- id: other-id/.test(out ?? "") && (out ?? "").includes("- id: at-file");
+  })());
+
+  // 用户写的条件逻辑不能被两态开关压平——必须拒绝并让人手改。
+  let threw = false;
+  try { setPatchRowDisabled(`- id: at-file\n  disabled: !!js process.platform === 'win32'\n`, "at-file", false); }
+  catch (error) { threw = /!!js expression/.test(error.message); }
+  check("disabled 是 !!js 表达式 → 拒绝接管", threw);
+
+  // 注释是用户手写的，一个字节都不能动。
+  const commented = "# 我的覆盖\n- id: at-file   # 保留这个注释\n  name: dsh-at-file\n";
+  const kept = setPatchRowDisabled(commented, "at-file", true);
+  check("注释原样保留", (kept ?? "").includes("# 我的覆盖") && (kept ?? "").includes("# 保留这个注释"));
+
+  // 多条目：只动目标那条，相邻条目不受影响。
+  const multi = "- id: a\n  name: pkg-a\n- id: at-file\n  name: dsh-at-file\n- id: z\n  name: pkg-z\n  disabled: true\n";
+  const one = setPatchRowDisabled(multi, "at-file", true);
+  check("多条目：只动目标条目", (one ?? "").split("disabled: true").length - 1 === 2 && (one ?? "").includes("- id: z"));
+  check("多条目：不误伤相邻条目的 disabled", setPatchRowDisabled(multi, "a", true)?.includes("- id: z\n  name: pkg-z\n  disabled: true") === true);
+
+  check("带引号的 id 也能匹配", setPatchRowDisabled(`- id: '@scope/pkg'\n  name: x\n`, "@scope/pkg", true) !== undefined);
+  return failed;
+}
+
 if (process.argv[1]?.endsWith("installer.js") && process.argv.includes("--self-test")) {
+  console.log("启用/停用 patch 层 fixtures:");
+  const toggleFailed = runToggleFixtures();
+  console.log();
   console.log("allowBuilds 合并 fixtures:");
-  const failed = runAllowBuildsFixtures();
+  const failed = runAllowBuildsFixtures() + toggleFailed;
   console.log(`${ALLOW_BUILDS_FIXTURES.length - failed}/${ALLOW_BUILDS_FIXTURES.length} passed`);
   // 实装 pnpm add 的参数/环境（纯函数）：peer 自动安装必须关闭，否则
   // marketplace 安装会把 @deepseek-ai 宿主依赖栈拉进 profile；构建脚本必须
