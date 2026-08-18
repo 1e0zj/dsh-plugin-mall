@@ -1043,6 +1043,74 @@ function reconcileInstallArgs() {
 }
 
 /**
+ * Args for the per-package fallback reinstall. pnpm 11's headless "up to date"
+ * short-circuit (node_modules/.pnpm/lock.yaml) can skip a `--frozen` install
+ * even while the package is actually missing — `--force` does not bypass it
+ * (verified on a real profile, twice, each time leaving the profile without
+ * the plugin and dsh unable to boot). `pnpm add <spec>` always goes through
+ * full resolution, so it is the reliable way to relink one missing direct
+ * dependency. Still strictly offline.
+ */
+function fallbackAddArgs(target) {
+  return [
+    "add", target,
+    "--ignore-scripts",
+    "--config.auto-install-peers=false",
+    "--reporter=append-only",
+    "--offline",
+  ];
+}
+
+/**
+ * The argv target for a fallback `pnpm add` of one restored dependency, or
+ * undefined when that spec cannot be added offline and safely. Semver ranges
+ * become `name@range`, local file:/link: paths add by the spec itself;
+ * github:/git+ specs need the network or git and stay fail-closed, and
+ * anything carrying shell metacharacters (a multi-clause range like
+ * `^1.0.0 || ^2.0.0` contains spaces and pipes) is skipped — the
+ * shell-wrapped pnpm spawn joins argv with spaces without quoting.
+ */
+function fallbackAddTarget(name, spec) {
+  const range = String(spec ?? "");
+  if (range.length === 0) return undefined;
+  const isLocal = /^(?:file:|link:)/i.test(range);
+  if (!isLocal && validRange(range) === null) return undefined;
+  const target = isLocal ? range : `${name}@${range}`;
+  try {
+    assertSafeSpec(target);
+  } catch {
+    return undefined;
+  }
+  return target;
+}
+
+/**
+ * Run one fallback `pnpm add` synchronously. Same contract as
+ * runReconcileInstall: never throws, failures surface as a nonzero exit.
+ */
+function runFallbackAdd(profileDir, target) {
+  let result;
+  try {
+    const plan = pnpmSpawnPlan();
+    result = spawnSync(plan.command, fallbackAddArgs(target), {
+      cwd: profileDir,
+      env: pnpmGuardEnv(),
+      shell: plan.shell,
+      encoding: "utf8",
+      timeout: 180000,
+      windowsHide: true,
+    });
+  } catch (error) {
+    return { exitCode: 1, output: "", error };
+  }
+  return {
+    exitCode: typeof result.status === "number" ? result.status : 1,
+    output: `${result.stdout ?? ""}${result.stderr ?? ""}`,
+    error: result.error,
+  };
+}
+
+/**
  * Run the offline reconcile install synchronously (rollback is a sync
  * recovery path, called from CLI/startup contexts that cannot await). Never
  * throws: a missing/broken pnpm is reported like a nonzero exit.
@@ -1225,6 +1293,28 @@ export function rollbackPendingSnapshot(profileDir) {
   }
 
   if (unsatisfied.length > 0) {
+    // pnpm 11's headless short-circuit (node_modules/.pnpm/lock.yaml) can turn
+    // the reconcile above into a no-op ("Already up to date") while the package
+    // is actually gone — `--force` does not bypass it. Twice on a real profile
+    // that left the plugin missing and dsh unable to boot. Retry the still-
+    // missing direct dependencies one at a time with `pnpm add` (full
+    // resolution, still offline), then put the snapshot bytes back over
+    // whatever pnpm wrote: the add is only the means to relink node_modules,
+    // the snapshot stays authoritative for the declaration files.
+    for (const depName of [...unsatisfied]) {
+      const target = fallbackAddTarget(depName, restoredDependencies[depName]);
+      if (target === undefined) continue; // not offline-addable — fail closed below
+      const addAttempt = runFallbackAdd(profileDir, target);
+      if (addAttempt.exitCode === 0) {
+        restoreProfileSnapshot(pending);
+        if (candidateRestoredCompatible(profileDir, depName, restoredDependencies[depName])) {
+          unsatisfied.splice(unsatisfied.indexOf(depName), 1);
+        }
+      }
+    }
+  }
+
+  if (unsatisfied.length > 0) {
     const why =
       wasUpdate && pending.files?.["pnpm-lock.yaml"]?.present !== true
         ? "no pnpm-lock.yaml in the snapshot to rebuild from"
@@ -1235,9 +1325,10 @@ export function rollbackPendingSnapshot(profileDir) {
             : "node_modules missing direct dependency";
     const tail = String(attempt?.output ?? "").replace(/\s+/g, " ").trim().slice(-400);
     // KEEP the marker + snapshot: the profile files are already restored,
-    // so a retry (`guard recover`) or a manual pnpm install finishes it.
+    // so a retry (`guard recover`), the per-package `pnpm add` above, or a
+    // manual pnpm install finishes it.
     throw new Error(
-      `rollback restored the profile files and removed the failed install, but direct dependencies in node_modules are missing or incompatible (${unsatisfied.join(", ")}; ${why}) — the pending marker and snapshot were KEPT; re-run \`guard recover\` or run \`pnpm install --ignore-scripts --frozen-lockfile\` in ${profileDir} manually${tail ? `. pnpm output: ${tail}` : ""}`
+      `rollback restored the profile files and removed the failed install, but direct dependencies in node_modules are missing or incompatible even after the offline reconcile and per-package add fallback (${unsatisfied.join(", ")}; ${why}) — the pending marker and snapshot were KEPT; re-run \`guard recover\` or run \`pnpm install --ignore-scripts --frozen-lockfile\` in ${profileDir} manually${tail ? `. pnpm output: ${tail}` : ""}`
     );
   }
 
@@ -2066,6 +2157,91 @@ async function selfTest() {
       if (readJson(join(p, "package.json")).dependencies?.good !== "1.0.0") throw new Error("the manifest must be restored");
       const attempts = readFileSync(attemptsFile, "utf8").split(/\r?\n/).filter((line) => line.trim().length > 0);
       if (attempts.length !== 1) throw new Error(`the rollback must run exactly ONE offline reconcile, got ${attempts.length}`);
+    }
+
+    // The reconcile no-op trap, met twice on a real profile: pnpm 11's headless
+    // short-circuit answers `install --frozen` with exit 0 / "Already up to
+    // date" while the package is actually missing (--force does not bypass it),
+    // leaving dsh unable to boot. The stub models exactly that: `install` exits
+    // 0 and does NOTHING; only the per-package `add` fallback relinks the old
+    // copy — and it also rewrites package.json the way a real pnpm would
+    // ("^1.0.0"), which the snapshot-byte restore must overwrite. Expected:
+    // reconcile attempt, add attempt, marker + snapshot cleared, node_modules
+    // restored, and the declaration files byte-identical to the snapshot.
+    {
+      const p = join(root, "profiles", "update-reconcile-noop");
+      mkdirSync(join(p, "node_modules", "good"), { recursive: true });
+      writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: { good: "1.0.0" } }));
+      writeFileSync(join(p, "cordis.patch.yml"), "[]\n");
+      writeFileSync(join(p, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n\nimporters: {}\n");
+      writeFileSync(join(p, "node_modules", "good", "package.json"), JSON.stringify({ name: "good", version: "2.0.0" }));
+      const binDir = join(root, "stub-bin-noop-install");
+      mkdirSync(binDir);
+      const attemptsFile = join(binDir, "attempts.txt");
+      const isWin = process.platform === "win32";
+      const stubPath = join(binDir, isWin ? "pnpm.cmd" : "pnpm");
+      writeFileSync(stubPath, isWin
+        ? `@echo off\r\nif "%1"=="add" goto add\r\necho install>> "${attemptsFile}"\r\nexit /b 0\r\n:add\r\nmkdir node_modules\\good 2>nul\r\necho {"name":"good","version":"1.0.0"}> node_modules\\good\\package.json\r\necho {"dependencies":{"good":"^^1.0.0"}}> package.json\r\necho add>> "${attemptsFile}"\r\nexit /b 0\r\n`
+        : `#!/bin/sh\nif [ "$1" = "add" ]; then\n  mkdir -p node_modules/good\n  printf '%s' '{"name":"good","version":"1.0.0"}' > node_modules/good/package.json\n  printf '%s' '{"dependencies":{"good":"^1.0.0"}}' > package.json\n  echo add >> '${attemptsFile}'\n  exit 0\nfi\necho install >> '${attemptsFile}'\nexit 0\n`);
+      if (!isWin) chmodSync(stubPath, 0o755);
+      const snap = createProfileSnapshot(p, { spec: "good@2.0.0" });
+      markPendingSnapshot(snap, { spec: "good@2.0.0", preflight: { candidate: { name: "good", version: "2.0.0", kind: "plain" } } });
+      const previousPath = process.env.PATH;
+      process.env.PATH = `${binDir}${delimiter}${previousPath ?? ""}`;
+      try {
+        rollbackPendingSnapshot(p);
+      } finally {
+        if (previousPath === undefined) delete process.env.PATH;
+        else process.env.PATH = previousPath;
+      }
+      if (readPendingSnapshot(p) !== undefined) throw new Error("an add-fallback-rescued rollback must clear the marker");
+      if (existsSync(snap.dir)) throw new Error("an add-fallback-rescued rollback must delete the snapshot dir");
+      if (readJson(join(p, "node_modules", "good", "package.json")).version !== "1.0.0") throw new Error("the add fallback must relink the old version");
+      if (readJson(join(p, "package.json")).dependencies?.good !== "1.0.0") throw new Error("snapshot bytes must win over the add's manifest rewrite");
+      const attempts = readFileSync(attemptsFile, "utf8").split(/\r?\n/).filter((line) => line.trim().length > 0);
+      if (attempts.join(",") !== "install,add") throw new Error(`expected the no-op reconcile then exactly one add fallback, got ${attempts.join(",")}`);
+    }
+
+    // The same no-op reconcile with an add that also fails (exit 1): rollback
+    // must stay fail-closed — throw, KEEP marker + snapshot, declarations stay
+    // at their snapshot bytes.
+    {
+      const p = join(root, "profiles", "update-reconcile-noop-fail");
+      mkdirSync(join(p, "node_modules", "good"), { recursive: true });
+      writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: { good: "1.0.0" } }));
+      writeFileSync(join(p, "cordis.patch.yml"), "[]\n");
+      writeFileSync(join(p, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n\nimporters: {}\n");
+      writeFileSync(join(p, "node_modules", "good", "package.json"), JSON.stringify({ name: "good", version: "2.0.0" }));
+      const binDir = join(root, "stub-bin-add-fails");
+      mkdirSync(binDir);
+      const attemptsFile = join(binDir, "attempts.txt");
+      const isWin = process.platform === "win32";
+      const stubPath = join(binDir, isWin ? "pnpm.cmd" : "pnpm");
+      writeFileSync(stubPath, isWin
+        ? `@echo off\r\necho %1>> "${attemptsFile}"\r\nexit /b 1\r\n`
+        : `#!/bin/sh\necho "$1" >> '${attemptsFile}'\nexit 1\n`);
+      if (!isWin) chmodSync(stubPath, 0o755);
+      const snap = createProfileSnapshot(p, { spec: "good@2.0.0" });
+      markPendingSnapshot(snap, { spec: "good@2.0.0", preflight: { candidate: { name: "good", version: "2.0.0", kind: "plain" } } });
+      const previousPath = process.env.PATH;
+      process.env.PATH = `${binDir}${delimiter}${previousPath ?? ""}`;
+      let threw = false;
+      try {
+        rollbackPendingSnapshot(p);
+      } catch {
+        threw = true;
+      } finally {
+        if (previousPath === undefined) delete process.env.PATH;
+        else process.env.PATH = previousPath;
+      }
+      if (!threw) throw new Error("a rollback whose reconcile no-ops AND add fallback fails must throw");
+      if (readPendingSnapshot(p)?.id !== snap.id) throw new Error("the failed rollback must KEEP the pending marker");
+      if (!existsSync(snap.dir)) throw new Error("the failed rollback must KEEP the snapshot dir");
+      if (readJson(join(p, "package.json")).dependencies?.good !== "1.0.0") throw new Error("the manifest must stay restored when the add fallback fails");
+      const attempts = readFileSync(attemptsFile, "utf8").split(/\r?\n/).filter((line) => line.trim().length > 0);
+      if (attempts.join(",") !== "install,add") throw new Error(`expected exactly one reconcile and one add attempt, got ${attempts.join(",")}`);
+      rmSync(pendingPath(p), { force: true });
+      rmSync(snap.dir, { recursive: true, force: true });
     }
 
     // The same interrupted update, but the reconcile never relinks the old
