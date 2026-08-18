@@ -104,11 +104,21 @@ unaffected.
 Recovery (either one; replace the package and profile dir with yours):
 
 ```powershell
+# Windows PowerShell
 # A. the official recovery path: run the 0.3.2 guard CLI on the fly
 npx -p @1e0zj/dsh-plugin-mall@0.3.2 dsh-plugin-guard recover "$env:USERPROFILE\.dsh\profiles\web"
 
 # B. or just install the missing package back at 0.3.2 (recover + upgrade in one step)
 pnpm --dir "$env:USERPROFILE\.dsh\profiles\web" add "@1e0zj/dsh-plugin-mall@0.3.2" --ignore-scripts
+```
+
+```bash
+# Linux / macOS
+# A. the official recovery path
+npx -p @1e0zj/dsh-plugin-mall@0.3.2 dsh-plugin-guard recover ~/.dsh/profiles/web
+
+# B. or just install the missing package back (recover + upgrade in one step)
+pnpm --dir ~/.dsh/profiles/web add "@1e0zj/dsh-plugin-mall@0.3.2" --ignore-scripts
 ```
 
 Then `dsh web`. If npmmirror has not synced 0.3.2 yet, append
@@ -246,11 +256,21 @@ node <profile>/node_modules/@1e0zj/dsh-plugin-mall/src/cli.js guard launch --pro
 恢复（任选其一；`<包名>` 换成报错点名的包，`<profile>` 换成 profile 目录）：
 
 ```powershell
+# Windows PowerShell
 # A. 官方恢复路径：临时拉 0.3.2 的 guard CLI，把 profile 恢复到升级前状态
 npx -p @1e0zj/dsh-plugin-mall@0.3.2 dsh-plugin-guard recover "$env:USERPROFILE\.dsh\profiles\web"
 
 # B. 直接把报错点名的包装回来（以市场为例；一步恢复 + 升级）
 pnpm --dir "$env:USERPROFILE\.dsh\profiles\web" add "@1e0zj/dsh-plugin-mall@0.3.2" --ignore-scripts
+```
+
+```bash
+# Linux / macOS
+# A. 官方恢复路径
+npx -p @1e0zj/dsh-plugin-mall@0.3.2 dsh-plugin-guard recover ~/.dsh/profiles/web
+
+# B. 直接装回（一步恢复 + 升级）
+pnpm --dir ~/.dsh/profiles/web add "@1e0zj/dsh-plugin-mall@0.3.2" --ignore-scripts
 ```
 
 然后 `dsh web`。npmmirror 尚未同步 0.3.2 时，给 B 追加
