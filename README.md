@@ -15,7 +15,7 @@ Curated lists only show what has been reviewed and merged. This marketplace is o
 - **Anti-squatting** — an install prefers the npm tarball only when the registry entry's `repository` URL points back to the same GitHub repo; anything else falls back to the explicit `github:` spec.
 - **npm-first installs** — registry tarballs are smaller than whole-repo GitHub downloads and come with integrity checks. Lookups follow the registry pnpm actually installs from (profile `.npmrc` → `pnpm config get registry` → npmjs), so a mirror user keeps npm-first instead of silently falling back to whole-repo clones.
 - **Update management** — installed plugins are compared against the registry `latest`; one-click update per plugin.
-- **Conflict guard** — every install runs an isolated preflight first: the candidate is installed with scripts disabled into a throwaway directory and scanned against the live profile for loader-id collisions, double mounts, host-module shadowing and version/OS/peer ranges. A hard conflict is blocked, warnings require explicit confirmation. The profile's load-bearing files are snapshotted before `pnpm` touches them and restored on failure, and a host-independent CLI guards startup: launched through `guard launch`, a pending install is committed only after dsh survives a grace window, and rolled back + restarted once when it crashes inside it (see [Startup protection](#startup-protection-guard-cli)).
+- **Conflict guard** — every install runs an isolated preflight first: the candidate is installed with scripts disabled into a throwaway directory and scanned against the live profile for loader-id collisions, double mounts, host-module shadowing and version/OS/peer ranges. A hard conflict is blocked, warnings require explicit confirmation. The profile's load-bearing files are snapshotted before `pnpm` touches them and restored on failure. A pending install is resolved on the next start, however you start it: this plugin runs recovery as it loads, which only happens because dsh booted far enough to compose the profile. Starting through `guard launch` adds a grace window on top, so a plugin that boots and then crashes seconds later is rolled back and restarted once (see [Startup protection](#startup-protection-guard-cli)).
 - **Resilience** — rate-limit circuit breaker, GitHub's 1000-result search window handled gracefully, `corepack enable pnpm` self-heal when pnpm is missing, one-click dsh restart (loopback-only, `allowRestart: false` to disable).
 
 ## Install
@@ -71,7 +71,15 @@ node <profile>/node_modules/@1e0zj/dsh-plugin-mall/src/cli.js guard add <spec> -
 node <profile>/node_modules/@1e0zj/dsh-plugin-mall/src/cli.js guard launch --profile web -- dsh web
 ```
 
-**You must start dsh through the guard wrapper to get startup protection.** `guard launch` checks the profile's pending-install marker before starting the command after `--`:
+**A plain `dsh web` already resolves pending installs.** The marketplace plugin runs
+recovery when it loads: reaching that point proves dsh booted far enough to compose
+the profile, so the pending marker is committed (or rolled back when the profile
+fails validation). Without this a single install would wedge the profile — every
+later install and uninstall refuses while a marker is outstanding.
+
+**`guard launch` is still strictly better**, because it also covers what a plain
+start cannot: a plugin that boots fine and then crashes seconds later. It checks the
+profile's pending-install marker before starting the command after `--`:
 
 - **No pending install** — the command runs as-is, inheriting the terminal, and its exit code is preserved.
 - **Clearly broken on disk** — the profile is rolled back to its pre-install snapshot *before* launch, then the command starts on the restored state.
@@ -105,7 +113,7 @@ Limitations: the grace window is the probation period — a failure that only su
 - **防抢注**：仅当 npm registry 条目的 `repository` 指回同一 GitHub 仓库时才用 npm 安装，否则回退 `github:` 源
 - **npm 优先安装**：registry tarball 比整仓库下载更小且带完整性校验；查询用的 registry 跟随 pnpm 实际安装源（profile `.npmrc` → `pnpm config get registry` → npmjs），换了镜像也不会退化成整仓库克隆
 - **更新管理**：已装插件与 registry `latest` 比对，逐个一键更新
-- **冲突防护**：每次安装先跑隔离预检——候选包在一次性目录里以禁用脚本的方式装好后，对照 live profile 扫描 loader-id 冲突、重复挂载、宿主模块遮蔽和版本/OS/peer 范围；硬冲突直接拦截，警告需显式确认。安装前给 profile 的承重文件拍快照、失败即回滚；另有一个独立于宿主的 CLI 守启动——经 `guard launch` 启动的 dsh 只有在活过观察期后才提交 pending 安装，观察期内崩溃则回滚并原样重启一次（见下方「启动保护」）。
+- **冲突防护**：每次安装先跑隔离预检——候选包在一次性目录里以禁用脚本的方式装好后，对照 live profile 扫描 loader-id 冲突、重复挂载、宿主模块遮蔽和版本/OS/peer 范围；硬冲突直接拦截，警告需显式确认。安装前给 profile 的承重文件拍快照、失败即回滚；pending 安装在下次启动时自动了结，**不挑启动方式**：本插件加载时就跑恢复，而能加载本身就证明 dsh 已经组装好 profile、活到了这一步。经 `guard launch` 启动则多一层观察期——插件启动几秒后才崩的情况也能回滚并原样重启一次（见下方「启动保护」）。
 - **工程韧性**：限流熔断、GitHub 5xx/超时退避重试（504 瞬时故障不再直达用户）、GitHub 1000 条搜索上限优雅处理、pnpm 缺失时 `corepack` 自愈、一键重启 dsh（仅 loopback，可 `allowRestart: false` 关闭）
 
 ## 安装
@@ -182,7 +190,13 @@ node <profile>/node_modules/@1e0zj/dsh-plugin-mall/src/cli.js guard add <spec> -
 node <profile>/node_modules/@1e0zj/dsh-plugin-mall/src/cli.js guard launch --profile web -- dsh web
 ```
 
-**必须经由 guard 包装器启动 dsh 才有启动期保护。** `guard launch` 在启动 `--` 之后的命令前检查该 profile 的 pending 安装标记：
+**普通的 `dsh web` 就会了结 pending 安装。** 本插件加载时即执行恢复——能加载
+本身就证明 dsh 已经组装好 profile、启动到了这一步，于是提交 pending 标记
+（profile 校验不过则回滚）。没有这一步的话，装完一个插件就会把 profile 卡住：
+只要标记还在，之后所有安装和卸载都会被拒绝。
+
+**`guard launch` 仍然更强**，因为它覆盖普通启动覆盖不了的情况：插件启动正常、
+几秒后才崩。它在启动 `--` 之后的命令前检查该 profile 的 pending 安装标记：
 
 - **无 pending 安装** —— 命令原样运行（继承终端），透传退出码；
 - **静态校验明显过不了** —— 启动*之前*先把 profile 回滚到安装前快照，再在恢复后的状态上启动；
@@ -220,6 +234,12 @@ node <profile>/node_modules/@1e0zj/dsh-plugin-mall/src/cli.js guard launch --pro
   （这行会出现在任务日志里）。更新检查读的是 registry 的 `/latest` 端点，
   不经过该策略，所以两边看到的「最新版本」本就可能不同。
   首次安装（卡片按钮）不带版本，沿用 pnpm 的策略默认值即可。
+- **一次点击一个任务，日志从第一毫秒开始流**：预检本身就是一个任务，点安装
+  的瞬间就出现在面板里，隔离探针的 pnpm 输出实时写入——而不是让按钮干等几秒
+  再冒出结果。预检通过后由安装任务接管同一条日志、撤掉预检条目，所以面板上
+  始终只有一条记录。运行中只露最后 8 行，落定后折叠成「查看日志（N 行）」。
+- **预检通过直接装**：verdict 为 safe 时不弹任何确认；只有有风险或被阻止才
+  出面板内联卡片（原因列表 + 取消 / 继续），不用模态弹窗打断。
 - **安装期代码要用户点头**：pnpm 默认拦掉依赖的构建脚本，放行等于让那些命令
   以用户的权限在其机器上运行（早于任何插件代码加载）——这个决定属于用户。
   所以被拦时安装**停下**，如实列出要批准的到底是什么：包名@版本、确切的

@@ -25,7 +25,7 @@ import { tmpdir } from "node:os";
 import { resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
 import { repoInfo, searchPlugins, verifyPlugins, cachedRepoManifest, fetchRawFile, preferNpmSpec, npmPackageInfo, compareVersions, assertSafeToInstall, mapLimit, NETWORK_CONCURRENCY } from "./github.js";
 import { ensureProfile, listInstalled, normalizeSpec, runInstall, runRemove, assertSafeSpec, resolveRegistry, serializeCanonicalProof } from "./installer.js";
-import { preflightInstall, inspectRemoteCandidate } from "./guard.js";
+import { preflightInstall, inspectRemoteCandidate, recoverProfile } from "./guard.js";
 
 export const name = "@1e0zj/dsh-plugin-mall";
 export const inject = ["tools", "jobs", "systemPrompt"];
@@ -194,7 +194,7 @@ function pinPreflight(profileDir, spec) {
  * Run the isolated preflight for a resolved install spec, reusing a fresh
  * cache entry ONLY if the profile fingerprint matches.
  */
-async function runPreflight({ profile, spec, force = false }) {
+async function runPreflight({ profile, spec, force = false, onOutput }) {
   let profileDir;
   try {
     profileDir = resolveProfileDir(profile);
@@ -220,7 +220,7 @@ async function runPreflight({ profile, spec, force = false }) {
     return { report: validCached.report, profileDir, fingerprint: currentFingerprint };
   }
 
-  const report = await preflightInstall({ profileDir, spec });
+  const report = await preflightInstall({ profileDir, spec, onOutput });
   preflightCache.set(key, {
     report,
     fingerprint: currentFingerprint,
@@ -858,6 +858,57 @@ export function createJobTracker({ producerFactory } = {}) {
       return id;
     },
 
+    /**
+     * A visible, log-streaming job for a phase that is not install/remove.
+     * Preflight above all: it used to run inside the RPC call before any job
+     * existed, so the panel sat empty for the seconds the probe took. Now the
+     * job appears the instant the user clicks and the probe's pnpm output
+     * streams into it. The verdict rides `extras` on the snapshot so the
+     * polling client can continue into the install (or raise a risk card).
+     * Cancel is advisory — the probe has no kill handle — so it just marks the
+     * record killed and discards the outcome; the throwaway probe directory
+     * lives in the system tmpdir and is reclaimed by the OS.
+     */
+    startCustom({ kind, label, profile, spec, surface = "browser", session, run }) {
+      const id = `market-${++trackerCounter}`;
+      const queue = [];
+      const push = (text) => { queue.push(String(text ?? "")); };
+      const record = {
+        id,
+        kind,
+        label,
+        profile,
+        spec,
+        surface,
+        session: session ?? "",
+        status: "running",
+        detail: undefined,
+        extras: undefined,
+        startedAt: Date.now(),
+        finishedAt: undefined,
+        cancelled: false,
+        readOutput: () => (queue.length === 0 ? "" : queue.splice(0).join("")),
+      };
+      (async () => {
+        try {
+          const outcome = await run(push);
+          if (record.cancelled) return; // 用户已放弃，结果作废
+          record.status = outcome?.status ?? "failed";
+          record.detail = outcome?.detail;
+          record.extras = outcome?.extras;
+        } catch (error) {
+          if (record.cancelled) return;
+          record.status = "failed";
+          record.detail = error?.message ?? String(error);
+        } finally {
+          if (!record.cancelled) record.finishedAt = Date.now();
+        }
+      })();
+      records.set(id, record);
+      prune();
+      return id;
+    },
+
     get(jobId, session) {
       const record = records.get(String(jobId));
       if (record === undefined) throw new Error(`unknown install job ${JSON.stringify(String(jobId))}`);
@@ -871,11 +922,15 @@ export function createJobTracker({ producerFactory } = {}) {
           detail: record.detail,
           needsApproval: record.needsApproval,
           approvalToken: isSameSession ? record.approvalToken : undefined,
+          // extras（如预检结论）同样只对同一 session 可见，与 approvalToken 同规格。
+          extras: isSameSession ? record.extras : undefined,
           spec: record.spec,
           startedAt: record.startedAt,
           finishedAt: record.finishedAt,
         },
-        output: typeof record.producer?.readOutput === "function" ? record.producer.readOutput() : "",
+        output: typeof record.readOutput === "function"
+          ? record.readOutput()
+          : typeof record.producer?.readOutput === "function" ? record.producer.readOutput() : "",
       };
     },
 
@@ -884,6 +939,13 @@ export function createJobTracker({ producerFactory } = {}) {
       if (record === undefined) throw new Error(`unknown install job ${JSON.stringify(String(jobId))}`);
       if (record.surface === "browser" && (record.session === "" || record.session !== session)) {
         throw new Error("unauthorized to cancel job from another session");
+      }
+      if (record.cancelled !== undefined) { // startCustom：无句柄可杀，立即标 killed 并作废结果
+        record.cancelled = true;
+        if (record.status === "running") {
+          record.status = "killed";
+          record.finishedAt = Date.now();
+        }
       }
       if (typeof record.producer?.cancel === "function") {
         record.producer.cancel();
@@ -1134,7 +1196,18 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
       return rpcOk(listInstalled(profile));
     }
     case "preflight": {
+      // 预检本身做成 job：点击安装的瞬间任务就出现在面板里，探针的 pnpm
+      // 输出实时流入——此前预检阻塞在 RPC 里，面板数秒空白只有按钮干等。
+      // 结论经 snapshot.extras 返回，轮询端据此后接安装或出风险卡片；
+      // 缓存同时被填热，随后的 install 调用不再重复探装。
       const profile = String(payload?.profile ?? defaultProfile).trim();
+      let session;
+      try {
+        // 与 install 同规格：job 归属浏览器 session，extras 才只对本人可见。
+        session = requireBrowserSession(payload?.session);
+      } catch (error) {
+        return rpcFail(error);
+      }
       let spec;
       try {
         spec = normalizeSpec(payload?.spec);
@@ -1144,9 +1217,22 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
       }
       try {
         const registry = await registryFor(profile, npmRegistry);
-        spec = await preferNpmSpec({ spec, registry, sources: rawSources });
-        const { report } = await runPreflight({ profile, spec });
-        return rpcOk(report);
+        const resolved = await preferNpmSpec({ spec, registry, sources: rawSources });
+        const jobId = tracker.startCustom({
+          kind: "dsh-plugin-preflight",
+          label: `preflight ${resolved}`,
+          profile,
+          spec: resolved,
+          surface: "browser",
+          session,
+          run: async (push) => {
+            push(`[dsh-plugin-mall] 预检 ${resolved}：隔离目录探装（脚本禁用）\n`);
+            const { report } = await runPreflight({ profile, spec: resolved, onOutput: (text) => push(text) });
+            push(`[dsh-plugin-mall] 预检结论：${report.verdict}\n`);
+            return { status: "completed", detail: `预检完成：${report.verdict}`, extras: report };
+          },
+        });
+        return rpcOk({ jobId, profile, spec: resolved });
       } catch (error) {
         return rpcFail(error);
       }
@@ -1362,6 +1448,31 @@ function registerRpcChannel(ctx, config, token) {
 export function apply(ctx, config = {}) {
   const { defaultProfile = "web", apiBase = "https://api.github.com", perPageMax = 30, npmRegistry = "", rawSources = [] } = config;
   const token = process.env.GITHUB_TOKEN ?? process.env.DSH_MARKET_GITHUB_TOKEN;
+
+  // Startup recovery. A pending install marker blocks every later install and
+  // uninstall in that profile until something resolves it — and until now the
+  // only thing that did was `guard launch`, a wrapper nobody uses: people type
+  // `dsh web`. One install then wedged the profile permanently, with an error
+  // telling users to run a CLI they have never heard of.
+  //
+  // Reaching `apply` IS the proof the pending install did not break the host:
+  // this code only runs because dsh booted far enough to compose the profile
+  // and load this plugin. So resolve the marker right here — recoverProfile
+  // commits when the profile validates and rolls back when it does not. The
+  // grace-window probation of `guard launch` stays strictly better (it also
+  // catches a crash seconds later); this is the floor for a plain start.
+  try {
+    const result = recoverProfile(resolveProfileDir(defaultProfile));
+    if (result.action === "committed") {
+      console.log(`[dsh-plugin-mall] startup recovery: committed the pending install for profile "${defaultProfile}"`);
+    } else if (result.action === "rolled-back") {
+      console.warn(`[dsh-plugin-mall] startup recovery: rolled back the pending install for profile "${defaultProfile}" — ${result.reason ?? "profile failed validation"}`);
+    }
+  } catch (error) {
+    // 恢复失败绝不能拖垮插件加载：报出来，让市场照常可用（用户还能手动
+    // `dsh-plugin-guard guard recover`），而不是连界面都进不去。
+    console.error("[dsh-plugin-mall] startup recovery failed:", error);
+  }
 
   ctx.systemPrompt.section({
     name: "tool:market",

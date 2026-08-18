@@ -64,7 +64,8 @@ window.__ModuleLoader__.load({
       ".mkt_approvePkg{display:flex;flex-direction:column;gap:4px}",
       ".mkt_approveName{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary);margin-right:8px;overflow-wrap:anywhere}",
       ".mkt_approveCmd{max-height:none;margin:0}",
-      ".mkt_jobDone{display:flex;align-items:center;gap:8px;flex-wrap:wrap}",
+      ".mkt_jobDone{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:2px}",
+      ".mkt_logBlock{display:flex;flex-direction:column;gap:4px;align-items:flex-start}",
       ".mkt_issueList{list-style:none;display:flex;flex-direction:column;gap:8px;margin:0;padding:0}",
       ".mkt_issue{border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:8px 10px;background:var(--dsw-alias-bg-secondary,#fff)}",
       ".mkt_issueBlock{border-color:var(--dsw-alias-state-error-primary)}",
@@ -123,7 +124,9 @@ window.__ModuleLoader__.load({
     }
 
     // ── job polling ─────────────────────────────────────────────────────────
-    function useJobPolling(call, onSettled, onApprovalToken) {
+    // onPreflightSettled：预检 job（kind=dsh-plugin-preflight）落定时回调，
+    // 携带 (spec, report)。safe 由调用方直接续装；有风险由调用方出内联卡片。
+    function useJobPolling(call, onSettled, onApprovalToken, onPreflightSettled) {
       var jobsRef = useRef({});
       var _jobs = useState({});
       var jobs = _jobs[0];
@@ -145,8 +148,15 @@ window.__ModuleLoader__.load({
               if (snapshot.needsApproval && snapshot.approvalToken && onApprovalToken) {
                 try { onApprovalToken(snapshot.spec, snapshot.approvalToken); } catch (e) { /* best effort */ }
               }
-              if (!wasTerminal && nowTerminal && onSettled) {
-                try { onSettled(id, snapshot); } catch (e) { /* best effort */ }
+              if (!wasTerminal && nowTerminal) {
+                if (onSettled) {
+                  try { onSettled(id, snapshot); } catch (e) { /* best effort */ }
+                }
+                // 预检 job 落定 → 把结论交给上层后继（只触发一次）
+                if (snapshot.kind === "dsh-plugin-preflight" && !old.preflightHandled && onPreflightSettled) {
+                  jobsRef.current[id] = Object.assign({}, old, { preflightHandled: true });
+                  try { onPreflightSettled(snapshot.spec, snapshot.extras, id); } catch (e) { /* best effort */ }
+                }
               }
               var output = (old.output || "") + (value.output || "");
               jobsRef.current = Object.assign({}, jobsRef.current, { [id]: Object.assign({}, old, {
@@ -154,6 +164,7 @@ window.__ModuleLoader__.load({
                 detail: snapshot.detail,
                 needsApproval: snapshot.needsApproval,
                 approvalToken: snapshot.approvalToken,
+                kind: snapshot.kind,
                 output: output,
               }) });
               setJobs(Object.assign({}, jobsRef.current));
@@ -162,9 +173,19 @@ window.__ModuleLoader__.load({
         }, 1200);
         return function () { clearInterval(timer); };
       }, [call, onSettled, onApprovalToken]);
-      var track = useCallback(function (id, spec) {
-        jobsRef.current = Object.assign({}, jobsRef.current, { [id]: { status: "running", spec: spec, output: "" } });
-        setJobs(Object.assign({}, jobsRef.current));
+      // carryFromId：把上一阶段（预检）的日志接过来并撤掉它的条目。一次点击
+      // 只应该在面板里留下一个任务，日志连续——而不是 market-1 预检、
+      // market-2 安装两条并排，让人以为自己点了两次。
+      var track = useCallback(function (id, spec, carryFromId) {
+        var next = Object.assign({}, jobsRef.current);
+        var carried = "";
+        if (carryFromId && next[carryFromId]) {
+          carried = next[carryFromId].output || "";
+          delete next[carryFromId];
+        }
+        next[id] = { status: "running", spec: spec, output: carried };
+        jobsRef.current = next;
+        setJobs(Object.assign({}, next));
       }, []);
       var clear = useCallback(function () {
         jobsRef.current = {};
@@ -317,6 +338,52 @@ window.__ModuleLoader__.load({
       );
     }
 
+    function jobKindLabel(kind) {
+      if (kind === "dsh-plugin-preflight") return "预检 ";
+      if (kind === "dsh-plugin-uninstall") return "卸载 ";
+      return "安装 ";
+    }
+
+    function jobStatusLabel(status) {
+      if (status === "completed") return "完成";
+      if (status === "failed") return "失败";
+      if (status === "killed") return "已取消";
+      return "进行中";
+    }
+
+    function jobStatusClass(status) {
+      if (status === "completed") return "mkt_ok";
+      if (status === "failed" || status === "killed") return "mkt_error";
+      return "";
+    }
+
+    // 任务日志：跑的时候只露尾部几行（够看进度，不霸屏），落定后默认折叠
+    // ——成功的日志没人回头读，失败的才需要，点开即可。
+    var LOG_TAIL_LINES = 8;
+    function JobLog(props) {
+      var _open = useState(false);
+      var open = _open[0];
+      var setOpen = _open[1];
+      var text = String(props.output || "").trimEnd();
+      if (text.length === 0) return null;
+      var lines = text.split("\n");
+      var collapsed = props.done && !open;
+      var shown = (props.done || lines.length <= LOG_TAIL_LINES) ? lines : lines.slice(-LOG_TAIL_LINES);
+      // 展开/收起始终在日志块上方：放在下方的话，点开后按钮会被推到长长的
+      // 日志末尾，想收起还得先滚回去。
+      return h("div", { className: "mkt_logBlock" },
+        props.done
+          ? h("span", {
+            className: "mkt_link",
+            onClick: function () { setOpen(!open); },
+          }, open ? "收起日志" : "查看日志（" + lines.length + " 行）")
+          : lines.length > LOG_TAIL_LINES
+            ? h("div", { className: "mkt_meta" }, "只显示最后 " + LOG_TAIL_LINES + " 行")
+            : null,
+        collapsed ? null : h("pre", { className: "mkt_pre" }, shown.join("\n").slice(-4000))
+      );
+    }
+
     // ── jobs panel ──────────────────────────────────────────────────────────
     function JobsPanel(props) {
       var ids = Object.keys(props.jobs);
@@ -330,8 +397,13 @@ window.__ModuleLoader__.load({
           var job = props.jobs[id];
           var done = job.status === "completed" || job.status === "failed" || job.status === "killed";
           return h("div", { key: id, style: { display: "flex", flexDirection: "column", gap: "4px" } },
+            // 不再显示 market-N 这种内部 id——对用户没有意义，反而让人以为
+            // 自己点了两次。只说清「在做什么 · 到哪一步了」。
+            // 状态词单独上色（完成绿、失败/取消红），前半段保持灰——整行
+            // 都染色会喧宾夺主，只有结论需要一眼看见。
             h("div", { className: "mkt_meta" },
-              id + " · " + clip(job.spec || "", 40) + " · " + (job.status || "running")),
+              jobKindLabel(job.kind) + clip(job.spec || "", 44) + " · ",
+              h("span", { className: jobStatusClass(job.status) }, jobStatusLabel(job.status))),
             job.needsApproval && job.needsApproval.length > 0
               ? h(ApprovalRequest, {
                 needsApproval: job.needsApproval,
@@ -345,9 +417,10 @@ window.__ModuleLoader__.load({
                 onDismiss: function () { props.onDismiss(id); },
               })
               : job.detail ? h("div", { className: "mkt_desc" }, job.detail) : null,
-            done && job.status === "completed"
+            // 预检完成不提示重启——它没有改动任何东西，接下来才是安装。
+            // 也不再重复一个绿色「完成」：状态行已经写了「· 完成」。
+            done && job.status === "completed" && job.kind !== "dsh-plugin-preflight"
               ? h("div", { className: "mkt_jobDone" },
-                h("span", { className: "mkt_ok" }, "完成"),
                 h("button", {
                   className: "mkt_btn mkt_btnPrimary mkt_btnSm",
                   disabled: props.restarting === true,
@@ -356,7 +429,7 @@ window.__ModuleLoader__.load({
               : job.status === "failed" && !(job.needsApproval && job.needsApproval.length > 0)
                 ? h("div", { className: "mkt_error" }, "失败，见下方输出")
                 : null,
-            job.output ? h("pre", { className: "mkt_pre" }, job.output.slice(-4000)) : null
+            h(JobLog, { output: job.output, done: done })
           );
         })
       );
@@ -584,7 +657,14 @@ window.__ModuleLoader__.load({
         }
       }, []);
 
-      var polling = useJobPolling(call, onJobSettled, onApprovalToken);
+      // 预检落定的后继动作要用到下面才定义的 doRawInstall，用 ref 转接，
+      // 免得为了闭包顺序把整块逻辑往上搬。
+      var preflightHandlerRef = useRef(null);
+      var onPreflightSettled = useCallback(function (spec, report, jobId) {
+        if (preflightHandlerRef.current) preflightHandlerRef.current(spec, report, jobId);
+      }, []);
+
+      var polling = useJobPolling(call, onJobSettled, onApprovalToken, onPreflightSettled);
       var track = polling.track;
       var jobs = polling.jobs;
       var clearJobs = polling.clear;
@@ -595,7 +675,7 @@ window.__ModuleLoader__.load({
         // eslint-disable-next-line react-hooks/exhaustive-deps
       }, []);
 
-      var doRawInstall = useCallback(function (spec, extra) {
+      var doRawInstall = useCallback(function (spec, extra, carryFromId) {
         setInstalling(function (prev) {
           var next = Object.assign({}, prev, { [spec]: true });
           return next;
@@ -603,7 +683,7 @@ window.__ModuleLoader__.load({
         setError(null);
         var payload = Object.assign({ spec: spec }, extra || {});
         call("install", payload).then(function (value) {
-          track(value.jobId, spec);
+          track(value.jobId, spec, carryFromId);
         }).catch(function (e) {
           delete approvalTokensRef.current[spec];
           setError(errorText(e));
@@ -626,31 +706,33 @@ window.__ModuleLoader__.load({
         doRawInstall(spec, extra);
       }, [doRawInstall]);
 
+      // 预检落定后的去向：safe 直接续装，其余出内联风险卡片。
+      useEffect(function () {
+        preflightHandlerRef.current = function (spec, report, jobId) {
+          if (!report || !report.verdict) {
+            setError("预检没有返回结论，请重试");
+            return;
+          }
+          if (report.verdict === "safe") {
+            // 安全：接过预检的日志、撤掉预检条目，面板上只剩这一个任务。
+            doRawInstall(spec, {}, jobId);
+          } else {
+            setPreflight({ spec: spec, report: report, jobId: jobId });
+          }
+        };
+      }, [doRawInstall]);
+
+      // 点安装 = 立刻起一个预检 job，面板马上有东西看、日志实时流。
+      // 结论由轮询经 onPreflightSettled 交回上面的 handler，这里不等待。
       var preflightAndInstall = useCallback(function (spec) {
         delete approvalTokensRef.current[spec];
-        setInstalling(function (prev) {
-          var next = Object.assign({}, prev, { [spec]: true });
-          return next;
-        });
         setError(null);
-        call("preflight", { spec: spec }).then(function (report) {
-          // 检查通过直接装，不打扰；有风险才出内联卡片等人表态；被阻止
-          // 只告知原因。任何路径都不再弹模态框。
-          if (report.verdict === "safe") {
-            doRawInstall(spec, {});
-          } else {
-            setPreflight({ spec: spec, report: report });
-          }
+        call("preflight", { spec: spec }).then(function (value) {
+          track(value.jobId, value.spec || spec);
         }).catch(function (e) {
           setError(errorText(e));
-        }).finally(function () {
-          setInstalling(function (prev) {
-            var next = Object.assign({}, prev);
-            delete next[spec];
-            return next;
-          });
         });
-      }, [call, doRawInstall]);
+      }, [call, track]);
 
       var doInstall = useCallback(function (repo) {
         preflightAndInstall("github:" + repo);
@@ -777,8 +859,9 @@ window.__ModuleLoader__.load({
           busy: installing[preflight.spec] === true,
           onConfirm: function () {
             var spec = preflight.spec;
+            var carry = preflight.jobId;
             setPreflight(null);
-            doRawInstall(spec, { acceptWarnings: true });
+            doRawInstall(spec, { acceptWarnings: true }, carry);
           },
           onClose: function () {
             if (preflight && preflight.spec) delete approvalTokensRef.current[preflight.spec];
