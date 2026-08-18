@@ -657,7 +657,9 @@ function spawnCapture(command, args, options, onOutput) {
 // not only by the agent/browser callers that happen to check first: anything
 // carrying shell metacharacters, or a Windows `file:`/`link:` path with spaces,
 // is refused before a single byte of filesystem work and before pnpm is spawned.
-const UNSAFE_SPEC_RE = /[;&|`$()<>^"!*\n\r]/;
+// `%` is on the list like everywhere else: cmd performs `%VAR%` expansion, and
+// the expanded value (often full of spaces and semicolons) reshapes the argv.
+const UNSAFE_SPEC_RE = /[;&|`$()<>^%!"*\n\r]/;
 
 function assertSafeSpec(spec) {
   const value = String(spec ?? "");
@@ -1903,6 +1905,12 @@ async function selfTest() {
       const rep = await preflightInstall({ profileDir: p, spec: "evil-pkg; rm -rf /tmp/x" });
       if (rep.verdict !== "blocked" || !rep.issues.some((entry) => entry.code === "unsafe-spec")) {
         throw new Error("preflightInstall should reject a spec with shell metacharacters before spawning");
+      }
+      // `%` 单独成案：它不是 POSIX 元字符，但 cmd 会做 %VAR% 展开，展开值
+      // 里的分号/空格足以重塑 argv——黑名单曾漏掉它，与 cli.js 漂移过。
+      const repPct = await preflightInstall({ profileDir: p, spec: "evil-pkg%PATH%" });
+      if (repPct.verdict !== "blocked" || !repPct.issues.some((entry) => entry.code === "unsafe-spec")) {
+        throw new Error("preflightInstall should reject a spec carrying cmd %VAR% expansion");
       }
       if (process.platform === "win32") {
         const repWin = await preflightInstall({ profileDir: p, spec: "file:C:\\some dir\\pkg" });

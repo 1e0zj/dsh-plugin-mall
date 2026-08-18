@@ -1132,8 +1132,10 @@ export function createJobTracker() {
 
 // Windows spawn 走 shell，spec 会被拼进 cmd 行；agent 传入的参数不可信。
 // 合法的 npm 名 / github:owner\/repo / git·file·link·URL spec 都不含这些
-// shell 元字符——出现即拒绝，宁可误杀不放开命令注入面。
-const UNSAFE_SPEC_RE = /[;&|`$()<>^"!*\n\r]/;
+// shell 元字符——出现即拒绝，宁可误杀不放开命令注入面。`%` 在列：cmd 会
+// 做 `%VAR%` 环境变量展开，展开结果常含分号/空格，足以改变参数切分。
+// （cli.js 的同款黑名单一直含 %，此前三处已经漂移。）
+const UNSAFE_SPEC_RE = /[;&|`$()<>^%!"*\n\r]/;
 
 /** Reject install/remove specs carrying shell metacharacters. */
 export function assertSafeSpec(spec) {
@@ -2025,6 +2027,17 @@ async function runTransactionFixtures() {
   };
   const tick = () => new Promise((resolve) => setTimeout(resolve, 1));
   const flush = async (rounds = 5) => { for (let index = 0; index < rounds; index++) await tick(); };
+
+  // 纯函数前置：spec 黑名单。`%` 必须在内——cmd 的 %VAR% 展开元字符，
+  // 展开值里的分号/空格足以重塑 argv；三处黑名单曾漂移（cli.js 一直有，
+  // installer/guard 漏过）。
+  {
+    const rejects = (value) => {
+      try { assertSafeSpec(value); return false; } catch { return true; }
+    };
+    check("assertSafeSpec：cmd 的 %VAR% 展开元字符被拒绝", rejects("evil-pkg%PATH%"));
+    check("assertSafeSpec：正常 spec 不受影响", !rejects("some-plugin@1.0.0") && !rejects("github:owner/repo"));
+  }
 
   // 0. hashPackageTree 确定性与符号链接越界防御
   {
