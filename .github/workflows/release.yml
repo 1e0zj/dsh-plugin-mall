@@ -28,11 +28,11 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
           package-manager-cache: false
 
-      # 这里故意没有 `npm ci`。框架包在 registry 上的 dist-tags 横跨两条发布线
+      # 这里故意不在仓库根目录跑 `npm ci`。框架包在 registry 上的 dist-tags 横跨两条发布线
       # （dsh-tools 的 latest 还在 0.0.1-rc.x，dsh-app-boot 已是 0.1.0-rc.x），
-      # 对 dsh-invariants 的 peer 区间无交集，npm install 必然 ERESOLVE 失败。
-      # 正好也不需要：这个包没有构建步骤，唯一的运行时依赖 js-yaml 由宿主提供，
-      # 而 npm publish 本身不读 node_modules。详见 README 的「本地开发」一节。
+      # 对 dsh-invariants 的 peer 区间无交集，npm 全量安装必然 ERESOLVE 失败。
+      # 正好也不需要：这个包没有构建步骤，`npm publish` 本身不读 node_modules。
+      # 离线 fixture 改从下一步的专用 lock 重放依赖（叶子依赖 + 测试宿主）。
 
       - name: tag 与 package.json 版本必须一致
         run: |
@@ -44,32 +44,33 @@ jobs:
           fi
           echo "版本一致：$PKG"
 
-      # src/github.js 只 import node: 内置模块，零依赖，裸机可跑。
-      # 守住宿主依赖检测的判据——它当初的实测对象 dsh-TUI 已被修复，
-      # 网络上不再有可复现的回归用例，这组 fixture 是唯一的防线。
-      - name: 离线 fixture
-        run: node src/github.js --self-test --offline
-
-      # guard/cli 的离线 fixture 需要 js-yaml 与 semver 两个叶子依赖（外加锁定
-      # 在 guard-tests/package-lock.json 里的测试宿主）。不对仓库根跑 npm ci：
-      # 根 package.json 的宿主 peer 不是开发依赖，且 dist-tags 横跨两条发布线，
-      # 全量安装必然 ERESOLVE。fixture 依赖树单独锁定重放。
-      - name: 安装锁定的 fixture 依赖
+      # 不对仓库根目录跑 npm ci：根 package.json 的宿主 peer 不是开发依赖。
+      # 六组 fixture 的完整依赖树单独锁在 guard-tests/package-lock.json；其中
+      # app-boot 与 dsh-tools 固定同一条 DSH 发布线，npm 在生成 lock 时自动解析
+      # 它们的 peer 闭包。发布时只重放 lock，不读 dist-tag，也不手列间接 peer。
+      - name: 安装锁定的 fixture 与宿主依赖
         run: |
           FIXTURE_DIR="$GITHUB_WORKSPACE/.github/fixtures/guard-tests"
           npm ci --prefix "$FIXTURE_DIR" --ignore-scripts --no-audit --no-fund
           ln -s "$FIXTURE_DIR/node_modules" node_modules
 
+      # src/github.js 只 import node: 内置模块，零依赖，裸机可跑。
+      # 守住宿主依赖检测的判据——它当初的实测对象 dsh-TUI 已被修复，
+      # 网络上不再有可复现的回归用例，这组 fixture 是唯一的防线。
       # src/guard.js 与 src/cli.js 的离线 fixture 固化冲突扫描、快照/pending/
-      # 回滚，以及 CLI 参数/启动缓刑的判据——主机无关、无网络、无 pnpm、无 dsh。
+      # 回滚，以及 CLI 参数/启动缓刑的判据——同为主机无关（不 import
+      # @deepseek-ai/*），无网络、无 pnpm、无 dsh，只吃上面装的两个叶子依赖。
+      # src/ds-router.js 固化安全路由、fail-closed 与绝对入口解析，同样无宿主依赖。
       # src/installer.js 的 fixture 固化 allowBuilds 合并与事务串行化/回滚；
       # src/index.js 的 fixture 覆盖 fingerprint、审批 token 与 job/session 隔离。
       # 两者经 node_modules 软链解析上面的最小宿主依赖；测试本身无网络、
       # 无 pnpm、无 dsh，也不触碰真实 profile。
-      - name: guard fixture
+      - name: 离线 fixture
         run: |
+          node src/github.js --self-test --offline
           node src/guard.js --self-test
           node src/cli.js self-test
+          node src/ds-router.js --self-test
           node src/installer.js --self-test
           node src/index.js --self-test
 

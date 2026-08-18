@@ -5,7 +5,8 @@
   "type": "module",
   "main": "src/index.js",
   "bin": {
-    "dsh-plugin-guard": "src/cli.js"
+    "dsh-plugin-guard": "src/cli.js",
+    "dsh-safe": "src/ds-router.js"
   },
   "exports": {
     ".": "./src/index.js",
