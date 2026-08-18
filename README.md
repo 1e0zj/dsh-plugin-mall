@@ -81,7 +81,6 @@ node <profile>/node_modules/@1e0zj/dsh-plugin-mall/src/cli.js guard launch --pro
 
 Limitations: the grace window is the probation period — a failure that only surfaces **after** it (a plugin that crashes minutes in, or on a specific interaction) cannot be rolled back automatically, because committing deletes the active snapshot and `guard recover` then has nothing to restore. `guard validate` still diagnoses the on-disk state, but a post-commit failure needs manual repair — uninstall and reinstall the plugin, or restore a backup you kept separately. Both commands do only **static on-disk validation**; neither proves the plugin actually loads. A corrupt pending marker fails closed: the command is not launched and no unvalidated path is deleted. Preserve the snapshot and repair or restore a trustworthy marker, then run `guard recover`; quarantine the marker only after you have independently verified the profile, or decided to abandon automatic recovery.
 
-
 ## Agent tools
 
 | Tool | What it does |
@@ -192,7 +191,6 @@ node <profile>/node_modules/@1e0zj/dsh-plugin-mall/src/cli.js guard launch --pro
 
 限制：缓刑期就是观察期——**之后**才暴露的故障（跑了几分钟才崩、或某个特定操作才触发）无法自动回滚：提交会删掉当前快照，此时 `guard recover` 已无可恢复的东西。`guard validate` 仍能诊断落盘状态，但提交之后的故障只能手工修复——卸载并重装插件（或恢复你另行保留的备份）。两条命令都只做**静态落盘校验**，都不证明插件真的能加载。pending 标记损坏时关闭式失败：不启动命令、不删除任何未校验路径。要**保留快照**、修复或恢复一个可信的标记后再跑 `guard recover`；只有在你已经独立核实过 profile、或决定放弃自动恢复之后，才去隔离（删除/移走）标记。
 
-
 ## 工作原理
 
 - 双面包（dual-face）插件：`dsh.bundle` 半边挂在 **host 平面**（profile bundle 层），
@@ -258,9 +256,16 @@ git push --follow-tags
 workflow 会先校验 tag 与 `package.json` 版本一致、再跑离线 fixture,任一不过
 就不发。它不在仓库根目录跑 `npm ci` —— 根 `package.json` 里的框架包是宿主
 提供的 peer，并非需要装进发布包的开发副本；这个包也没有构建步骤，
-`npm publish` 本身不读 `node_modules`。guard/cli 自测需要的测试依赖单独放在
+`npm publish` 本身不读 `node_modules`。测试依赖单独放在
 `.github/fixtures/guard-tests`，由提交进仓库的 `package-lock.json` 固定完整解析树，
-CI 只在该隔离目录运行 `npm ci --ignore-scripts`。
+CI 只在该隔离目录运行 `npm ci --ignore-scripts`。lock 将 `dsh-app-boot` 与
+`dsh-tools` 固定在同一 DSH 发布线，并包含 npm 自动解析出的 peer 闭包，因此发布
+不读取 dist-tag，也不因上游 latest 或手列间接 peer 漂移。
+
+离线 fixture 共六组：`github.js`、`guard.js`、`cli.js`、`ds-router.js`、
+`installer.js`、`index.js`。前四组只用 node: 内置模块或 `js-yaml` + `semver`，
+后两组还需 lock 中的最小宿主模块；依赖下载发生在测试前，fixture 运行期间不联网、
+不调用真实 pnpm/dsh，也不触碰真实 profile。
 
 > 首次配置需在 npmjs.com 的包设置里添加 Trusted Publisher(GitHub Actions +
 > 仓库名 + `release.yml`),之后所有长期 token 都可以删掉。
@@ -295,6 +300,9 @@ CI 只在该隔离目录运行 `npm ci --ignore-scripts`。
   import `js-yaml` + `semver` 两个叶子包，裸 checkout 里单点装这两个即可跑：
   `npm install --no-save --no-package-lock --ignore-scripts --legacy-peer-deps
   js-yaml@4 semver@7`，或从已安装副本跑同两条命令。改 guard 逻辑前必跑这组。
+- `src/ds-router.js` 的离线 fixture 固化 `ds` 的精确安装路由、变更命令
+  fail-closed、Windows profile 别名拒绝与官方 DSH 绝对入口解析：
+  `node src/ds-router.js --self-test`。它只 import node: 内置模块。
 - `src/index.js` 的离线 fixture 固化 profile fingerprint、构建脚本审批 token
   与 job/session 隔离：`node src/index.js --self-test`。它会静态 import
   `installer.js` 及宿主的 `dsh-tools` / `schemastery`，所以由发布 CI 在隔离目录
