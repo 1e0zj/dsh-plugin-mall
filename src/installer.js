@@ -16,7 +16,7 @@ import { createHash } from "node:crypto";
 import { dump, load } from "js-yaml";
 import { DEFAULT_PROFILE_BUNDLES, PROFILE_TEMPLATES, initProfile, resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
 import { describeBuildScripts, npmNameOf } from "./github.js";
-import { commitPendingSnapshot, createProfileSnapshot, markPendingSnapshot, pnpmGuardEnv, pnpmSpawnPlan, rollbackPendingSnapshot } from "./guard.js";
+import { commitPendingSnapshot, createProfileSnapshot, markPendingSnapshot, pnpmGuardEnv, pnpmSpawnPlan, readValidatedPendingSnapshot, rollbackPendingSnapshot } from "./guard.js";
 
 // ── spec normalization ──────────────────────────────────────────────────────
 
@@ -1444,17 +1444,38 @@ function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, pref
   // first live pnpm add runs. These are the files that decide what pnpm
   // installs and what dsh loads; the marker is what lets startup/CLI recovery
   // roll the profile back if the plugin proves unloadable.
-  let snapshot;
+  //
+  // An existing marker means one of two things. A needsApproval pause from a
+  // previous attempt of THIS SAME install resumes: its snapshot keeps the
+  // rollback target at "before this install first began", and re-snapshotting
+  // now would capture the paused half-installed state as the rollback target.
+  // Anything else (different spec, remove transaction, corrupt marker) is
+  // refused — the recovery path owns it.
+  let existingMarker;
   try {
-    snapshot = createProfileSnapshot(profileDir, { spec });
+    existingMarker = readValidatedPendingSnapshot(profileDir);
   } catch (error) {
-    return failedNow(`cannot snapshot profile before installing ${spec}: ${error.message} — refusing to touch the profile`);
+    return failedNow(`profile has an unreadable pending marker — refusing to install ${spec} (${error.message}); run \`dsh-plugin-guard guard recover\` first`);
   }
-  try {
-    markPendingSnapshot(snapshot, { spec, preflight });
-  } catch (error) {
-    rmSync(snapshot.dir, { recursive: true, force: true });
-    return failedNow(`cannot register the install pending marker for ${spec}: ${error.message} — refusing to touch the profile`);
+  if (existingMarker !== undefined) {
+    const previous = existingMarker.metadata?.spec ?? existingMarker.metadata?.packageName ?? "unknown";
+    if (existingMarker.operation !== "install" || existingMarker.metadata?.spec !== spec) {
+      return failedNow(`profile has a pending ${existingMarker.operation} transaction for ${JSON.stringify(previous)} — refusing to install ${spec}; restart dsh (startup recovery) or run \`dsh-plugin-guard guard recover\` first`);
+    }
+    push(`[dsh-plugin-mall] resuming the paused install transaction for ${spec} — its original snapshot stays the rollback target\n`);
+  } else {
+    let snapshot;
+    try {
+      snapshot = createProfileSnapshot(profileDir, { spec });
+    } catch (error) {
+      return failedNow(`cannot snapshot profile before installing ${spec}: ${error.message} — refusing to touch the profile`);
+    }
+    try {
+      markPendingSnapshot(snapshot, { spec, preflight });
+    } catch (error) {
+      rmSync(snapshot.dir, { recursive: true, force: true });
+      return failedNow(`cannot register the install pending marker for ${spec}: ${error.message} — refusing to touch the profile`);
+    }
   }
 
   // Neutralize existing allowBuilds before every first pnpm add so strict-dep-builds
@@ -1687,6 +1708,19 @@ function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, pref
       }
       if (result.status === "completed") {
         // Keep the marker as-is
+      } else if (Array.isArray(result.needsApproval) && result.needsApproval.length > 0) {
+        // needsApproval is a PAUSE awaiting the user's decision, not a terminal
+        // failure — do not roll back. Rolling back would tear out the candidate
+        // pnpm just installed and rewrite the manifest to the old version, so
+        // the retry's profile fingerprint and preflight report drift with the
+        // changed on-disk state and the approval token's digest check can never
+        // pass (real incident: dsh-better-sidebar 0.12.3 → 0.13.0 update died
+        // exactly here, "invalid approval token: preflight report changed").
+        // The retry's rebuild branch also needs this tree in place. Leave the
+        // on-disk state and the marker for the token retry; an abandoned pause
+        // is settled by startup recovery / `guard recover`, whose rollback
+        // target is still the pre-first-attempt snapshot.
+        push("\n[dsh-plugin-mall] install paused for build-script approval — the candidate stays installed with its scripts blocked; approve in the UI to finish, or restart dsh / run `dsh-plugin-guard guard recover` to roll back\n");
       } else {
         try {
           rollbackPendingSnapshot(profileDir);
@@ -2093,7 +2127,9 @@ async function runTransactionFixtures() {
   }
 
   // 1a. exit 0 + "Ignored build scripts" 且未批准：必须停在批准闸（failed +
-  // needsApproval），携带 proof，绝不 finalize，回滚收掉 marker，且只 spawn 一次。
+  // needsApproval），携带 proof，绝不 finalize，且是暂停不是失败——现场与
+  // marker 原样保留给带 token 的重试（回滚会让重试的 approval token 必死，
+  // 见收尾处的真实事故注释），只 spawn 一次。
   {
     const { profileDir, cleanup } = makeTempProfile("ignored-gate");
     try {
@@ -2118,8 +2154,10 @@ async function runTransactionFixtures() {
         }],
       });
       const outcome = await producer.done;
+      const output = producer.readOutput();
+      const markerBefore = pendingMarkerPath(profileDir);
       check(
-        "退出码 0 + Ignored build scripts（未批准）→ 停在批准闸，返回 proof，不 finalize",
+        "退出码 0 + Ignored build scripts（未批准）→ 停在批准闸，返回 proof，不 finalize，暂停保留 marker",
         outcome.status === "failed"
           && Array.isArray(outcome.needsApproval)
           && outcome.needsApproval.some((entry) => entry.name === "node-pty")
@@ -2133,9 +2171,54 @@ async function runTransactionFixtures() {
             && entry.contentHash !== "0".repeat(64)
             && entry.weeklyDownloads === 123)
           && calls.length === 1
-          && !existsSync(pendingMarkerPath(profileDir)),
-        `status=${outcome.status} calls=${calls.length} marker=${existsSync(pendingMarkerPath(profileDir))}`,
+          && existsSync(markerBefore)
+          && /paused for build-script approval/.test(output),
+        `status=${outcome.status} calls=${calls.length} marker=${existsSync(markerBefore)}`,
       );
+
+      // 1a-bis. 同 spec 重试接管暂停的 marker：不再新建快照（回滚目标仍是
+      // 第一次安装前的现场），继续 spawn pnpm；异 spec 则拒绝且不 spawn。
+      {
+        const snapshotRootDir = join(dirname(dirname(profileDir)), "guard", "snapshots");
+        const snapshotsBefore = readdirSync(snapshotRootDir, { withFileTypes: true }).filter((e) => e.isDirectory()).length;
+        const retry = scriptedSpawn([{ code: 0, out: "Ignored build scripts: node-pty@1.0.0\nDone\n" }]);
+        const retryProducer = runInstall({
+          profile: "p",
+          spec: "some-plugin",
+          preflight: preflightStub("some-plugin"),
+          _profileDir: profileDir,
+          _spawn: retry.spawnFn,
+          _describe: async () => [],
+        });
+        const retryOutcome = await retryProducer.done;
+        const retryOutput = retryProducer.readOutput();
+        const snapshotsAfter = readdirSync(snapshotRootDir, { withFileTypes: true }).filter((e) => e.isDirectory()).length;
+        check(
+          "同 spec 重试接管暂停的 marker → 复用原快照，继续安装而非拒绝",
+          retryOutcome.status === "failed"
+            && Array.isArray(retryOutcome.needsApproval)
+            && retry.calls.length === 1
+            && /resuming the paused install transaction/.test(retryOutput)
+            && snapshotsAfter === snapshotsBefore,
+          `status=${retryOutcome.status} calls=${retry.calls.length} snapshots=${snapshotsBefore}->${snapshotsAfter}`,
+        );
+        const other = scriptedSpawn([{ code: 0, out: "Done\n" }]);
+        const otherOutcome = await runInstall({
+          profile: "p",
+          spec: "another-plugin",
+          preflight: preflightStub("another-plugin"),
+          _profileDir: profileDir,
+          _spawn: other.spawnFn,
+          _describe: async () => [],
+        }).done;
+        check(
+          "异 spec 遇暂停 marker → 拒绝且不 spawn",
+          otherOutcome.status === "failed"
+            && /pending install transaction/.test(otherOutcome.detail ?? "")
+            && other.calls.length === 0,
+          `status=${otherOutcome.status} calls=${other.calls.length}`,
+        );
+      }
       const call = calls[0] ?? { args: [], options: {} };
       check(
         "实装 argv/env：strict-dep-builds + peer 关闭 + cwd/shell 正确",
@@ -2498,7 +2581,7 @@ async function runTransactionFixtures() {
       check(
         "损坏/既有 pending marker → install 不 spawn、不覆盖证据、不遗留新 snapshot",
         outcome.status === "failed"
-          && /already has a pending install marker/.test(outcome.detail ?? "")
+          && /unreadable pending marker/.test(outcome.detail ?? "")
           && calls.length === 0
           && readFileSync(marker, "utf8") === corruptBytes
           && leftoverSnapshots.length === 0,

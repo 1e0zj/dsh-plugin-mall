@@ -880,7 +880,7 @@ function sanitizeSnapshot(marker, home) {
 }
 
 /** Read and validate a profile's pending marker; undefined when none exists. */
-function readValidatedPendingSnapshot(profileDir) {
+export function readValidatedPendingSnapshot(profileDir) {
   const resolved = resolve(profileDir);
   const filePath = pendingPath(resolved);
   if (!existsSync(filePath)) return undefined;
