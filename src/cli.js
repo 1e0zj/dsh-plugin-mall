@@ -40,13 +40,17 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  clearPendingApprovalPause,
   commitPendingSnapshot,
   createProfileSnapshot,
   listPendingSnapshots,
+  markPendingApprovalPause,
   markPendingSnapshot,
+  pendingApprovalPaused,
   pnpmGuardEnv,
   preflightInstall,
   readPendingSnapshot,
+  readValidatedPendingSnapshot,
   recoverAll,
   recoverProfile,
   resolveDshHome,
@@ -693,9 +697,25 @@ async function runPlain(command, args) {
  * Commit the pending snapshot once startup probation passes. A commit failure
  * is a warning, not a launch failure — the process is already running and
  * healthy, and the marker simply stays pending for the next launch.
+ *
+ * An approval-paused marker must never commit: the new version sits there with
+ * its build scripts never approved, so staying alive only proves the JS loads.
+ * Roll it back to the pre-install snapshot instead (a rollback failure keeps
+ * the marker for the next attempt, same as recoverProfile).
  */
 function commitLaunchSnapshot(profileDir) {
   try {
+    let pending;
+    try {
+      pending = readValidatedPendingSnapshot(profileDir);
+    } catch {
+      pending = undefined; // unreadable marker: leave it to guard recover
+    }
+    if (pending !== undefined && pendingApprovalPaused(pending) !== undefined) {
+      rollbackPendingSnapshot(profileDir);
+      console.log(`[guard] startup probation passed, but the install was abandoned at the approval gate — profile rolled back for ${profileDir}`);
+      return;
+    }
     commitPendingSnapshot(profileDir);
     console.log(`[guard] startup probation passed — pending snapshot committed for ${profileDir}`);
   } catch (error) {
@@ -1155,6 +1175,31 @@ async function selfTest() {
     writeFileSync(join(profileDir, "node_modules", "good", "cordis.patch.yml"), "- insert:\n    - id: good\n      name: good\n");
     const validated = validateInstalledProfile(profileDir);
     if (validated.ok !== true) throw new Error("healthy profile should validate clean (cli)");
+
+    // commitLaunchSnapshot: a marker paused at the approval gate must roll back
+    // instead of committing even after a healthy probation — the candidate sits
+    // there with its build scripts never approved, and committing would delete
+    // the only rollback snapshot. Layout keeps the candidate a NEW dependency
+    // so the rollback prunes node_modules without spawning pnpm.
+    {
+      const pauseProfile = join(root, "pause-home", "profiles", "web");
+      mkdirSync(join(pauseProfile, "node_modules"), { recursive: true });
+      writeFileSync(join(pauseProfile, "package.json"), JSON.stringify({ dependencies: {} }));
+      writeFileSync(join(pauseProfile, "cordis.patch.yml"), "[]\n");
+      const snap = createProfileSnapshot(pauseProfile, { fixture: true });
+      markPendingSnapshot(snap, { spec: "good@2.0.0", preflight: { candidate: { name: "good", version: "2.0.0", kind: "bundle" } } });
+      // 暂停现场：候选已装、声明已写，静态校验过得去——正是不许提交的原因。
+      writeFileSync(join(pauseProfile, "package.json"), JSON.stringify({ dependencies: { good: "^2.0.0" } }));
+      mkdirSync(join(pauseProfile, "node_modules", "good"), { recursive: true });
+      writeFileSync(join(pauseProfile, "node_modules", "good", "package.json"), JSON.stringify({ name: "good", version: "2.0.0" }));
+      markPendingApprovalPause(pauseProfile);
+      commitLaunchSnapshot(pauseProfile);
+      if (readPendingSnapshot(pauseProfile) !== undefined) throw new Error("commitLaunchSnapshot must consume (roll back) an approval-paused marker");
+      if (existsSync(snap.dir)) throw new Error("the paused rollback must delete the snapshot dir");
+      if (JSON.parse(readFileSync(join(pauseProfile, "package.json"), "utf8")).dependencies?.good !== undefined) {
+        throw new Error("the paused rollback must restore the pre-install manifest");
+      }
+    }
 
     // guarded remove: exact official argv + shell:false runner seam, snapshot
     // before mutation, immediate commit after a statically safe removal.

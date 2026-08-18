@@ -16,7 +16,7 @@ import { createHash } from "node:crypto";
 import { dump, load } from "js-yaml";
 import { DEFAULT_PROFILE_BUNDLES, PROFILE_TEMPLATES, initProfile, resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
 import { describeBuildScripts, npmNameOf } from "./github.js";
-import { commitPendingSnapshot, createProfileSnapshot, markPendingSnapshot, pnpmGuardEnv, pnpmSpawnPlan, readValidatedPendingSnapshot, rollbackPendingSnapshot } from "./guard.js";
+import { clearPendingApprovalPause, commitPendingSnapshot, createProfileSnapshot, markPendingApprovalPause, markPendingSnapshot, pnpmGuardEnv, pnpmSpawnPlan, readValidatedPendingSnapshot, rollbackPendingSnapshot } from "./guard.js";
 
 // ── spec normalization ──────────────────────────────────────────────────────
 
@@ -1463,6 +1463,12 @@ function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, pref
       return failedNow(`profile has a pending ${existingMarker.operation} transaction for ${JSON.stringify(previous)} — refusing to install ${spec}; restart dsh (startup recovery) or run \`dsh-plugin-guard guard recover\` first`);
     }
     push(`[dsh-plugin-mall] resuming the paused install transaction for ${spec} — its original snapshot stays the rollback target\n`);
+    // 事务复活：清掉暂停标记，否则重试成功后的启动提交会被它拦下错误回滚。
+    try {
+      clearPendingApprovalPause(profileDir);
+    } catch (pauseError) {
+      push(`[dsh-plugin-mall] WARNING: could not clear the approval-pause mark: ${pauseError.message}\n`);
+    }
   } else {
     let snapshot;
     try {
@@ -1719,7 +1725,15 @@ function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, pref
         // The retry's rebuild branch also needs this tree in place. Leave the
         // on-disk state and the marker for the token retry; an abandoned pause
         // is settled by startup recovery / `guard recover`, whose rollback
-        // target is still the pre-first-attempt snapshot.
+        // target is still the pre-first-attempt snapshot. The pause is also
+        // marked ON the marker: without the mark a restart that passes the
+        // static validation would commit the never-approved version and drop
+        // the snapshot (both recovery commit points check it).
+        try {
+          markPendingApprovalPause(profileDir);
+        } catch (pauseError) {
+          push(`[dsh-plugin-mall] WARNING: could not mark the pause on the pending marker: ${pauseError.message}\n`);
+        }
         push("\n[dsh-plugin-mall] install paused for build-script approval — the candidate stays installed with its scripts blocked; approve in the UI to finish, or restart dsh / run `dsh-plugin-guard guard recover` to roll back\n");
       } else {
         try {
@@ -2175,13 +2189,24 @@ async function runTransactionFixtures() {
           && /paused for build-script approval/.test(output),
         `status=${outcome.status} calls=${calls.length} marker=${existsSync(markerBefore)}`,
       );
+      check(
+        "暂停必须落盘到 marker（metadata.paused）——重启后的恢复靠它区分「装完待验证」与「停在批准闸被放弃」",
+        (() => {
+          try {
+            const marker = JSON.parse(readFileSync(markerBefore, "utf8"));
+            return marker?.metadata?.paused?.reason === "paused for build-script approval";
+          } catch { return false; }
+        })(),
+      );
 
       // 1a-bis. 同 spec 重试接管暂停的 marker：不再新建快照（回滚目标仍是
-      // 第一次安装前的现场），继续 spawn pnpm；异 spec 则拒绝且不 spawn。
+      // 第一次安装前的现场），继续 spawn pnpm；这次给批准后的成功路径——
+      // completed 后 marker 保留给启动提交，且暂停标记必须已被接管清掉
+      // （否则启动提交会被它拦下错误回滚）。异 spec 则拒绝且不 spawn。
       {
         const snapshotRootDir = join(dirname(dirname(profileDir)), "guard", "snapshots");
         const snapshotsBefore = readdirSync(snapshotRootDir, { withFileTypes: true }).filter((e) => e.isDirectory()).length;
-        const retry = scriptedSpawn([{ code: 0, out: "Ignored build scripts: node-pty@1.0.0\nDone\n" }]);
+        const retry = scriptedSpawn([{ code: 0, out: "Done in 1s\n" }]);
         const retryProducer = runInstall({
           profile: "p",
           spec: "some-plugin",
@@ -2194,12 +2219,18 @@ async function runTransactionFixtures() {
         const retryOutput = retryProducer.readOutput();
         const snapshotsAfter = readdirSync(snapshotRootDir, { withFileTypes: true }).filter((e) => e.isDirectory()).length;
         check(
-          "同 spec 重试接管暂停的 marker → 复用原快照，继续安装而非拒绝",
-          retryOutcome.status === "failed"
-            && Array.isArray(retryOutcome.needsApproval)
+          "同 spec 重试接管暂停的 marker → 复用原快照、继续安装并清掉暂停标记",
+          retryOutcome.status === "completed"
             && retry.calls.length === 1
             && /resuming the paused install transaction/.test(retryOutput)
-            && snapshotsAfter === snapshotsBefore,
+            && snapshotsAfter === snapshotsBefore
+            && existsSync(markerBefore)
+            && (() => {
+              try {
+                const marker = JSON.parse(readFileSync(markerBefore, "utf8"));
+                return marker?.metadata?.paused === undefined;
+              } catch { return false; }
+            })(),
           `status=${retryOutcome.status} calls=${retry.calls.length} snapshots=${snapshotsBefore}->${snapshotsAfter}`,
         );
         const other = scriptedSpawn([{ code: 0, out: "Done\n" }]);

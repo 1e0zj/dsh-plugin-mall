@@ -1426,11 +1426,95 @@ export function validateRemoveCompletion(profileDir, candidateName) {
  * @param profileDir - the profile directory (may come straight from the marker).
  * @returns {{action: "none"|"committed"|"rolled-back", issues?, removed?}}
  */
+// ── approval-pause mark ──────────────────────────────────────────────────────
+//
+// A needsApproval pause otherwise lives only in console output: the marker
+// carries no trace of it, so a restart that passes the STATIC validation would
+// commit the new version with its build scripts never approved — a natively
+// built plugin is then left installed-but-broken and the rollback snapshot is
+// deleted. Both recovery commit points (recoverProfile here, cli.js's
+// commitLaunchSnapshot) must check this mark and roll back instead.
+//
+// Deliberately NOT mirrored into snapshot.json (it is written before the
+// transaction begins and cannot know about a later pause) and NOT a
+// SNAPSHOT_VERSION bump (a bump would fail-close every marker already written
+// by earlier versions, pushing users from auto-recoverable to manual).
+// sanitizeSnapshot ignores unknown metadata fields, so a missing `paused`
+// simply reads as "not paused" and old markers keep their behavior. Tampering
+// with the mark is fail-safe: forging it forces a rollback (refuses the new
+// plugin); deleting it restores the pre-mark behavior.
+
+/** The pause record on a validated pending marker, or undefined. */
+export function pendingApprovalPaused(pending) {
+  const paused = pending?.metadata?.paused;
+  return paused !== null && typeof paused === "object" ? paused : undefined;
+}
+
+/**
+ * Mark the profile's existing pending marker as paused at the approval gate.
+ * @returns true when a marker was marked; false when there is nothing to mark
+ *   (no marker) or it fails validation (fail closed — never create or heal one).
+ */
+export function markPendingApprovalPause(profileDir, reason = "paused for build-script approval") {
+  let pending;
+  try {
+    pending = readValidatedPendingSnapshot(profileDir);
+  } catch {
+    return false;
+  }
+  if (pending === undefined) return false;
+  const markerPath = pendingPath(profileDir);
+  const marker = readJson(markerPath);
+  if (marker === null || typeof marker !== "object") return false;
+  const metadata = marker.metadata ?? {};
+  metadata.paused = { reason, at: Date.now() };
+  marker.metadata = metadata;
+  writeFileSync(markerPath, JSON.stringify(marker, undefined, 2) + "\n");
+  return true;
+}
+
+/**
+ * Clear the approval-pause mark: a token retry resumed the transaction, so its
+ * eventual completion must commit normally instead of being rolled back.
+ * @returns true when a mark was removed, false when there was none to remove.
+ */
+export function clearPendingApprovalPause(profileDir) {
+  let pending;
+  try {
+    pending = readValidatedPendingSnapshot(profileDir);
+  } catch {
+    return false;
+  }
+  if (pending === undefined || pendingApprovalPaused(pending) === undefined) return false;
+  const markerPath = pendingPath(profileDir);
+  const marker = readJson(markerPath);
+  if (marker === null || typeof marker !== "object") return false;
+  if (marker.metadata !== null && typeof marker.metadata === "object") {
+    delete marker.metadata.paused;
+    writeFileSync(markerPath, JSON.stringify(marker, undefined, 2) + "\n");
+    return true;
+  }
+  return false;
+}
+
 export function recoverProfile(profileDir) {
   const pending = readValidatedPendingSnapshot(profileDir);
   if (pending === undefined) return { action: "none" };
-  const validation = validateInstalledProfile(profileDir);
   const isRemove = pending.operation === "remove";
+  // 批准闸暂停后被放弃：静态校验过得去也不许提交——那会把「构建脚本从未
+  // 批准」的新版本以已提交状态留下（原生构建插件装着但坏），且快照被删、
+  // 回滚目标消失。一律回滚到第一次安装前。
+  const pause = pendingApprovalPaused(pending);
+  if (!isRemove && pause !== undefined) {
+    rollbackPendingSnapshot(profileDir);
+    return {
+      action: "rolled-back",
+      issues: [issue("warn", "approval-paused-abandoned", "批准闸暂停后被放弃，已回滚",
+        `安装停在构建脚本批准处未被批准（${pause.reason}），profile 已回滚到安装前状态`)],
+      removed: addedDependencyNames(pending),
+    };
+  }
+  const validation = validateInstalledProfile(profileDir);
   const candidateName = pending.preflight?.candidate?.name ?? pending.candidate?.name;
   const removeValidation = isRemove
     ? validateRemoveCompletion(pending.profileDir, candidateName)
@@ -1680,6 +1764,55 @@ async function selfTest() {
       if (rec.action !== "committed") throw new Error(`recoverProfile should commit a healthy install, got ${rec.action}`);
       if (readPendingSnapshot(p) !== undefined) throw new Error("recoverProfile commit should clear the marker");
       if (existsSync(snap.dir)) throw new Error("recoverProfile commit should delete the snapshot dir");
+    }
+
+    // Approval-pause mark, part 1: a paused marker must NEVER commit on
+    // recovery — not even when the static validation would pass (the version
+    // sits there with its build scripts never approved; committing would drop
+    // the only rollback snapshot). Recovery rolls back to the pre-install
+    // state. Layout: the candidate is a NEW dependency (snapshot has none), so
+    // the rollback only prunes node_modules and never spawns pnpm.
+    {
+      const p = join(root, "profiles", "approval-pause");
+      mkdirSync(join(p, "node_modules", "good"), { recursive: true });
+      writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: {} }));
+      writeFileSync(join(p, "cordis.patch.yml"), "[]\n");
+      if (markPendingApprovalPause(p) !== false) throw new Error("markPendingApprovalPause without a marker must return false, not create one");
+      const snap = createProfileSnapshot(p, { fixture: true });
+      markPendingSnapshot(snap, { spec: "good@2.0.0", preflight: { candidate: { name: "good", version: "2.0.0", kind: "bundle" } } });
+      // 暂停现场：pnpm 已把候选装上、声明也写了——静态校验完全过得去，
+      // 这正是危险所在（提交 = 脚本从未批准的版本以已提交状态留下）。
+      writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: { good: "^2.0.0" } }));
+      writeFileSync(join(p, "node_modules", "good", "package.json"), JSON.stringify({ name: "good", version: "2.0.0" }));
+      if (markPendingApprovalPause(p) !== true) throw new Error("markPendingApprovalPause must mark an existing marker");
+      const pausedMarker = readJson(pendingPath(p));
+      if (pausedMarker?.metadata?.paused?.reason !== "paused for build-script approval") throw new Error("the pause mark must persist on the marker file");
+      const recPaused = recoverProfile(p);
+      if (recPaused.action !== "rolled-back") throw new Error(`a paused marker must roll back even when validation would pass, got ${recPaused.action}`);
+      if (!recPaused.issues.some((entry) => entry.code === "approval-paused-abandoned")) throw new Error("the rollback must carry the approval-paused-abandoned issue");
+      if (readJson(join(p, "package.json")).dependencies?.good !== undefined) throw new Error("rollback must restore the pre-install manifest (no candidate)");
+      if (existsSync(join(p, "node_modules", "good"))) throw new Error("rollback must prune the never-approved candidate");
+      if (readPendingSnapshot(p) !== undefined) throw new Error("the rolled-back pause must consume its marker");
+    }
+
+    // Approval-pause mark, part 2: a cleared mark (token retry resumed and
+    // finished the transaction) commits normally — the mark must not outlive
+    // the transaction it belonged to.
+    {
+      const p = join(root, "profiles", "approval-pause-cleared");
+      mkdirSync(join(p, "node_modules", "good"), { recursive: true });
+      writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: { good: "1.0.0" }, dsh: { profile: { bundles: ["good"] } } }));
+      writeFileSync(join(p, "cordis.patch.yml"), "[]\n");
+      writeFileSync(join(p, "node_modules", "good", "package.json"), JSON.stringify({ name: "good", version: "1.0.0", dsh: { bundle: { patch: "./cordis.patch.yml" } } }));
+      writeFileSync(join(p, "node_modules", "good", "cordis.patch.yml"), "- insert:\n    - id: good\n      name: good\n");
+      const snap = createProfileSnapshot(p, { fixture: true });
+      markPendingSnapshot(snap, { spec: "good", preflight: { candidate: { name: "good", version: "1.0.0", kind: "bundle" } } });
+      markPendingApprovalPause(p);
+      if (clearPendingApprovalPause(p) !== true) throw new Error("clearPendingApprovalPause must remove an existing mark");
+      const rec = recoverProfile(p);
+      if (rec.action !== "committed") throw new Error(`after the mark is cleared a healthy install must commit, got ${rec.action}`);
+      if (readPendingSnapshot(p) !== undefined) throw new Error("the commit must clear the marker");
+      if (clearPendingApprovalPause(p) !== false) throw new Error("clearPendingApprovalPause without a mark must return false");
     }
 
     // Remove rollback, no-op failure: the official command failed before
