@@ -46,8 +46,12 @@ https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/HEAD/docs/<path>.
 - **对 profile 配置的任何写入都走 `writeChecked` 系列**（写后回读校验、
   解析不过就还原）。装别人的插件失败，绝不能留下 dsh 或 pnpm 加载不了的 profile。
 - **`disabled` 只写字面量布尔**。用户手写的 `disabled: !!js ...` 要**拒绝接管**
-  并说明原因——`!!js` 在元数据位置不求值，读到的是 truthy 对象
-  （见 postmortem/0002，官方为此永久禁用过文件系统工具）。
+  并说明原因：那是用户的条件逻辑（如「只在 Windows 上关」），覆盖它等于把
+  条件永久压成固定值，而且无声无息。参见 `cynch18/plugin-switch` 的报错文案。
+- **读 postmortem 要核对当前源码**。`postmortem/0002` 说 `disabled` 里的 `!!js`
+  不求值——那是当时的行为，现在 `disabledOf()` 有专门的求值分支，
+  官方配置自己就在用（bash-sandbox / pwsh-sandbox 按平台开关）。
+  **事故复盘讲历史，不讲现状。**
 - **`cordis.yml` 条目必须带 `id`**，否则每次读取生成新 id，
   「即使文本未变也会被视为先删后加并重新挂载」。
 - 用户的选择表达在 `cordis.patch.yml`（用户 patch 层），

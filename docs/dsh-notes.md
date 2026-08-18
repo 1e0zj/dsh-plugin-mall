@@ -30,6 +30,17 @@
   条件式组合改用显式 overlay 文件。
 - 教训：**语法接受 ≠ 在该处被求值**。
 
+> ⚠️ **这篇描述的是当时的行为，已不适用于当前版本。** 核对已装 loader 源码：
+> `disabledOf(options)` 有专门分支 `isJsExpr(options.disabled) ? Boolean(this.evaluate(...))`，
+> **`disabled` 里的 `!!js` 是求值的**；web profile 里 bash-sandbox / pwsh-sandbox
+> 两条正是靠 `disabled: !!js process.platform === 'win32'` 正常工作的。
+> 那个分支很可能就是这次事故的修复产物。
+>
+> 教训升级：**事故复盘讲的是历史，不是现状——必须核对当前源码。**
+>
+> 对我们的实现结论不变（只写字面量、遇到 `!!js` 拒绝接管），但理由变了：
+> 那是用户写的条件逻辑，覆盖它等于把人家的条件永久压成固定值，而且无声无息。
+
 ### `architecture.zh.md`
 
 - 「运行中的 dsh 是一棵插件树，**由启动时按序叠加的各层组成**」——
