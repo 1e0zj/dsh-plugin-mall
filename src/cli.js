@@ -54,6 +54,25 @@ import {
   validateInstalledProfile,
   validateRemoveCompletion,
 } from "./guard.js";
+// github.js imports node builtins only — the host-independence of this CLI is
+// preserved (it must keep working when the dsh host itself is broken).
+import { npmPackageInfo } from "./github.js";
+
+/**
+ * Pin a bare package name to name@latest: pnpm's minimumReleaseAge policy
+ * otherwise silently falls back to an older "installable" release, so
+ * `add somepkg` can install yesterday's version. Anything already carrying a
+ * version/tag, or a github:/file:/link: spec, passes through untouched; a
+ * registry failure keeps the bare spec rather than blocking the install.
+ */
+export async function pinSpecToLatest(spec, npmInfo = npmPackageInfo) {
+  if (!/^(@[^@/\s]+\/)?[^@/\s]+$/.test(spec)) return spec;
+  try {
+    const info = await npmInfo(spec);
+    if (info?.latest) return `${spec}@${info.latest}`;
+  } catch { /* offline or registry failure — keep the bare spec */ }
+  return spec;
+}
 
 // ── small helpers ────────────────────────────────────────────────────────────
 
@@ -399,6 +418,11 @@ async function cmdAdd({ spec, profile, home, acceptWarnings }) {
     throw new Error(`profile "${profile}" already has a pending install awaiting recovery — run \`node src/cli.js guard recover\` first`);
   }
   assertSafeSpec(spec);
+  const pinned = await pinSpecToLatest(spec);
+  if (pinned !== spec) {
+    console.log(`[guard] resolved ${spec} → ${pinned} (pinning latest so pnpm's minimumReleaseAge cannot pick an older release)`);
+    spec = pinned;
+  }
   // Resolve the official CLI entry up front (fail closed when it cannot be
   // verified): the install below runs `node <entry> plugin --profile <name>
   // add <spec>` with shell:false — no dsh.cmd/ds.cmd shim, no cmd.exe, and no
@@ -1569,6 +1593,20 @@ async function selfTest() {
         restore("PATH", savedPath);
         restore("PATHEXT", savedPathExt);
       }
+    }
+
+    // pinSpecToLatest: bare names get name@latest (minimumReleaseAge cannot
+    // silently downgrade); pinned/scoped-pinned/git/file specs pass through;
+    // registry failure keeps the bare spec.
+    {
+      const fakeInfo = async (name) => name === "somepkg" || name === "@scope/pkg" ? { latest: "9.9.9" } : null;
+      if (await pinSpecToLatest("somepkg", fakeInfo) !== "somepkg@9.9.9") throw new Error("bare name must be pinned to latest");
+      if (await pinSpecToLatest("@scope/pkg", fakeInfo) !== "@scope/pkg@9.9.9") throw new Error("bare scoped name must be pinned to latest");
+      if (await pinSpecToLatest("somepkg@1.2.3", fakeInfo) !== "somepkg@1.2.3") throw new Error("already-pinned spec must pass through");
+      if (await pinSpecToLatest("github:owner/repo", fakeInfo) !== "github:owner/repo") throw new Error("github spec must pass through");
+      if (await pinSpecToLatest("unknown-pkg", fakeInfo) !== "unknown-pkg") throw new Error("unknown package must keep the bare spec");
+      const offline = async () => { throw new Error("network down"); };
+      if (await pinSpecToLatest("somepkg", offline) !== "somepkg") throw new Error("registry failure must keep the bare spec");
     }
 
     console.log("PASS cli argument/validate/recover fixtures");

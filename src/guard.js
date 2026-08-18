@@ -86,8 +86,41 @@ function packageJsonPathOf(packageName, anchorDir) {
   return undefined;
 }
 
+/**
+ * Upward (Node-semantics) variant used ONLY for @deepseek-ai/* host peers:
+ * the host stack lives in the shared profiles/node_modules, an ancestor of
+ * the profile's own node_modules, so a strict profile-only lookup can never
+ * resolve it — which used to emit a bogus "peer-unresolved" warning for every
+ * well-declared plugin. Direct profile dependencies deliberately stay on the
+ * strict path above (ancestor-only resolution is the fingerprint of a crashed
+ * install, see the ancestor fixture in selfTest).
+ */
+function hostPackageJsonPathOf(packageName, anchorDir) {
+  const direct = packageJsonPathOf(packageName, anchorDir);
+  if (direct !== undefined) return direct;
+  try {
+    return createRequire(join(anchorDir, "noop.js")).resolve(`${packageName}/package.json`);
+  } catch {
+    return undefined;
+  }
+}
+
 function packageInfo(packageName, anchorDir) {
   const manifestPath = packageJsonPathOf(packageName, anchorDir);
+  if (manifestPath === undefined) return undefined;
+  try {
+    const manifest = readJson(manifestPath);
+    if (manifest === null || typeof manifest !== "object") return undefined;
+    if (manifest.name !== packageName) return undefined;
+    return { manifestPath, dir: dirname(manifestPath), manifest };
+  } catch {
+    return undefined;
+  }
+}
+
+/** packageInfo over hostPackageJsonPathOf — only for @deepseek-ai/* peers. */
+function hostPackageInfo(packageName, anchorDir) {
+  const manifestPath = hostPackageJsonPathOf(packageName, anchorDir);
   if (manifestPath === undefined) return undefined;
   try {
     const manifest = readJson(manifestPath);
@@ -265,7 +298,7 @@ function compatibilityIssues(candidate, current, profileDir) {
 
   for (const [peerName, range] of Object.entries(candidate.manifest.peerDependencies ?? {})) {
     if (!HOST_PACKAGE_RE.test(peerName) || range === "*") continue;
-    const host = packageInfo(peerName, profileDir);
+    const host = hostPackageInfo(peerName, profileDir);
     if (host === undefined) {
       issues.push(issue("warn", "peer-unresolved", "无法验证宿主依赖", `${candidateName} 需要 ${peerName}@${range}，但预检无法解析宿主版本。`, { package: candidateName, conflictsWith: [peerName] }));
       continue;
@@ -549,6 +582,32 @@ export function inspectRemoteCandidate({ profileDir, manifest, patchText, spec }
   };
 }
 
+/** Locate a binary on PATH by explicit extension (no shell, no PATHEXT guessing). */
+function findOnPath(binary, extensions) {
+  const separator = process.platform === "win32" ? ";" : ":";
+  for (const dir of String(process.env.PATH ?? "").split(separator)) {
+    if (dir.length === 0) continue;
+    for (const ext of extensions) {
+      const candidate = join(dir, `${binary}${ext}`);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * pnpm spawn plan, mirroring installer.js pnpmSpawnPlan: a real .exe spawns
+ * without a shell; only the .cmd shim forces a cmd wrapper on Windows
+ * (shell:true, and Node's DEP0190 warning with it).
+ */
+function pnpmSpawnPlan() {
+  if (process.platform !== "win32") return { command: "pnpm", shell: false };
+  const exe = findOnPath("pnpm", [".exe"]);
+  if (exe !== undefined) return { command: exe, shell: false };
+  const cmd = findOnPath("pnpm", [".cmd"]);
+  return { command: cmd ?? "pnpm", shell: true };
+}
+
 function spawnCapture(command, args, options, onOutput) {
   return new Promise((resolvePromise) => {
     let child;
@@ -561,7 +620,7 @@ function spawnCapture(command, args, options, onOutput) {
     try {
       child = spawn(command, args, {
         ...options,
-        shell: process.platform === "win32",
+        shell: options.shell === true,
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
       });
@@ -631,7 +690,8 @@ export async function preflightInstall({ profileDir, spec, onOutput }) {
     const profileNpmrc = join(profileDir, ".npmrc");
     if (existsSync(profileNpmrc)) copyFileSync(profileNpmrc, join(probeDir, ".npmrc"));
     onOutput?.(`[dsh-plugin-guard] probing ${spec} with install scripts disabled\n`);
-    const result = await spawnCapture("pnpm", probeAddArgs(spec), { cwd: probeDir, env: process.env }, onOutput);
+    const plan = pnpmSpawnPlan();
+    const result = await spawnCapture(plan.command, probeAddArgs(spec), { cwd: probeDir, env: process.env, shell: plan.shell }, onOutput);
     if (result.exitCode !== 0) {
       return {
         ok: false,
@@ -972,10 +1032,11 @@ function reconcileInstallArgs() {
 function runReconcileInstall(profileDir) {
   let result;
   try {
-    result = spawnSync("pnpm", reconcileInstallArgs(), {
+    const plan = pnpmSpawnPlan();
+    result = spawnSync(plan.command, reconcileInstallArgs(), {
       cwd: profileDir,
       env: pnpmGuardEnv(),
-      shell: process.platform === "win32",
+      shell: plan.shell,
       encoding: "utf8",
       timeout: 180000,
       windowsHide: true,
@@ -1363,6 +1424,35 @@ async function selfTest() {
         spec: "github:owner/remote-bad",
       });
       if (malformed.verdict !== "blocked" || !malformed.issues.some((entry) => entry.code === "patch-invalid")) throw new Error("remote malformed patch fixture failed");
+    }
+
+    // Peer version checks resolve host packages through Node's upward lookup:
+    // the host lives in the shared profiles/node_modules (the profile's own
+    // node_modules has no @deepseek-ai/*), and missing that used to emit a
+    // bogus "peer-unresolved" warning for every well-declared plugin.
+    {
+      const p = join(root, "profiles", "peerup");
+      mkdirSync(join(p, "node_modules"), { recursive: true });
+      writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: {} }));
+      writeFileSync(join(p, "cordis.patch.yml"), "[]\n");
+      const hostDir = join(root, "profiles", "node_modules", "@deepseek-ai", "fake-host-fixture");
+      mkdirSync(hostDir, { recursive: true });
+      writeFileSync(join(hostDir, "package.json"), JSON.stringify({ name: "@deepseek-ai/fake-host-fixture", version: "2.0.0" }));
+
+      const incompatible = inspectRemoteCandidate({
+        profileDir: p,
+        manifest: { name: "peer-cand", version: "1.0.0", dsh: { client: {} }, peerDependencies: { "@deepseek-ai/fake-host-fixture": "^1.0.0" } },
+        spec: "peer-cand",
+      });
+      if (incompatible.issues.some((entry) => entry.code === "peer-unresolved")) throw new Error("host in shared profiles/node_modules must resolve via upward lookup");
+      if (!incompatible.issues.some((entry) => entry.code === "peer-version")) throw new Error("incompatible host peer must block once resolved");
+
+      const compatible = inspectRemoteCandidate({
+        profileDir: p,
+        manifest: { name: "peer-cand", version: "1.0.0", dsh: { client: {} }, peerDependencies: { "@deepseek-ai/fake-host-fixture": "^2.0.0" } },
+        spec: "peer-cand",
+      });
+      if (compatible.issues.some((entry) => entry.code === "peer-unresolved" || entry.code === "peer-version")) throw new Error("compatible host peer must produce no peer issues");
     }
 
     // Snapshot → restore round-trip.
