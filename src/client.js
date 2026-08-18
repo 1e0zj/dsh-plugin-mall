@@ -65,17 +65,12 @@ window.__ModuleLoader__.load({
       ".mkt_approveName{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary);margin-right:8px;overflow-wrap:anywhere}",
       ".mkt_approveCmd{max-height:none;margin:0}",
       ".mkt_jobDone{display:flex;align-items:center;gap:8px;flex-wrap:wrap}",
-      ".mkt_modalOverlay{position:fixed;inset:0;background:rgba(0,0,0,.42);display:flex;align-items:center;justify-content:center;z-index:1200;padding:16px}",
-      ".mkt_modal{background:var(--dsw-alias-bg-primary,#fff);border:1px solid var(--dsw-alias-border-l2);border-radius:10px;padding:16px 18px;max-width:600px;width:100%;max-height:82vh;overflow:auto;display:flex;flex-direction:column;gap:12px;box-shadow:0 12px 40px rgba(0,0,0,.18)}",
-      ".mkt_modalTitle{font-size:15px;font-weight:600;color:var(--dsw-alias-label-primary);margin:0}",
-      ".mkt_modalSpec{font-size:12px;color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere}",
       ".mkt_issueList{list-style:none;display:flex;flex-direction:column;gap:8px;margin:0;padding:0}",
       ".mkt_issue{border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:8px 10px;background:var(--dsw-alias-bg-secondary,#fff)}",
       ".mkt_issueBlock{border-color:var(--dsw-alias-state-error-primary)}",
       ".mkt_issueWarn{border-color:var(--dsw-alias-state-warning-primary,var(--dsw-alias-state-business-primary))}",
       ".mkt_issueTitle{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary)}",
       ".mkt_issueDetail{font-size:12px;color:var(--dsw-alias-label-secondary);margin-top:4px;line-height:18px;overflow-wrap:anywhere}",
-      ".mkt_modalActions{display:flex;gap:8px;justify-content:flex-end;align-items:center}",
     ].join("\n");
     var tagId = "@1e0zj/dsh-plugin-mall/market-tab.css";
     if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId) + "]") === null) {
@@ -281,42 +276,43 @@ window.__ModuleLoader__.load({
       );
     }
 
-    // ── preflight risk dialog ────────────────────────────────────────────────
-    function PreflightDialog(props) {
+    // ── preflight result card ────────────────────────────────────────────────
+    // 预检通过（safe）根本不渲染这张卡片——直接开始安装，不打扰。只有
+    // warning / blocked 才出现，且用任务面板同款的内联卡片语言，不弹模态框：
+    // 市场里一切任务都在面板里流动，弹窗会打断这个节奏。
+    function PreflightCard(props) {
       var report = props.report || {};
-      var verdict = report.verdict;
-      var blocked = verdict === "blocked";
-      var warning = verdict === "warning";
-      var title = blocked ? "安装被阻止" : warning ? "安装存在风险" : "安装检查通过";
+      var blocked = report.verdict === "blocked";
+      var title = blocked ? "安装被阻止" : "安装存在风险";
       var issues = report.issues || [];
-      return h("div", { className: "mkt_modalOverlay" },
-        h("div", { className: "mkt_modal" },
-          h("p", { className: "mkt_modalTitle" }, title),
-          h("div", { className: "mkt_modalSpec" }, clip(props.spec, 80)),
-          report.summary ? h("div", { className: "mkt_desc" }, report.summary) : null,
-          issues.length > 0 ? h("ul", { className: "mkt_issueList" },
-            issues.map(function (issue) {
-              return h("li", {
-                key: (issue.code || "") + "-" + (issue.title || ""),
-                className: "mkt_issue " + (issue.severity === "block" ? "mkt_issueBlock" : "mkt_issueWarn"),
-              },
-                h("div", { className: "mkt_issueTitle" }, issue.title),
-                issue.detail ? h("div", { className: "mkt_issueDetail" }, issue.detail) : null);
-            })
-          ) : null,
-          h("div", { className: "mkt_modalActions" },
-            blocked
-              ? h("button", { className: "mkt_btn mkt_btnSm", onClick: props.onClose }, "关闭")
-              : [
-                  h("button", { key: "cancel", className: "mkt_btn mkt_btnSm", onClick: props.onClose }, "取消"),
-                  h("button", {
-                    key: "confirm",
-                    className: "mkt_btn mkt_btnPrimary mkt_btnSm",
-                    disabled: props.busy === true,
-                    onClick: props.onConfirm,
-                  }, props.busy ? "安装中…" : (warning ? "我已了解风险，继续安装" : "安装")),
-                ]
-          )
+      return h("div", { className: "mkt_card" },
+        h("div", { className: "mkt_panelRow" },
+          h("p", { className: "mkt_panelTitle" + (blocked ? " mkt_error" : "") }, title),
+          h("span", { className: "mkt_meta" }, clip(props.spec, 50))
+        ),
+        report.summary ? h("div", { className: "mkt_desc" }, report.summary) : null,
+        issues.length > 0 ? h("ul", { className: "mkt_issueList" },
+          issues.map(function (issue) {
+            return h("li", {
+              key: (issue.code || "") + "-" + (issue.title || ""),
+              className: "mkt_issue " + (issue.severity === "block" ? "mkt_issueBlock" : "mkt_issueWarn"),
+            },
+              h("div", { className: "mkt_issueTitle" }, issue.title),
+              issue.detail ? h("div", { className: "mkt_issueDetail" }, issue.detail) : null);
+          })
+        ) : null,
+        h("div", { className: "mkt_row" },
+          blocked
+            ? h("button", { className: "mkt_btn mkt_btnSm", onClick: props.onClose }, "关闭")
+            : [
+              h("button", { key: "cancel", className: "mkt_btn mkt_btnSm", onClick: props.onClose }, "取消"),
+              h("button", {
+                key: "confirm",
+                className: "mkt_btn mkt_btnPrimary mkt_btnSm",
+                disabled: props.busy === true,
+                onClick: props.onConfirm,
+              }, props.busy ? "安装中…" : "我已了解风险，继续安装"),
+            ]
         )
       );
     }
@@ -638,7 +634,13 @@ window.__ModuleLoader__.load({
         });
         setError(null);
         call("preflight", { spec: spec }).then(function (report) {
-          setPreflight({ spec: spec, report: report });
+          // 检查通过直接装，不打扰；有风险才出内联卡片等人表态；被阻止
+          // 只告知原因。任何路径都不再弹模态框。
+          if (report.verdict === "safe") {
+            doRawInstall(spec, {});
+          } else {
+            setPreflight({ spec: spec, report: report });
+          }
         }).catch(function (e) {
           setError(errorText(e));
         }).finally(function () {
@@ -648,18 +650,11 @@ window.__ModuleLoader__.load({
             return next;
           });
         });
-      }, [call]);
+      }, [call, doRawInstall]);
 
       var doInstall = useCallback(function (repo) {
         preflightAndInstall("github:" + repo);
       }, [preflightAndInstall]);
-
-      var confirmInstall = useCallback(function () {
-        var pending = preflight;
-        if (!pending) return;
-        setPreflight(null);
-        doRawInstall(pending.spec, pending.report.verdict === "warning" ? { acceptWarnings: true } : {});
-      }, [preflight, doRawInstall]);
 
       var doRestart = useCallback(function () {
         if (typeof window !== "undefined" && typeof window.confirm === "function") {
@@ -776,11 +771,15 @@ window.__ModuleLoader__.load({
           restarting: restarting,
           approving: Object.keys(installing).filter(function (s) { return installing[s]; })[0],
         }),
-        preflight ? h(PreflightDialog, {
+        preflight ? h(PreflightCard, {
           spec: preflight.spec,
           report: preflight.report,
           busy: installing[preflight.spec] === true,
-          onConfirm: confirmInstall,
+          onConfirm: function () {
+            var spec = preflight.spec;
+            setPreflight(null);
+            doRawInstall(spec, { acceptWarnings: true });
+          },
           onClose: function () {
             if (preflight && preflight.spec) delete approvalTokensRef.current[preflight.spec];
             setPreflight(null);
