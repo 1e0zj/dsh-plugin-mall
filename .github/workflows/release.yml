@@ -50,8 +50,22 @@ jobs:
       - name: 离线 fixture
         run: node src/github.js --self-test --offline
 
-      # src/installer.js 的 10 条 fixture（allowBuilds 合并）需要 js-yaml 与
-      # 宿主框架包，CI 裸机跑不了，只能在已安装副本上手工跑。见 README。
+      # guard/cli 的离线 fixture 需要 js-yaml 与 semver 两个叶子依赖（外加锁定
+      # 在 guard-tests/package-lock.json 里的测试宿主）。不对仓库根跑 npm ci：
+      # 根 package.json 的宿主 peer 不是开发依赖，且 dist-tags 横跨两条发布线，
+      # 全量安装必然 ERESOLVE。fixture 依赖树单独锁定重放。
+      - name: 安装锁定的 fixture 依赖
+        run: |
+          FIXTURE_DIR="$GITHUB_WORKSPACE/.github/fixtures/guard-tests"
+          npm ci --prefix "$FIXTURE_DIR" --ignore-scripts --no-audit --no-fund
+          ln -s "$FIXTURE_DIR/node_modules" node_modules
+
+      # src/guard.js 与 src/cli.js 的离线 fixture 固化冲突扫描、快照/pending/
+      # 回滚，以及 CLI 参数/启动缓刑的判据——主机无关、无网络、无 pnpm、无 dsh。
+      - name: guard fixture
+        run: |
+          node src/guard.js --self-test
+          node src/cli.js self-test
 
       - name: 发布（无 token，provenance 自动生成）
         run: npm publish --access public

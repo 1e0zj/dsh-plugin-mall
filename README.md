@@ -14,6 +14,7 @@ Curated lists only show what has been reviewed and merged. This marketplace is o
 - **Anti-squatting** — an install prefers the npm tarball only when the registry entry's `repository` URL points back to the same GitHub repo; anything else falls back to the explicit `github:` spec.
 - **npm-first installs** — registry tarballs are smaller than whole-repo GitHub downloads and come with integrity checks. Lookups follow the registry pnpm actually installs from (profile `.npmrc` → `pnpm config get registry` → npmjs), so a mirror user keeps npm-first instead of silently falling back to whole-repo clones.
 - **Update management** — installed plugins are compared against the registry `latest`; one-click update per plugin.
+- **Conflict guard** — every install runs an isolated preflight first: the candidate is installed with scripts disabled into a throwaway directory and scanned against the live profile for loader-id collisions, double mounts, host-module shadowing and version/OS/peer ranges. A hard conflict is blocked, warnings require explicit confirmation. The profile's load-bearing files are snapshotted before `pnpm` touches them and restored on failure, and a host-independent CLI guards startup: launched through `guard launch`, a pending install is committed only after dsh survives a grace window, and rolled back + restarted once when it crashes inside it (see [Startup protection](#startup-protection-guard-cli)).
 - **Resilience** — rate-limit circuit breaker, GitHub's 1000-result search window handled gracefully, `corepack enable pnpm` self-heal when pnpm is missing, one-click dsh restart (loopback-only, `allowRestart: false` to disable).
 
 ## Install
@@ -46,6 +47,40 @@ Restart dsh after installing.
 > `node_modules`: they are hard-linked into pnpm's global store, and any later
 > `pnpm add/remove` rebuilds the tree and restores them anyway.
 
+## Startup protection (guard CLI)
+
+The last line of defense is at **startup**. The package ships a standalone, host-independent CLI (bin `dsh-plugin-guard`, also runnable by path):
+
+```powershell
+# guarded install: isolated preflight → snapshot → dsh plugin add → on-disk validation
+dsh-plugin-guard guard add <spec> --profile web
+# start dsh under startup probation
+dsh-plugin-guard guard launch --profile web -- dsh web
+```
+
+The bare `dsh-plugin-guard` bin resolves only when the profile's (or global) `.bin` is on `PATH`. Two PATH-independent forms:
+
+```powershell
+# installed profile: run the bin from the profile's own node_modules/.bin
+pnpm --dir <profile> exec dsh-plugin-guard guard add <spec> --profile web
+pnpm --dir <profile> exec dsh-plugin-guard guard launch --profile web -- dsh web
+
+# development: run by source path
+node <profile>/node_modules/@1e0zj/dsh-plugin-mall/src/cli.js guard add <spec> --profile web
+node <profile>/node_modules/@1e0zj/dsh-plugin-mall/src/cli.js guard launch --profile web -- dsh web
+```
+
+**You must start dsh through the guard wrapper to get startup protection.** `guard launch` checks the profile's pending-install marker before starting the command after `--`:
+
+- **No pending install** — the command runs as-is, inheriting the terminal, and its exit code is preserved.
+- **Clearly broken on disk** — the profile is rolled back to its pre-install snapshot *before* launch, then the command starts on the restored state.
+- **Alive through the grace period** (default **10 seconds**; `--grace-ms <ms>` to change) — the pending snapshot is committed and the wrapper keeps waiting on the process.
+- **Exits 0 inside the grace period** (one-shot command) — the pending snapshot is committed.
+- **Crashes or exits nonzero inside the grace period** — the profile is rolled back and the *exact same command* is restarted once with the restored state (never in a loop); the restarted process's exit code is preserved. SIGINT/SIGTERM are forwarded to the child where the platform supports it; on Windows `.cmd`/`.bat` shims go through `%ComSpec%` with strict per-argument quoting.
+
+Limitations: the grace window is the probation period — a failure that only surfaces **after** it (a plugin that crashes minutes in, or on a specific interaction) cannot be rolled back automatically, because committing deletes the active snapshot and `guard recover` then has nothing to restore. `guard validate` still diagnoses the on-disk state, but a post-commit failure needs manual repair — uninstall and reinstall the plugin, or restore a backup you kept separately. Both commands do only **static on-disk validation**; neither proves the plugin actually loads. A corrupt pending marker fails closed: the command is not launched and no unvalidated path is deleted. Preserve the snapshot and repair or restore a trustworthy marker, then run `guard recover`; quarantine the marker only after you have independently verified the profile, or decided to abandon automatic recovery.
+
+
 ## Agent tools
 
 | Tool | What it does |
@@ -68,6 +103,7 @@ Restart dsh after installing.
 - **防抢注**：仅当 npm registry 条目的 `repository` 指回同一 GitHub 仓库时才用 npm 安装，否则回退 `github:` 源
 - **npm 优先安装**：registry tarball 比整仓库下载更小且带完整性校验；查询用的 registry 跟随 pnpm 实际安装源（profile `.npmrc` → `pnpm config get registry` → npmjs），换了镜像也不会退化成整仓库克隆
 - **更新管理**：已装插件与 registry `latest` 比对，逐个一键更新
+- **冲突防护**：每次安装先跑隔离预检——候选包在一次性目录里以禁用脚本的方式装好后，对照 live profile 扫描 loader-id 冲突、重复挂载、宿主模块遮蔽和版本/OS/peer 范围；硬冲突直接拦截，警告需显式确认。安装前给 profile 的承重文件拍快照、失败即回滚；另有一个独立于宿主的 CLI 守启动——经 `guard launch` 启动的 dsh 只有在活过观察期后才提交 pending 安装，观察期内崩溃则回滚并原样重启一次（见下方「启动保护」）。
 - **工程韧性**：限流熔断、GitHub 5xx/超时退避重试（504 瞬时故障不再直达用户）、GitHub 1000 条搜索上限优雅处理、pnpm 缺失时 `corepack` 自愈、一键重启 dsh（仅 loopback，可 `allowRestart: false` 关闭）
 
 ## 安装
@@ -120,6 +156,40 @@ dsh plugin --profile web add link:C:\path\to\dsh-plugin-mall
 > 另：Windows 上 `file:`/`link:` 的路径**不能含空格**。pnpm 是经 cmd 拉起的，
 > Node 只把参数用空格拼接、不逐参加引号，带空格的路径会被拆成两个参数；
 > 自己加引号也不行（`"` 属于被拦截的 shell 元字符）。市场会直接拒绝并说明原因。
+
+## 启动保护（guard CLI）
+
+最后一道防线在**启动**时。包自带一个独立于宿主的 CLI（bin 名 `dsh-plugin-guard`，也可按路径直接跑）：
+
+```powershell
+# 受 guard 保护的安装：隔离预检 → 快照 → dsh plugin add → 落盘校验
+dsh-plugin-guard guard add <spec> --profile web
+# 带启动缓刑期地启动 dsh
+dsh-plugin-guard guard launch --profile web -- dsh web
+```
+
+裸的 `dsh-plugin-guard` 只有在 profile（或全局）的 `.bin` 在 `PATH` 上时才解析得到。两种不依赖 `PATH` 的写法：
+
+```powershell
+# 已装 profile：从 profile 自己的 node_modules/.bin 里跑
+pnpm --dir <profile> exec dsh-plugin-guard guard add <spec> --profile web
+pnpm --dir <profile> exec dsh-plugin-guard guard launch --profile web -- dsh web
+
+# 开发：按源码路径直接跑
+node <profile>/node_modules/@1e0zj/dsh-plugin-mall/src/cli.js guard add <spec> --profile web
+node <profile>/node_modules/@1e0zj/dsh-plugin-mall/src/cli.js guard launch --profile web -- dsh web
+```
+
+**必须经由 guard 包装器启动 dsh 才有启动期保护。** `guard launch` 在启动 `--` 之后的命令前检查该 profile 的 pending 安装标记：
+
+- **无 pending 安装** —— 命令原样运行（继承终端），透传退出码；
+- **静态校验明显过不了** —— 启动*之前*先把 profile 回滚到安装前快照，再在恢复后的状态上启动；
+- **活过缓刑期**（默认 **10 秒**，`--grace-ms <ms>` 可调）—— 提交 pending 快照，包装器继续守候该进程；
+- **缓刑期内以 0 退出**（一次性命令）—— 同样提交 pending 快照；
+- **缓刑期内崩溃或非零退出** —— 回滚 profile，并用恢复后的状态**原样重启同一命令一次**（绝不循环），透传重启进程的退出码。支持的平台会把 SIGINT/SIGTERM 转发给子进程；Windows 上 `.cmd`/`.bat` 经 `%ComSpec%` 启动，逐参数严格加引号。
+
+限制：缓刑期就是观察期——**之后**才暴露的故障（跑了几分钟才崩、或某个特定操作才触发）无法自动回滚：提交会删掉当前快照，此时 `guard recover` 已无可恢复的东西。`guard validate` 仍能诊断落盘状态，但提交之后的故障只能手工修复——卸载并重装插件（或恢复你另行保留的备份）。两条命令都只做**静态落盘校验**，都不证明插件真的能加载。pending 标记损坏时关闭式失败：不启动命令、不删除任何未校验路径。要**保留快照**、修复或恢复一个可信的标记后再跑 `guard recover`；只有在你已经独立核实过 profile、或决定放弃自动恢复之后，才去隔离（删除/移走）标记。
+
 
 ## 工作原理
 
@@ -184,9 +254,11 @@ git push --follow-tags
 之间那道缝是可验证地闭合的(`npm view <pkg> dist.attestations` 可查)。
 
 workflow 会先校验 tag 与 `package.json` 版本一致、再跑离线 fixture,任一不过
-就不发。**它故意不跑 `npm ci`** —— 框架包的 dist-tags 问题会让它 ERESOLVE
-失败(见上方 `link:` 说明),而这个包没有构建步骤,`npm publish` 也不读
-`node_modules`。
+就不发。它不在仓库根目录跑 `npm ci` —— 根 `package.json` 里的框架包是宿主
+提供的 peer，并非需要装进发布包的开发副本；这个包也没有构建步骤，
+`npm publish` 本身不读 `node_modules`。guard/cli 自测需要的测试依赖单独放在
+`.github/fixtures/guard-tests`，由提交进仓库的 `package-lock.json` 固定完整解析树，
+CI 只在该隔离目录运行 `npm ci --ignore-scripts`。
 
 > 首次配置需在 npmjs.com 的包设置里添加 Trusted Publisher(GitHub Actions +
 > 仓库名 + `release.yml`),之后所有长期 token 都可以删掉。
@@ -213,3 +285,9 @@ workflow 会先校验 tag 与 `package.json` 版本一致、再跑离线 fixture
 - `src/installer.js` 也有一组 fixture，固化 `allowBuilds` 合并的全部形状
   （改 `mergeAllowBuilds` 前必跑）。它有宿主依赖，所以要从**已安装副本**运行：
   `node ~/.dsh/profiles/web/node_modules/@1e0zj/dsh-plugin-mall/src/installer.js --self-test`
+- `src/guard.js` 与 `src/cli.js` 各自带一组离线 fixture（无网络、无 pnpm/dsh、
+  无宿主框架依赖），固化冲突扫描、快照/pending/回滚，以及 CLI 参数与启动缓刑
+  的判据：`node src/guard.js --self-test`、`node src/cli.js self-test`。两者只
+  import `js-yaml` + `semver` 两个叶子包，裸 checkout 里单点装这两个即可跑：
+  `npm install --no-save --no-package-lock --ignore-scripts --legacy-peer-deps
+  js-yaml@4 semver@7`，或从已安装副本跑同两条命令。改 guard 逻辑前必跑这组。
