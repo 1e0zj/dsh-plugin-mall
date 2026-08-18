@@ -182,12 +182,20 @@ window.__ModuleLoader__.load({
       // carryFromId：把上一阶段（预检）的日志接过来并撤掉它的条目。一次点击
       // 只应该在面板里留下一个任务，日志连续——而不是 market-1 预检、
       // market-2 安装两条并排，让人以为自己点了两次。
+      // 重试同理：同一 spec 上一轮失败/完成的终态条目一并撤掉——用户没点
+      // 「清空」就重试时，面板照样只留新一轮一条。旧失败日志不拼进新任务
+      // （两轮 pnpm 输出混在一起没法读）；running 的不动，那是真并发任务。
       var track = useCallback(function (id, spec, carryFromId) {
         var next = Object.assign({}, jobsRef.current);
         var carried = "";
         if (carryFromId && next[carryFromId]) {
           carried = next[carryFromId].output || "";
           delete next[carryFromId];
+        }
+        for (var key in next) {
+          if (key !== id && next[key] && next[key].spec === spec && next[key].status !== "running") {
+            delete next[key];
+          }
         }
         next[id] = { status: "running", spec: spec, output: carried };
         jobsRef.current = next;
