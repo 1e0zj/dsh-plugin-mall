@@ -1062,26 +1062,71 @@ function fallbackAddArgs(target) {
 }
 
 /**
- * The argv target for a fallback `pnpm add` of one restored dependency, or
- * undefined when that spec cannot be added offline and safely. Semver ranges
- * become `name@range`, local file:/link: paths add by the spec itself;
- * github:/git+ specs need the network or git and stay fail-closed, and
- * anything carrying shell metacharacters (a multi-clause range like
- * `^1.0.0 || ^2.0.0` contains spaces and pipes) is skipped — the
- * shell-wrapped pnpm spawn joins argv with spaces without quoting.
+ * The lockfile's pinned version for one direct dependency, or undefined. In a
+ * rollback the lockfile has just been restored from the snapshot, so this IS
+ * the exact version the rollback is trying to get back — not a guess.
  */
-function fallbackAddTarget(name, spec) {
-  const range = String(spec ?? "");
-  if (range.length === 0) return undefined;
-  const isLocal = /^(?:file:|link:)/i.test(range);
-  if (!isLocal && validRange(range) === null) return undefined;
-  const target = isLocal ? range : `${name}@${range}`;
+function pinnedLockfileVersion(profileDir, name) {
   try {
-    assertSafeSpec(target);
+    const doc = load(readFileSync(join(profileDir, "pnpm-lock.yaml"), "utf8"));
+    const version = doc?.importers?.["."]?.dependencies?.[name]?.version;
+    return typeof version === "string" && version.length > 0 ? version : undefined;
   } catch {
     return undefined;
   }
-  return target;
+}
+
+/**
+ * The argv target for a fallback `pnpm add` of one restored dependency, or
+ * undefined when that spec cannot be added offline and safely.
+ *
+ * - `github:owner/repo` adds by the spec itself — pnpm keeps a git resolution
+ *   cache, so `--offline` add relinks from the store on a cache hit (verified
+ *   on a real profile: exit 0, zero downloads) and exits nonzero otherwise,
+ *   falling through to the same fail-closed path. `--offline` keeps the
+ *   recovery network-free either way. The marketplace's primary source IS
+ *   github:, so this branch covers most real plugins.
+ * - `file:/link:` paths add by the spec itself.
+ * - Semver ranges: `name@range` only when the range carries no shell
+ *   metacharacters — and `^` (the near-universal pnpm save prefix!) is one
+ *   (cmd's escape character: it mangles the argv through the shell-wrapped
+ *   spawn, so assertSafeSpec refuses it). For those — including multi-clause
+ *   ranges like `^1.0.0 || ^2.0.0` — the target becomes
+ *   `name@<lockfile pinned version>`: the lockfile is the authority this
+ *   rollback just restored, so its pinned version is by definition a legal
+ *   restore target for any range. Only a missing/unreadable lockfile entry
+ *   stays fail-closed.
+ */
+function fallbackAddTarget(name, spec, profileDir) {
+  const range = String(spec ?? "");
+  if (range.length === 0) return undefined;
+  const isLocal = /^(?:file:|link:)/i.test(range);
+  const isGit = /^github:/i.test(range);
+  if (isLocal || isGit) {
+    try {
+      assertSafeSpec(range);
+      return range;
+    } catch {
+      return undefined;
+    }
+  }
+  if (validRange(range) === null) return undefined;
+  const direct = `${name}@${range}`;
+  try {
+    assertSafeSpec(direct);
+    return direct;
+  } catch {
+    /* ^-prefixed and other shell-hostile ranges: fall through to the pinned version */
+  }
+  const pinned = pinnedLockfileVersion(profileDir, name);
+  if (pinned === undefined) return undefined;
+  const pinnedTarget = `${name}@${pinned}`;
+  try {
+    assertSafeSpec(pinnedTarget);
+    return pinnedTarget;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -1302,7 +1347,7 @@ export function rollbackPendingSnapshot(profileDir) {
     // whatever pnpm wrote: the add is only the means to relink node_modules,
     // the snapshot stays authoritative for the declaration files.
     for (const depName of [...unsatisfied]) {
-      const target = fallbackAddTarget(depName, restoredDependencies[depName]);
+      const target = fallbackAddTarget(depName, restoredDependencies[depName], profileDir);
       if (target === undefined) continue; // not offline-addable — fail closed below
       const addAttempt = runFallbackAdd(profileDir, target);
       if (addAttempt.exitCode === 0) {
@@ -2152,6 +2197,44 @@ async function selfTest() {
       if (args[0] !== "add" || args[1] !== "some-plugin@1.0.0") throw new Error("probe args should be `add <spec>`");
       if (!args.includes("--config.auto-install-peers=false")) throw new Error("probe args must disable peer auto-install");
       if (!args.includes("--ignore-scripts")) throw new Error("probe args must keep install scripts disabled");
+    }
+
+    // fallbackAddTarget (pure): what one restored dependency may be offline
+    // re-added as. github: specs add by the spec itself — pnpm keeps a git
+    // resolution cache, so `--offline` add relinks from the store on a cache
+    // hit (verified on a real profile: exit 0, zero downloads) and exits
+    // nonzero otherwise, falling through to the same fail-closed path.
+    // `^` ranges (pnpm's near-universal save prefix) cannot be spliced into a
+    // shell-wrapped argv (cmd eats the caret), so they resolve to the
+    // lockfile's pinned version — exactly what a rollback is restoring to.
+    {
+      const lockRoot = join(root, "profiles", "fbtarget");
+      mkdirSync(lockRoot, { recursive: true });
+      writeFileSync(join(lockRoot, "pnpm-lock.yaml"), [
+        "lockfileVersion: '9.0'",
+        "importers:",
+        "  .:",
+        "    dependencies:",
+        "      good:",
+        "        specifier: ^1.0.0",
+        "        version: 1.0.0",
+        "",
+      ].join("\n"));
+      if (fallbackAddTarget("good", "1.0.0", lockRoot) !== "good@1.0.0") throw new Error("a plain range splices directly");
+      if (fallbackAddTarget("good", "^1.0.0", lockRoot) !== "good@1.0.0") throw new Error("a ^-range must resolve to the lockfile pinned version");
+      if (fallbackAddTarget("good", "^1.0.0", join(root, "profiles", "no-lock-here")) !== undefined) {
+        throw new Error("a ^-range without a readable lockfile must stay fail-closed");
+      }
+      if (fallbackAddTarget("good", "github:owner/repo", lockRoot) !== "github:owner/repo") throw new Error("a github spec must add by itself");
+      if (fallbackAddTarget("good", "file:D:\\pkg.tgz", lockRoot) !== "file:D:\\pkg.tgz") throw new Error("local file target expected");
+      // 多区间 range 直拼必被拒（空格/管道），但 lockfile 的 pinned 对任何
+      // range 都是合法恢复目标（lockfile 即权威）——同样走 pinned，
+      // 只有 lockfile 不可读/无该条目才 fail-closed。
+      if (fallbackAddTarget("good", "^1.0.0 || ^2.0.0", lockRoot) !== "good@1.0.0") throw new Error("a multi-clause range must resolve to the lockfile pinned version");
+      if (fallbackAddTarget("good", "^1.0.0 || ^2.0.0", join(root, "profiles", "no-lock-here")) !== undefined) {
+        throw new Error("a multi-clause range without a readable lockfile must stay fail-closed");
+      }
+      if (fallbackAddTarget("good", "", lockRoot) !== undefined) throw new Error("an empty spec has no target");
     }
 
     // pnpmSpawnPlan (pure, plus a real spawn on Windows): the .cmd shim path

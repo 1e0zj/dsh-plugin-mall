@@ -119,9 +119,10 @@ npx -p @1e0zj/dsh-plugin-mall@0.3.2 dsh-plugin-guard recover ~/.dsh/profiles/web
 pnpm --dir ~/.dsh/profiles/web add "@1e0zj/dsh-plugin-mall@0.3.2" --ignore-scripts
 ```
 
-**GitHub sources** (`"name": "github:owner/repo"`) — the rollback rebuild does not
-cover git dependencies; if `guard recover` could not repair it (dsh still won't
-start), install it back manually, online:
+**GitHub sources** (`"name": "github:owner/repo"`) — try `guard recover` first:
+for git dependencies it attempts an offline re-add from pnpm's resolution cache
+(a cache hit repairs it automatically). If dsh still won't start (cache miss),
+install it back manually, online:
 
 ```powershell
 pnpm --dir "$env:USERPROFILE\.dsh\profiles\web" add "github:owner/repo" --ignore-scripts
@@ -280,8 +281,9 @@ npx -p @1e0zj/dsh-plugin-mall@0.3.2 dsh-plugin-guard recover ~/.dsh/profiles/web
 pnpm --dir ~/.dsh/profiles/web add "@1e0zj/dsh-plugin-mall@0.3.2" --ignore-scripts
 ```
 
-**GitHub 源**（`"名字": "github:owner/repo"` 这类）——guard recover 的回滚重建
-不覆盖 git 依赖；若它没能自动修复（dsh 仍起不来），手动联网装回：
+**GitHub 源**（`"名字": "github:owner/repo"` 这类）——先跑上面的 guard
+recover：它对 git 依赖会尝试从 pnpm 的解析缓存离线装回（缓存命中即可自动
+修复）；若仍起不来（缓存未命中），手动联网装回：
 
 ```powershell
 pnpm --dir "$env:USERPROFILE\.dsh\profiles\web" add "github:owner/repo" --ignore-scripts
