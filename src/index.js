@@ -540,12 +540,12 @@ function requireAgentApprovalOwner(exec) {
 export const SAFE_PROFILE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 export const WINDOWS_DEVICE_BASENAME_RE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 
-export function assertSafeProfileName(profile) {
+export function assertSafeProfileName(profile, isWindows = process.platform === "win32") {
   const value = String(profile ?? "");
   if (!SAFE_PROFILE_NAME_RE.test(value)) {
     throw new Error(`invalid profile name ${JSON.stringify(value)} — only letters, digits, '.', '_' and '-' are allowed, starting with a letter or digit`);
   }
-  if (process.platform === "win32") {
+  if (isWindows) {
     if (/[. ]$/.test(value)) {
       throw new Error(`invalid profile name ${JSON.stringify(value)} — Windows profile names must not end in a dot or space (on disk it would alias ${JSON.stringify(value.replace(/[. ]+$/, ""))} while using a different pending filename)`);
     }
@@ -704,7 +704,7 @@ export function resolveCurrentDshEntry() {
   return undefined;
 }
 
-export function resolveRestartLaunchPlan({ profile, config = {} }) {
+export function resolveRestartLaunchPlan({ profile, config = {}, isWindows }) {
   if (config.allowRestart === false) {
     return { ok: false, error: "restart disabled by config (allowRestart: false)" };
   }
@@ -714,7 +714,8 @@ export function resolveRestartLaunchPlan({ profile, config = {} }) {
     return { ok: false, error: "restart requires a target profile name" };
   }
   try {
-    assertSafeProfileName(name);
+    // isWindows 显式传入时覆盖平台默认（离线 fixture 用它跨平台钉死 Windows 语义）。
+    assertSafeProfileName(name, isWindows === undefined ? undefined : isWindows === true);
   } catch (error) {
     return { ok: false, error: error.message };
   }
@@ -2089,10 +2090,12 @@ export async function runSelfTests() {
     }
     check("Windows 保留设备名 (含扩展名及大小写) 全部拒绝", allDevicesRejected);
 
-    const restartBadPlan = resolveRestartLaunchPlan({ profile: "CON", config: { allowRestart: true } });
+    // isWindows: true —— 这两条断言的是 Windows 路径语义，与运行平台无关地钉死；
+    // 否则 Linux CI 上 "CON"/"web." 是合法名，plan 会因下游原因失败、错误对不上。
+    const restartBadPlan = resolveRestartLaunchPlan({ profile: "CON", config: { allowRestart: true }, isWindows: true });
     check("保留设备名 profile 重启 plan fail-closed", !restartBadPlan.ok && /reserved Windows device name/.test(restartBadPlan.error));
 
-    const restartDotPlan = resolveRestartLaunchPlan({ profile: "web.", config: { allowRestart: true } });
+    const restartDotPlan = resolveRestartLaunchPlan({ profile: "web.", config: { allowRestart: true }, isWindows: true });
     check("尾随点 profile 重启 plan fail-closed", !restartDotPlan.ok && /dot or space/.test(restartDotPlan.error));
 
     // ── 7. Tracker isolation: producer.done rejection handling ───────────────
