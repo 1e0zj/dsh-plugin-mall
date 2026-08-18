@@ -583,9 +583,9 @@ export function inspectRemoteCandidate({ profileDir, manifest, patchText, spec }
 }
 
 /** Locate a binary on PATH by explicit extension (no shell, no PATHEXT guessing). */
-function findOnPath(binary, extensions) {
-  const separator = process.platform === "win32" ? ";" : ":";
-  for (const dir of String(process.env.PATH ?? "").split(separator)) {
+function findOnPath(binary, { platform, pathEnv, extensions }) {
+  const separator = platform === "win32" ? ";" : ":";
+  for (const dir of String(pathEnv ?? "").split(separator)) {
     if (dir.length === 0) continue;
     for (const ext of extensions) {
       const candidate = join(dir, `${binary}${ext}`);
@@ -596,16 +596,32 @@ function findOnPath(binary, extensions) {
 }
 
 /**
- * pnpm spawn plan, mirroring installer.js pnpmSpawnPlan: a real .exe spawns
- * without a shell; only the .cmd shim forces a cmd wrapper on Windows
- * (shell:true, and Node's DEP0190 warning with it).
+ * How to spawn pnpm on this platform. installer.js consumes this too, so the
+ * plan lives here exactly once instead of as two drifting copies (the mirror
+ * copies had already diverged once; that is how the quoting bug below stayed
+ * invisible on both sides).
+ * @returns {{ command: string, shell: boolean, treeKill: boolean }}
+ *   treeKill marks the shell-wrapped case: cancel must taskkill /T the tree.
  */
-function pnpmSpawnPlan() {
-  if (process.platform !== "win32") return { command: "pnpm", shell: false };
-  const exe = findOnPath("pnpm", [".exe"]);
-  if (exe !== undefined) return { command: exe, shell: false };
-  const cmd = findOnPath("pnpm", [".cmd"]);
-  return { command: cmd ?? "pnpm", shell: true };
+export function pnpmSpawnPlan({ platform = process.platform, pathEnv = process.env.PATH } = {}) {
+  if (platform !== "win32") return { command: "pnpm", shell: false, treeKill: false };
+  // A real .exe spawns without a shell — cancel then kills pnpm itself.
+  const exe = findOnPath("pnpm", { platform, pathEnv, extensions: [".exe"] });
+  if (exe !== undefined) return { command: exe, shell: false, treeKill: false };
+  // Only the .cmd shim: Node refuses batch files with shell:false (EINVAL
+  // since the batch-file argument-injection fix), so a cmd wrapper is
+  // unavoidable — flag it so cancel kills the whole tree, not the wrapper.
+  const cmd = findOnPath("pnpm", { platform, pathEnv, extensions: [".cmd"] });
+  if (cmd === undefined) return { command: "pnpm", shell: true, treeKill: true };
+  // The shim usually sits in a directory with a space (`D:\Program Files\nodejs`
+  // is Node's default install layout). Under shell:true Node joins command and
+  // args with spaces WITHOUT quoting per argument — the same fact the
+  // UNSAFE_SPEC_RE comment below argues from — so an unquoted path is cut at
+  // the first space and cmd answers `'D:\Program' is not recognized`, killing
+  // every preflight and install on such machines. Quote the command ourselves;
+  // the args joined after it are fixed flags plus an assertSafeSpec-validated
+  // spec, none of which carry spaces.
+  return { command: `"${cmd}"`, shell: true, treeKill: true };
 }
 
 function spawnCapture(command, args, options, onOutput) {
@@ -1904,6 +1920,36 @@ async function selfTest() {
       if (args[0] !== "add" || args[1] !== "some-plugin@1.0.0") throw new Error("probe args should be `add <spec>`");
       if (!args.includes("--config.auto-install-peers=false")) throw new Error("probe args must disable peer auto-install");
       if (!args.includes("--ignore-scripts")) throw new Error("probe args must keep install scripts disabled");
+    }
+
+    // pnpmSpawnPlan (pure, plus a real spawn on Windows): the .cmd shim path
+    // must carry its own quotes. Node's shell:true joins command and args
+    // without per-argument quoting, so `D:\Program Files\nodejs\pnpm.CMD`
+    // would be cut at the first space and cmd would answer
+    // `'D:\Program' is not recognized` — that exact failure blocked every
+    // preflight on a real machine (Node's default install layout has a space).
+    {
+      const shimRoot = join(root, "path with space");
+      mkdirSync(shimRoot, { recursive: true });
+      writeFileSync(join(shimRoot, "pnpm.cmd"), "@echo probe-ok\r\n");
+      const plan = pnpmSpawnPlan({ platform: "win32", pathEnv: shimRoot });
+      if (plan.shell !== true || plan.treeKill !== true || plan.command !== `"${join(shimRoot, "pnpm.cmd")}"`) {
+        throw new Error(`quoted .cmd plan expected, got ${JSON.stringify(plan)}`);
+      }
+      if (pnpmSpawnPlan({ platform: "linux", pathEnv: shimRoot }).command !== "pnpm") {
+        throw new Error("posix plan should spawn pnpm directly");
+      }
+      const noShim = pnpmSpawnPlan({ platform: "win32", pathEnv: join(root, "no-shim-here") });
+      if (noShim.command !== "pnpm" || noShim.shell !== true || noShim.treeKill !== true) {
+        throw new Error(`missing-shim fallback expected, got ${JSON.stringify(noShim)}`);
+      }
+      // 引用不是摆设：Windows 真机端到端 spawn 一轮（CI 是 Linux，只跑静态断言）。
+      if (process.platform === "win32") {
+        const probe = spawnSync(plan.command, ["--version"], { shell: plan.shell, encoding: "utf8", timeout: 15000 });
+        if (probe.status !== 0 || !/probe-ok/.test(probe.stdout ?? "")) {
+          throw new Error(`quoted shim must actually run: status=${probe.status} stdout=${JSON.stringify(probe.stdout)} stderr=${JSON.stringify(probe.stderr)}`);
+        }
+      }
     }
 
     // Rollback reconcile args/env (pure): scripts off, the restored lockfile

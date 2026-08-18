@@ -16,7 +16,7 @@ import { createHash } from "node:crypto";
 import { dump, load } from "js-yaml";
 import { DEFAULT_PROFILE_BUNDLES, PROFILE_TEMPLATES, initProfile, resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
 import { describeBuildScripts, npmNameOf } from "./github.js";
-import { commitPendingSnapshot, createProfileSnapshot, markPendingSnapshot, pnpmGuardEnv, rollbackPendingSnapshot } from "./guard.js";
+import { commitPendingSnapshot, createProfileSnapshot, markPendingSnapshot, pnpmGuardEnv, pnpmSpawnPlan, rollbackPendingSnapshot } from "./guard.js";
 
 // ── spec normalization ──────────────────────────────────────────────────────
 
@@ -1258,36 +1258,11 @@ function serializedProducer(lockKey, start) {
 // (a .cmd shim cannot be spawned with shell:false on modern Node), cancel
 // terminates the whole process tree and the done chain waits for the
 // wrapper's 'close' before any rollback runs.
-
-/** First `binary<ext>` found on PATH, or undefined. */
-function findOnPath(binary, { platform, pathEnv, extensions }) {
-  const separator = platform === "win32" ? ";" : ":";
-  for (const dir of String(pathEnv ?? "").split(separator)) {
-    if (dir.length === 0) continue;
-    for (const ext of extensions) {
-      const candidate = join(dir, `${binary}${ext}`);
-      if (existsSync(candidate)) return candidate;
-    }
-  }
-  return undefined;
-}
-
-/**
- * How to spawn pnpm on this platform.
- * @returns {{ command: string, shell: boolean, treeKill: boolean }}
- *   treeKill marks the shell-wrapped case: cancel must taskkill /T the tree.
- */
-function pnpmSpawnPlan({ platform = process.platform, pathEnv = process.env.PATH } = {}) {
-  if (platform !== "win32") return { command: "pnpm", shell: false, treeKill: false };
-  // A real .exe spawns without a shell — cancel then kills pnpm itself.
-  const exe = findOnPath("pnpm", { platform, pathEnv, extensions: [".exe"] });
-  if (exe !== undefined) return { command: exe, shell: false, treeKill: false };
-  // Only the .cmd shim: Node refuses batch files with shell:false (EINVAL
-  // since the batch-file argument-injection fix), so a cmd wrapper is
-  // unavoidable — flag it so cancel kills the whole tree, not the wrapper.
-  const cmd = findOnPath("pnpm", { platform, pathEnv, extensions: [".cmd"] });
-  return { command: cmd ?? "pnpm", shell: true, treeKill: true };
-}
+//
+// The plan itself is pnpmSpawnPlan in guard.js (imported above) — one
+// implementation, not a local mirror. It quotes the .cmd path: Node's
+// shell:true joins without per-argument quoting, and `D:\Program Files\…`
+// would be cut at the first space (`'D:\Program' is not recognized`).
 
 /**
  * Terminate a shell-wrapped process tree (Windows): taskkill /T /F kills the
@@ -2567,7 +2542,9 @@ async function runTransactionFixtures() {
   }
 
   // 4a. spawn 计划（纯函数）：非 Windows 无 shell；Windows 有 .exe 则
-  // shell:false，仅 .cmd 则 shell:true + treeKill，全找不到回退 "pnpm"。
+  // shell:false，仅 .cmd 则 shell:true + treeKill 且 command 自带引号
+  // （.cmd 常在 `D:\Program Files\nodejs` 这类带空格的目录里，shell:true 下
+  // Node 只拼空格不逐参数引用，不引用就从空格截断），全找不到回退 "pnpm"。
   {
     const shimDir = mkdtempSync(join(tmpdir(), "dsh-mall-selftest-path-"));
     try {
@@ -2577,15 +2554,36 @@ async function runTransactionFixtures() {
       const missingOk = planMissing.command === "pnpm" && planMissing.shell === true && planMissing.treeKill === true;
       writeFileSync(join(shimDir, "pnpm.cmd"), "@echo off\r\n");
       const planCmd = pnpmSpawnPlan({ platform: "win32", pathEnv: shimDir });
-      const cmdOk = planCmd.command === join(shimDir, "pnpm.cmd") && planCmd.shell === true && planCmd.treeKill === true;
+      const cmdOk = planCmd.command === `"${join(shimDir, "pnpm.cmd")}"` && planCmd.shell === true && planCmd.treeKill === true;
       writeFileSync(join(shimDir, "pnpm.exe"), "MZ");
       const planExe = pnpmSpawnPlan({ platform: "win32", pathEnv: shimDir });
       const exeOk = planExe.command === join(shimDir, "pnpm.exe") && planExe.shell === false && planExe.treeKill === false;
       check(
-        "pnpmSpawnPlan：posix 直起 / win32 优先 .exe 无 shell / 仅 .cmd 则 treeKill",
+        "pnpmSpawnPlan：posix 直起 / win32 优先 .exe 无 shell / 仅 .cmd 则带引号 + treeKill",
         posixOk && missingOk && cmdOk && exeOk,
         JSON.stringify({ planPosix, planMissing, planCmd, planExe }),
       );
+      // 空格目录不是假想敌：Node 默认装进 Program Files，真实机器上命令从
+      // 空格截断曾让「'D:\Program' 不是内部或外部命令」拦下所有预检。
+      const spaceDir = join(shimDir, "dir with space");
+      mkdirSync(spaceDir, { recursive: true });
+      writeFileSync(join(spaceDir, "pnpm.cmd"), "@echo probe-ok\r\n");
+      const planSpace = pnpmSpawnPlan({ platform: "win32", pathEnv: spaceDir });
+      check(
+        "pnpmSpawnPlan：带空格的 .cmd 路径 → command 自带引号",
+        planSpace.shell === true && planSpace.command === `"${join(spaceDir, "pnpm.cmd")}"`,
+        JSON.stringify(planSpace),
+      );
+      // 引用必须真的可跑：Windows 真机端到端 spawn 一轮假 shim（CI 是 Linux，
+      // 只跑静态断言；Windows 上这一条覆盖完整链路）。
+      if (process.platform === "win32") {
+        const probe = spawnSync(planSpace.command, ["--version"], { shell: planSpace.shell, encoding: "utf8", timeout: 15000 });
+        check(
+          "pnpmSpawnPlan：带引号 command 真实 spawn 不再被空格截断",
+          probe.status === 0 && /probe-ok/.test(probe.stdout ?? ""),
+          `status=${probe.status} stdout=${JSON.stringify((probe.stdout ?? "").slice(0, 80))} stderr=${JSON.stringify((probe.stderr ?? "").slice(0, 80))}`,
+        );
+      }
     } finally {
       rmSync(shimDir, { recursive: true, force: true });
     }
