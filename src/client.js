@@ -133,10 +133,29 @@ window.__ModuleLoader__.load({
     // onPreflightSettled：预检 job（kind=dsh-plugin-preflight）落定时回调，
     // 携带 (spec, report)。safe 由调用方直接续装；有风险由调用方出内联卡片。
     function useJobPolling(call, onSettled, onApprovalToken, onPreflightSettled) {
-      var jobsRef = useRef({});
-      var _jobs = useState({});
+      // 重挂载垫底：安装完成的收尾会写 cordis.patch.yml，dsh 随之重放装配树、
+      // 整个市场 UI 重挂载，React state 归零——面板先空一拍再被异步的
+      // call("jobs") 恢复，用户看到「任务清掉又回来」的割裂（实测反馈）。
+      // sessionStorage 镜像让重挂载的第一帧直接渲染上一帧的面板，随后的
+      // RPC 恢复用后端权威数据覆盖。tab 级存储，随 tab 关闭而清，
+      // 与内存里的任务数据同生命周期。
+      var JOBS_MIRROR_KEY = "@1e0zj/dsh-plugin-mall:jobs";
+      var readJobsMirror = function () {
+        try {
+          var parsed = JSON.parse(window.sessionStorage.getItem(JOBS_MIRROR_KEY) || "null");
+          return parsed && typeof parsed === "object" ? parsed : {};
+        } catch (e) { return {}; }
+      };
+      var jobsRef = useRef(null);
+      if (jobsRef.current === null) jobsRef.current = readJobsMirror();
+      var _jobs = useState(Object.assign({}, jobsRef.current));
       var jobs = _jobs[0];
       var setJobs = _jobs[1];
+      var commit = useCallback(function (next) {
+        jobsRef.current = next;
+        setJobs(Object.assign({}, next));
+        try { window.sessionStorage.setItem(JOBS_MIRROR_KEY, JSON.stringify(next)); } catch (e) { /* 存储被禁/写满不致命 */ }
+      }, []);
       useEffect(function () {
         var timer = setInterval(function () {
           var current = jobsRef.current;
@@ -165,15 +184,15 @@ window.__ModuleLoader__.load({
                 }
               }
               var output = (old.output || "") + (value.output || "");
-              jobsRef.current = Object.assign({}, jobsRef.current, { [id]: Object.assign({}, old, {
+              commit(Object.assign({}, jobsRef.current, { [id]: Object.assign({}, old, {
                 status: snapshot.status,
                 detail: snapshot.detail,
                 needsApproval: snapshot.needsApproval,
                 approvalToken: snapshot.approvalToken,
                 kind: snapshot.kind,
                 output: output,
-              }) });
-              setJobs(Object.assign({}, jobsRef.current));
+                finishedAt: snapshot.finishedAt,
+              }) }));
             }).catch(function () { /* keep polling */ });
           });
         }, 1200);
@@ -198,20 +217,66 @@ window.__ModuleLoader__.load({
           }
         }
         next[id] = { status: "running", spec: spec, output: carried };
-        jobsRef.current = next;
-        setJobs(Object.assign({}, next));
-      }, []);
+        commit(next);
+      }, [commit]);
       var clear = useCallback(function () {
-        jobsRef.current = {};
-        setJobs({});
-      }, []);
+        commit({});
+      }, [commit]);
       var drop = useCallback(function (id) {
         var next = Object.assign({}, jobsRef.current);
         delete next[id];
-        jobsRef.current = next;
-        setJobs(next);
-      }, []);
-      return { jobs: jobs, track: track, clear: clear, drop: drop };
+        commit(next);
+      }, [commit]);
+      // 恢复后端任务记录（tracker.list 的形状）：安装事务改写
+      // cordis.patch.yml 会让 dsh 重放装配树、整个市场 UI 重挂载，React
+      // state 全丢——任务面板、完成提醒、重启按钮一起消失（真实事故：
+      // 更新其实成功了，用户靠手动重启+查版本才确认）。记录在后端活着，
+      // 挂载时拉回来。两个细节：恢复出的**已落定**预检任务标
+      // preflightHandled，否则轮询的第一拍会重放 onPreflightSettled——
+      // 那等于页面一刷新就自动续装一次；running 的不标，交回轮询线。
+      var restore = useCallback(function (entries) {
+        var next = Object.assign({}, jobsRef.current);
+        var serverIds = {};
+        for (var index = 0; index < (entries || []).length; index++) {
+          var entry = entries[index] || {};
+          var snap = entry.snapshot || {};
+          if (!entry.id) continue;
+          serverIds[entry.id] = true;
+          // 服务器记录是权威（覆盖垫底镜像）；本地独有的 id 保留——后端
+          // 修剪掉的旧条目不至于从面板上闪没。
+          next[entry.id] = {
+            status: snap.status,
+            spec: snap.spec,
+            detail: snap.detail,
+            needsApproval: snap.needsApproval,
+            approvalToken: snap.approvalToken,
+            kind: snap.kind,
+            output: entry.output || "",
+            finishedAt: snap.finishedAt,
+            preflightHandled: snap.kind === "dsh-plugin-preflight" && snap.status !== "running",
+          };
+        }
+        // 不在本次服务器列表里的条目属于上一次宿主会话（进程重启后
+        // tracker 清空）。已兑现的直接翻篇撤掉：completed 的重启已经
+        // 发生；needsApproval 暂停的批准卡片已随进程失效（事务由启动
+        // 恢复处置），留着只会让人点一个必然失败的按钮。running 的标
+        // 中断，别让轮询对着不存在的 id 空转。failed 保留——日志还有
+        // 排障价值。这个判据不依赖 finishedAt（旧镜像里没有该字段）。
+        for (var key in next) {
+          if (serverIds[key]) continue;
+          var stale = next[key];
+          if (stale.status === "running") {
+            next[key] = Object.assign({}, stale, {
+              status: "killed",
+              detail: "宿主进程已重启，该任务的记录随之丢失",
+            });
+          } else if (stale.status === "completed" || (Array.isArray(stale.needsApproval) && stale.needsApproval.length > 0)) {
+            delete next[key];
+          }
+        }
+        commit(next);
+      }, [commit]);
+      return { jobs: jobs, track: track, clear: clear, drop: drop, restore: restore };
     }
 
     // ── plugin verification badge ───────────────────────────────────────────
@@ -425,10 +490,12 @@ window.__ModuleLoader__.load({
                 needsApproval: job.needsApproval,
                 busy: props.approving === job.spec,
                 onApprove: function (names) {
-                  if (typeof props.onDrop === "function") {
-                    props.onDrop(id);
-                  }
-                  props.onApprove(job.spec, names, job.approvalToken);
+                  // 不先 drop：旧条目由重试任务的 track(carryFromId) 原子接管
+                  // （撤条目 + 日志接续一拍完成）。先删的话，call("install")
+                  // 要走数秒（重试还会重跑一次隔离预检），面板会空白一段，
+                  // 「批准后任务消失、开始安装才冒出来」的割裂就是这么来的。
+                  // 等待期间按钮由 approving 态显示「继续中…」。
+                  props.onApprove(job.spec, names, job.approvalToken, id);
                 },
                 onDismiss: function () { props.onDismiss(id); },
               })
@@ -437,11 +504,16 @@ window.__ModuleLoader__.load({
             // 也不再重复一个绿色「完成」：状态行已经写了「· 完成」。
             done && job.status === "completed" && job.kind !== "dsh-plugin-preflight"
               ? h("div", { className: "mkt_jobDone" },
-                h("button", {
-                  className: "mkt_btn mkt_btnPrimary mkt_btnSm",
-                  disabled: props.restarting === true,
-                  onClick: props.onRestart,
-                }, props.restarting ? "重启中…" : "重启 dsh 生效"))
+                // 完成时间早于本次宿主启动 = 重启已经发生过了（防御分支：
+                // 已兑现的条目通常在恢复时就被撤掉了）：换成说明文字，
+                // 不再催一次没必要的重启。
+                props.hostStartedAt && job.finishedAt && job.finishedAt < props.hostStartedAt
+                  ? h("span", { className: "mkt_meta" }, "重启已生效")
+                  : h("button", {
+                    className: "mkt_btn mkt_btnPrimary mkt_btnSm",
+                    disabled: props.restarting === true,
+                    onClick: props.onRestart,
+                  }, props.restarting ? "重启中…" : "重启 dsh 生效"))
               : job.status === "failed" && !(job.needsApproval && job.needsApproval.length > 0)
                 ? h("div", { className: "mkt_error" }, "失败，见下方输出")
                 : null,
@@ -567,6 +639,11 @@ window.__ModuleLoader__.load({
       var _restarting = useState(false);
       var restarting = _restarting[0];
       var setRestarting = _restarting[1];
+      // 本次宿主进程的启动时间（jobs 端点带回）：完成时间早于它的任务，
+      // 其「重启 dsh 生效」按钮已经兑现，改显示「重启已生效」。
+      var _hostStartedAt = useState(0);
+      var hostStartedAt = _hostStartedAt[0];
+      var setHostStartedAt = _hostStartedAt[1];
       var _preflight = useState(null);
       var preflight = _preflight[0];
       var setPreflight = _preflight[1];
@@ -724,6 +801,14 @@ window.__ModuleLoader__.load({
 
       useEffect(function () {
         doSearch();
+        // 挂载即恢复任务面板（见 useJobPolling.restore 的注释）：重挂载丢掉
+        // 的完成提醒、重启按钮、暂停中的批准卡片都从后端拉回来。
+        // hostStartedAt：本次宿主进程的启动时间——早于它的完成任务说明
+        // 重启已经发生，按钮要换成「重启已生效」而不是再催一次。
+        call("jobs", {}).then(function (value) {
+          if (value.hostStartedAt) setHostStartedAt(value.hostStartedAt);
+          polling.restore(value.jobs);
+        }).catch(function () { /* 恢复失败不阻塞面板 */ });
         // eslint-disable-next-line react-hooks/exhaustive-deps
       }, []);
 
@@ -748,14 +833,14 @@ window.__ModuleLoader__.load({
         });
       }, [call, track]);
 
-      var doApprove = useCallback(function (spec, names, token) {
+      var doApprove = useCallback(function (spec, names, token, carryFromId) {
         var extra = { allowBuildScripts: names };
         var apprToken = token || approvalTokensRef.current[spec];
         if (apprToken) {
           extra.approvalToken = apprToken;
           delete approvalTokensRef.current[spec];
         }
-        doRawInstall(spec, extra);
+        doRawInstall(spec, extra, carryFromId);
       }, [doRawInstall]);
 
       // 预检落定后的去向：safe 直接续装，其余出内联风险卡片。
@@ -912,6 +997,7 @@ window.__ModuleLoader__.load({
           onDrop: dropJob,
           onRestart: doRestart,
           restarting: restarting,
+          hostStartedAt: hostStartedAt,
           approving: Object.keys(installing).filter(function (s) { return installing[s]; })[0],
         }),
         preflight ? h(PreflightCard, {

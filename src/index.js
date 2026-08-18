@@ -144,6 +144,13 @@ export function computeProfileFingerprint(profileDir) {
 const compatCache = new Map();
 const COMPAT_TTL = 600000;
 
+// When this plugin instance loaded — for a host process this is effectively the
+// host's start time (the loader mounts plugins at boot). Sent with `jobs` so a
+// remounted client can tell "completed, restart still pending" from "completed
+// and the restart already happened": a finishedAt older than this value means
+// the task's Restart-dsh button has already done its job.
+const pluginLoadedAt = Date.now();
+
 function compatCacheGet(key) {
   const cached = compatCache.get(key);
   if (cached === undefined) return undefined;
@@ -918,6 +925,13 @@ export function createJobTracker({ producerFactory } = {}) {
       const record = records.get(String(jobId));
       if (record === undefined) throw new Error(`unknown install job ${JSON.stringify(String(jobId))}`);
       const isSameSession = record.surface !== "browser" || (record.session !== "" && record.session === session);
+      const delta = typeof record.readOutput === "function"
+        ? record.readOutput()
+        : typeof record.producer?.readOutput === "function" ? record.producer.readOutput() : "";
+      // Accumulate the drained deltas so `list` can restore the full log after a
+      // remount: the polling client drains destructively, so without this the
+      // backend would hold no history at all.
+      record.log = String(record.log ?? "") + delta;
       return {
         snapshot: {
           id: record.id,
@@ -933,10 +947,46 @@ export function createJobTracker({ producerFactory } = {}) {
           startedAt: record.startedAt,
           finishedAt: record.finishedAt,
         },
-        output: typeof record.readOutput === "function"
-          ? record.readOutput()
-          : typeof record.producer?.readOutput === "function" ? record.producer.readOutput() : "",
+        output: delta,
       };
+    },
+
+    /**
+     * Every live record as {id, snapshot, output}, oldest first — for a freshly
+     * mounted client to restore its task panel. The install of a plugin whose
+     * bundle patch rewrites cordis.patch.yml replays the assembly tree and
+     * remounts this very UI mid-flight, dropping every React state; the backend
+     * records survive (1h/20-entry prune), so the remounted panel can show the
+     * finished task, its log, and the restart button instead of going blank
+     * with no signal at all (real incident: an update finished, the panel
+     * vanished, and the user learned it worked only by checking versions after
+     * a manual restart). Session visibility mirrors get(); dismissed records
+     * are skipped — "清空" must survive a remount too.
+     */
+    list(session) {
+      const out = [];
+      for (const record of records.values()) {
+        if (record.dismissed === true) continue;
+        const isSameSession = record.surface !== "browser" || (record.session !== "" && record.session === session);
+        out.push({
+          id: record.id,
+          snapshot: {
+            id: record.id,
+            kind: record.kind,
+            label: record.label,
+            status: record.status,
+            detail: record.detail,
+            needsApproval: record.needsApproval,
+            approvalToken: isSameSession ? record.approvalToken : undefined,
+            extras: isSameSession ? record.extras : undefined,
+            spec: record.spec,
+            startedAt: record.startedAt,
+            finishedAt: record.finishedAt,
+          },
+          output: String(record.log ?? ""),
+        });
+      }
+      return out;
     },
 
     cancel(jobId, session) {
@@ -969,6 +1019,9 @@ export function createJobTracker({ producerFactory } = {}) {
       if (record.surface === "browser" && (record.session === "" || record.session !== session)) {
         return false;
       }
+      // Marked, not deleted: `list` (panel restore after a remount) skips these,
+      // so a cleared panel stays cleared across remounts.
+      record.dismissed = true;
       if (record.approvalToken) {
         invalidateApprovalToken(record.approvalToken, record.session || undefined, record.surface);
         record.approvalToken = undefined;
@@ -1478,6 +1531,17 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
       try {
         const session = requireBrowserSession(payload?.session);
         return rpcOk(tracker.get(payload?.jobId, session));
+      } catch (error) {
+        return rpcFail(error);
+      }
+    }
+    case "jobs": {
+      // Panel restore for a freshly mounted client: an install that rewrites
+      // cordis.patch.yml replays the assembly tree and remounts this UI,
+      // dropping all React state. The task records live here.
+      try {
+        const session = requireBrowserSession(payload?.session);
+        return rpcOk({ jobs: tracker.list(session), hostStartedAt: pluginLoadedAt });
       } catch (error) {
         return rpcFail(error);
       }
@@ -2290,6 +2354,52 @@ export async function runSelfTests() {
     check("相同 session dismiss job 成功且 token 被注销", dismissSame === true);
     const snapAfterDismiss = sessionTracker.get(sessionJobId, "session-alpha").snapshot;
     check("dismiss 后 job snapshot 中 approvalToken 为 undefined", snapAfterDismiss.approvalToken === undefined);
+
+    // ── 5b. list（重挂载恢复）：日志累积、dismissed 过滤、session 隔离 ────────
+    // 安装事务改写 cordis.patch.yml 会让 dsh 重放装配树、市场 UI 整体重挂载，
+    // 前端 state 全丢。任务记录在后端活着——list 就是恢复通道：drain 过的
+    // 日志增量必须已在后端累积成全量，「清空」过的条目不得被拉回。
+    {
+      const pendingLines = ["line-a\n", "line-b\n"];
+      const lineProducer = {
+        cancel: () => {},
+        done: Promise.resolve({ status: "completed", detail: "done" }),
+        readOutput: () => pendingLines.shift() ?? "",
+      };
+      const listTracker = createJobTracker({ producerFactory: () => lineProducer });
+      const listJobId = listTracker.start({
+        profile: "web",
+        spec: "log-pkg",
+        profileDir,
+        surface: "browser",
+        session: "session-alpha",
+      });
+      await new Promise((resolvePromise) => setImmediate(resolvePromise));
+      const drain1 = listTracker.get(listJobId, "session-alpha").output;
+      const drain2 = listTracker.get(listJobId, "session-alpha").output;
+      const restoredJob = listTracker.list("session-alpha").find((entry) => entry.id === listJobId);
+      check(
+        "list 恢复全量日志（drain 过的增量在后端累积成完整历史）",
+        drain1 === "line-a\n" && drain2 === "line-b\n"
+          && restoredJob !== undefined
+          && restoredJob.output === "line-a\nline-b\n"
+          && restoredJob.snapshot.status === "completed"
+          && restoredJob.snapshot.spec === "log-pkg",
+        JSON.stringify({ drain1, drain2, restored: restoredJob?.output }),
+      );
+      const crossSessionJob = listTracker.list("session-beta").find((entry) => entry.id === listJobId);
+      check(
+        "list 对异 session 不暴露 approvalToken/extras（与 get 同规格）",
+        crossSessionJob !== undefined
+          && crossSessionJob.snapshot.approvalToken === undefined
+          && crossSessionJob.snapshot.extras === undefined,
+      );
+      listTracker.dismiss(listJobId, "session-alpha");
+      check(
+        "dismiss 后 list 不再返回该条（「清空」跨重挂载存活）",
+        listTracker.list("session-alpha").every((entry) => entry.id !== listJobId),
+      );
+    }
 
     // ── 6. Windows profile names & restart plan ──────────────────────────────
     check("合法 profile 名称识别", isSafeProfileName("web", true) && isSafeProfileName("profile_1", true) && isSafeProfileName("dev-test", true));
