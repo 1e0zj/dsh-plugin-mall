@@ -132,6 +132,23 @@ function isBundlePackage(packageName, profileDir) {
 }
 
 /**
+ * The version of `packageName` as it exists in the profile right now, or
+ * undefined when it is absent or its manifest is unreadable. Transitive
+ * packages count: the build gate is about what is on disk, not about what the
+ * profile declares.
+ */
+export function installedVersionOf(packageName, profileDir) {
+  const path = packageJsonPathOf(packageName, profileDir);
+  if (path === undefined) return undefined;
+  try {
+    const version = JSON.parse(readFileSync(path, "utf8"))?.version;
+    return typeof version === "string" && version.length > 0 ? version : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Classify an installed package by its `dsh` declaration:
  * `bundle` (a profile patch layer), `client` (a browser-side UI plugin),
  * `plain` (a plain dependency), or `missing` (not resolvable).
@@ -641,12 +658,51 @@ export function mergeAllowBuilds(content, names) {
 }
 
 /**
- * Neutralize allowBuilds in pnpm-workspace.yaml so that all lifecycle scripts
- * are strictly blocked by pnpm on the initial install.
+ * Split an allowBuilds key into its package name and the spec pnpm matched it
+ * by, if the key carries one. `node-pty` → name only; `node-pty@1.1.0` and
+ * `pkg@file:../pkg` → name plus spec. Mirrors the selector parsing in
+ * {@link parseIgnoredBuilds}, because these two have to agree on what a key
+ * refers to or an approval will be preserved against the wrong package.
+ */
+function splitBuildSelector(key) {
+  const text = String(key ?? "");
+  const suffix = /@(?:([\w.+-]+)|https?:\/\/\S+|file:\S+|link:\S+|github:\S+)$/.exec(text);
+  if (suffix === null) return NPM_NAME_RE.test(text) ? { name: text } : undefined;
+  const name = text.slice(0, suffix.index);
+  return NPM_NAME_RE.test(name) ? { name, spec: text.slice(suffix.index + 1) } : undefined;
+}
+
+/**
+ * Neutralize allowBuilds in pnpm-workspace.yaml so that pnpm strictly blocks
+ * the lifecycle scripts of everything this transaction introduces.
+ *
+ * The property being defended is narrow: a package that is NEW to this install
+ * must not run scripts on the strength of an approval the user gave to some
+ * earlier package. Wiping the whole allow-list enforced that — and also
+ * re-blocked packages that were already installed and already approved, which
+ * had nothing to do with the install in flight. Installing an unrelated plugin
+ * then re-asked about, say, `node-pty` pulled in months ago by a different
+ * plugin, with the disclosure card correctly but uselessly reporting it as "a
+ * transitive dependency — NOT the package you asked for".
+ *
+ * That is worse than noise. An approval prompt that fires on every install for
+ * a package the user never chose is the fastest way to train people to approve
+ * without reading, which is the entire value of the gate.
+ *
+ * So preserve exactly the approvals that cannot cover anything new: a package
+ * already on disk, still at the version it was approved at. Bare-name keys are
+ * pinned to the installed version on the way in (`node-pty` →
+ * `node-pty@1.1.0`), so the same transaction pulling a DIFFERENT version of an
+ * approved package still meets a closed gate. Anything whose installed version
+ * cannot be established is dropped — fail closed, the user is asked again.
+ *
  * @param content - current pnpm-workspace.yaml contents.
+ * @param resolveInstalledVersion - `(name) => version | undefined` for what is
+ *   on disk right now; omitted (tests, callers without a profile) drops every
+ *   approval, which is the old all-or-nothing behaviour.
  * @returns the neutralized workspace yaml.
  */
-export function neutralizeWorkspaceContent(content) {
+export function neutralizeWorkspaceContent(content, resolveInstalledVersion) {
   const source = typeof content === "string" ? content : DEFAULT_WORKSPACE_YAML;
   let parsed;
   try {
@@ -658,10 +714,44 @@ export function neutralizeWorkspaceContent(content) {
   if (typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("pnpm-workspace.yaml root must be a mapping");
   }
-  parsed.allowBuilds = {};
+  parsed.allowBuilds = preserveInstalledApprovals(parsed.allowBuilds, resolveInstalledVersion);
   parsed.onlyBuiltDependencies = [];
   parsed.dangerouslyAllowAllBuilds = false;
   return dump(parsed, { lineWidth: -1, noRefs: true, sortKeys: false });
+}
+
+/**
+ * The subset of `current` that provably cannot authorize anything new, keyed by
+ * the selector pnpm will match. See {@link neutralizeWorkspaceContent}.
+ */
+function preserveInstalledApprovals(current, resolveInstalledVersion) {
+  if (typeof resolveInstalledVersion !== "function") return {};
+  const approvedKeys = Array.isArray(current)
+    ? current.map((entry) => String(entry))
+    : current !== null && typeof current === "object"
+      ? Object.entries(current).filter(([, value]) => value === true).map(([key]) => key)
+      : [];
+  const preserved = {};
+  for (const key of approvedKeys) {
+    const parsedKey = splitBuildSelector(key);
+    if (parsedKey === undefined) continue;
+    let installed;
+    try {
+      installed = resolveInstalledVersion(parsedKey.name);
+    } catch {
+      continue; // 读不出来就当没批准过——失败方向朝「再问一次」
+    }
+    if (typeof installed !== "string" || installed.length === 0) continue;
+    if (parsedKey.spec === undefined) {
+      // 裸名：钉到当前已装版本，别让同一次事务换上来的新版本蹭到。
+      preserved[`${parsedKey.name}@${installed}`] = true;
+    } else if (parsedKey.spec === installed) {
+      preserved[key] = true;
+    }
+    // 非 registry 的 selector（file:/link:/github:）对不上已装版本号，
+    // 无法证明它只覆盖眼下这一份，一律丢弃重问。
+  }
+  return preserved;
 }
 
 /** Enable exactly the selectors pnpm itself reported while every broad build
@@ -1516,10 +1606,17 @@ function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, pref
   }
 
   // Neutralize existing allowBuilds before every first pnpm add so strict-dep-builds
-  // always blocks candidate lifecycle scripts regardless of pre-existing workspace policy.
+  // blocks the lifecycle scripts of everything this transaction introduces,
+  // regardless of pre-existing workspace policy. Approvals for packages already
+  // on disk are pinned to their installed version and kept — they cannot cover
+  // anything new, and re-asking about them on every unrelated install is how a
+  // consent gate gets trained into a reflex. See neutralizeWorkspaceContent.
   try {
     if (originalWorkspaceBytes !== undefined) {
-      const neutralized = neutralizeWorkspaceContent(originalWorkspaceBytes.toString("utf8"));
+      const neutralized = neutralizeWorkspaceContent(
+        originalWorkspaceBytes.toString("utf8"),
+        (name) => installedVersionOf(name, profileDir),
+      );
       writeYamlChecked(workspacePath, neutralized, "pnpm-workspace.yaml");
     } else {
       writeYamlChecked(workspacePath, DEFAULT_WORKSPACE_YAML, "pnpm-workspace.yaml");
@@ -2014,6 +2111,102 @@ function runAllowBuildsFixtures() {
     if (!ok && out !== undefined) console.log(`       产出:\n${out.split("\n").map((l) => `       | ${l}`).join("\n")}`);
     if (!ok && error !== undefined) console.log(`       抛错: ${error.message}`);
   }
+  failed += runNeutralizeFixtures();
+  return failed;
+}
+
+// ── neutralizeWorkspaceContent：保留哪些批准 ────────────────────────────────
+//
+// 实测确定的 pnpm 11 行为，这组用例建立在它之上：
+//   - allowBuilds 里 registry 包用裸名或 `name@version` 都能放行；
+//   - `file:`/`link:` 依赖只认 pnpm 自己的完整 selector，裸名无效；
+//   - allowBuilds 被清空后，pnpm 会重新报树里**任何**带脚本的包，
+//     哪怕这次安装跟它毫无关系 —— 这正是 node-pty 反复弹窗的来源。
+//
+// 所以这里钉的是范围：已装且版本未变的批准要留下（并钉上版本），
+// 其余一律丢弃。丢弃的方向是「再问一次」，永远不是「默默放行」。
+const NEUTRALIZE_FIXTURES = [
+  {
+    label: "已装且已批准（裸名）→ 保留，并钉到已装版本",
+    content: "packages:\n  - .\nallowBuilds:\n  node-pty: true\n",
+    installed: { "node-pty": "1.1.0" },
+    check: (d) => d.allowBuilds["node-pty@1.1.0"] === true && d.allowBuilds["node-pty"] === undefined,
+  },
+  {
+    label: "已装且已批准（带版本且一致）→ 原样保留",
+    content: "packages:\n  - .\nallowBuilds:\n  'node-pty@1.1.0': true\n",
+    installed: { "node-pty": "1.1.0" },
+    check: (d) => d.allowBuilds["node-pty@1.1.0"] === true,
+  },
+  {
+    label: "批准的版本与已装版本不符 → 丢弃（升级必须重新批准）",
+    content: "packages:\n  - .\nallowBuilds:\n  'node-pty@1.0.0': true\n",
+    installed: { "node-pty": "1.1.0" },
+    check: (d) => Object.keys(d.allowBuilds).length === 0,
+  },
+  {
+    label: "批准过但树里没有 → 丢弃（新引入的同名包不许蹭）",
+    content: "packages:\n  - .\nallowBuilds:\n  node-pty: true\n",
+    installed: {},
+    check: (d) => Object.keys(d.allowBuilds).length === 0,
+  },
+  {
+    label: "序列形态的 allowBuilds 同样按已装版本钉住",
+    content: "packages:\n  - .\nallowBuilds:\n  - 'node-pty'\n  - 'esbuild'\n",
+    installed: { "node-pty": "1.1.0" },
+    check: (d) => d.allowBuilds["node-pty@1.1.0"] === true && Object.keys(d.allowBuilds).length === 1,
+  },
+  {
+    label: "值不是 true 的未决占位符 → 不算批准",
+    content: "packages:\n  - .\nallowBuilds:\n  node-pty: set this to true or false\n",
+    installed: { "node-pty": "1.1.0" },
+    check: (d) => Object.keys(d.allowBuilds).length === 0,
+  },
+  {
+    label: "file: selector 无法与版本号对应 → 丢弃重问",
+    content: "packages:\n  - .\nallowBuilds:\n  'pkg@file:../pkg': true\n",
+    installed: { pkg: "1.0.0" },
+    check: (d) => Object.keys(d.allowBuilds).length === 0,
+  },
+  {
+    label: "不传解析器 → 退回全清（老行为，绝不放宽）",
+    content: "packages:\n  - .\nallowBuilds:\n  node-pty: true\n",
+    installed: undefined,
+    check: (d) => Object.keys(d.allowBuilds).length === 0,
+  },
+  {
+    label: "解析器抛错 → 当作没批准过",
+    content: "packages:\n  - .\nallowBuilds:\n  node-pty: true\n",
+    resolver: () => { throw new Error("node_modules unreadable"); },
+    check: (d) => Object.keys(d.allowBuilds).length === 0,
+  },
+  {
+    label: "两个广义开关始终关闭",
+    content: "packages:\n  - .\ndangerouslyAllowAllBuilds: true\nonlyBuiltDependencies:\n  - anything\n",
+    installed: { "node-pty": "1.1.0" },
+    check: (d) => d.dangerouslyAllowAllBuilds === false && Array.isArray(d.onlyBuiltDependencies) && d.onlyBuiltDependencies.length === 0,
+  },
+  {
+    label: "其余键原样保留（不碰用户的别的设置）",
+    content: "packages:\n  - .\nnodeLinker: hoisted\nminimumReleaseAgeExclude:\n  - 'a@1.0.0'\nallowBuilds:\n  node-pty: true\n",
+    installed: { "node-pty": "1.1.0" },
+    check: (d) => d.nodeLinker === "hoisted" && d.minimumReleaseAgeExclude[0] === "a@1.0.0",
+  },
+];
+
+function runNeutralizeFixtures() {
+  let failed = 0;
+  for (const fx of NEUTRALIZE_FIXTURES) {
+    const resolver = fx.resolver ?? (fx.installed === undefined ? undefined : (name) => fx.installed[name]);
+    let ok;
+    try {
+      ok = fx.check(load(neutralizeWorkspaceContent(fx.content, resolver))) === true;
+    } catch {
+      ok = false;
+    }
+    if (!ok) failed++;
+    console.log(`  ${ok ? "PASS" : "FAIL"} neutralize: ${fx.label}`);
+  }
   return failed;
 }
 
@@ -2443,47 +2636,124 @@ async function runTransactionFixtures() {
     }
   }
 
-  // 1d. 攻击防御：profile 预先存在的 allowBuilds: true 无法绕过首次审批警告
-  {
+  // 1d. 攻击防御：预先存在的 allowBuilds 不能替**新东西**盖章。
+  //
+  // 这条原本断言的是「任何预先存在的 allowBuilds 一律不认」。那个范围太宽：
+  // 它同时把「早已落盘、早已批准、这次根本没动」的包也重新拦下，于是装任何
+  // 不相干的插件都会为 node-pty 之类的传递依赖再弹一次审批卡。一个每次安装
+  // 都因为你没选的包而弹的同意框，训练出来的是无脑点同意——恰好摧毁这道闸
+  // 在它本职场景里的作用。
+  //
+  // 所以守的边界改成：**盖章只对「此刻就在盘上、且这次装完还是同一份」的包
+  // 有效**。下面两条钉住它拦得住的、一条钉住它该放行的；三条都同时验证两个
+  // 广义开关被强制关闭、事后恢复用户原本的 workspace 字节。
+  // 时序很要紧：neutralize 在 pnpm 跑之前决定放行名单，那一刻本次事务要装的
+  // 东西还没落盘。所以「新包」在决策点上就是「盘上没有」，这两条照这个时序
+  // 模拟——由 scriptedSpawn 的 beforeExit 扮演 pnpm 把包装上去。
+  const preexistingAllowCases = [
+    {
+      label: "本次新引入的包 → 预先盖的章无效，仍触发审批闸",
+      preinstalled: undefined,           // 决策点上盘里没有
+      reported: "evil-script-pkg@1.0.0", // pnpm 装完后报的
+      landed: "1.0.0",
+      expectPins: {},                    // 章被丢弃
+    },
+    {
+      label: "已批准的包被本次升级 → 旧章只钉住旧版本，新版本仍被拦",
+      preinstalled: "1.0.0",             // 决策点上是 1.0.0，章有效
+      reported: "evil-script-pkg@1.1.0", // 但装上来的是 1.1.0
+      landed: "1.1.0",
+      expectPins: { "evil-script-pkg@1.0.0": true },
+    },
+  ];
+  for (const testCase of preexistingAllowCases) {
     const { profileDir, cleanup } = makeTempProfile("bypass-preexisting-allow");
     try {
       const initialWs = "packages:\n  - .\n\nallowBuilds:\n  evil-script-pkg: true\nonlyBuiltDependencies:\n  - evil-script-pkg\ndangerouslyAllowAllBuilds: true\n\nnodeLinker: hoisted\n";
       writeFileSync(join(profileDir, "pnpm-workspace.yaml"), initialWs);
       materializeFakePackage(profileDir, "some-plugin", "1.0.0");
-      materializeFakePackage(profileDir, "evil-script-pkg", "1.0.0", { postinstall: "node evil.js" });
+      if (testCase.preinstalled !== undefined) {
+        materializeFakePackage(profileDir, "evil-script-pkg", testCase.preinstalled, { postinstall: "node evil.js" });
+      }
 
       let firstProbeWorkspace;
       const { spawnFn, calls } = scriptedSpawn([
         {
           code: 0,
-          out: "Ignored build scripts: evil-script-pkg@1.0.0\n",
+          out: `Ignored build scripts: ${testCase.reported}\n`,
           beforeExit: () => {
             firstProbeWorkspace = load(readFileSync(join(profileDir, "pnpm-workspace.yaml"), "utf8"));
+            // pnpm 此刻把包落盘（新装或升级），披露据此计算。
+            materializeFakePackage(profileDir, "evil-script-pkg", testCase.landed, { postinstall: "node evil.js" });
           },
         },
       ]);
-      const producer = runInstall({
+      const outcome = await runInstall({
         profile: "p",
         spec: "some-plugin",
         preflight: preflightStub("some-plugin"),
         _profileDir: profileDir,
         _spawn: spawnFn,
         _describe: describeStub,
-      });
-      const outcome = await producer.done;
+      }).done;
       const finalWs = readFileSync(join(profileDir, "pnpm-workspace.yaml"), "utf8");
       check(
-        "攻击防御：预先存在的 allowBuilds 在首轮被中和 → 依然触发审批闸，且事后恢复用户原本的 workspace 字节",
+        `攻击防御：${testCase.label}（且两个广义开关强制关闭、事后恢复原字节）`,
         outcome.status === "failed"
           && Array.isArray(outcome.needsApproval)
           && outcome.needsApproval.some((e) => e.name === "evil-script-pkg")
           && calls.length === 1
-          && Object.keys(firstProbeWorkspace?.allowBuilds ?? {}).length === 0
+          && JSON.stringify(firstProbeWorkspace?.allowBuilds) === JSON.stringify(testCase.expectPins)
           && Array.isArray(firstProbeWorkspace?.onlyBuiltDependencies)
           && firstProbeWorkspace.onlyBuiltDependencies.length === 0
           && firstProbeWorkspace?.dangerouslyAllowAllBuilds === false
           && finalWs === initialWs,
-        `status=${outcome.status} calls=${calls.length} finalWs=${JSON.stringify(finalWs)}`,
+        `status=${outcome.status} calls=${calls.length} allowBuilds=${JSON.stringify(firstProbeWorkspace?.allowBuilds)} needsApproval=${JSON.stringify(outcome.needsApproval?.map((e) => `${e.name}@${e.version}`))} wsSame=${finalWs === initialWs}`,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+
+  // 1d-b. 该放行的那一侧：已落盘、已批准、版本没变的包，装别的东西时不再重问。
+  // 交给 pnpm 的是钉了版本的 selector，所以同一次事务若换上另一个版本，
+  // 那个版本并不在放行名单里。
+  {
+    const { profileDir, cleanup } = makeTempProfile("preserve-installed-allow");
+    try {
+      const initialWs = "packages:\n  - .\n\nallowBuilds:\n  native-pkg: true\ndangerouslyAllowAllBuilds: true\n\nnodeLinker: hoisted\n";
+      writeFileSync(join(profileDir, "pnpm-workspace.yaml"), initialWs);
+      materializeFakePackage(profileDir, "some-plugin", "1.0.0");
+      materializeFakePackage(profileDir, "native-pkg", "1.1.0", { install: "node build.js" });
+
+      let firstProbeWorkspace;
+      const { spawnFn, calls } = scriptedSpawn([
+        {
+          code: 0,
+          out: "Done\n",
+          beforeExit: () => {
+            firstProbeWorkspace = load(readFileSync(join(profileDir, "pnpm-workspace.yaml"), "utf8"));
+          },
+        },
+      ]);
+      const outcome = await runInstall({
+        profile: "p",
+        spec: "some-plugin",
+        preflight: preflightStub("some-plugin"),
+        _profileDir: profileDir,
+        _spawn: spawnFn,
+        _describe: describeStub,
+      }).done;
+      const finalWs = readFileSync(join(profileDir, "pnpm-workspace.yaml"), "utf8");
+      check(
+        "已装且版本未变的批准被保留（钉到已装版本），装不相干的包不再重弹审批",
+        outcome.status === "completed"
+          && calls.length === 1
+          && firstProbeWorkspace?.allowBuilds?.["native-pkg@1.1.0"] === true
+          && firstProbeWorkspace?.allowBuilds?.["native-pkg"] === undefined
+          && firstProbeWorkspace?.dangerouslyAllowAllBuilds === false
+          && finalWs === initialWs,
+        `status=${outcome.status} detail=${outcome.detail} allowBuilds=${JSON.stringify(firstProbeWorkspace?.allowBuilds)}`,
       );
     } finally {
       cleanup();
