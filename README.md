@@ -92,7 +92,7 @@ profile's pending-install marker before starting the command after `--`:
 Limitations: the grace window is the probation period — a failure that only surfaces **after** it (a plugin that crashes minutes in, or on a specific interaction) cannot be rolled back automatically, because committing deletes the active snapshot and `guard recover` then has nothing to restore. `guard validate` still diagnoses the on-disk state, but a post-commit failure needs manual repair — uninstall and reinstall the plugin, or restore a backup you kept separately. Both commands do only **static on-disk validation**; neither proves the plugin actually loads. A corrupt pending marker fails closed: the command is not launched and no unvalidated path is deleted. Preserve the snapshot and repair or restore a trustworthy marker, then run `guard recover`; quarantine the marker only after you have independently verified the profile, or decided to abandon automatic recovery.
 
 
-## dsh won't start after an update? (affects 0.2.0 – 0.3.2)
+## dsh won't start after an update? (affects 0.2.0 – 0.3.2, fixed in 0.3.3)
 
 Symptom: `dsh web` exits with `cannot resolve profile bundle "<package>"`.
 
@@ -117,7 +117,8 @@ pnpm --dir <profile> add "github:omdsh-dev/dsh-at-file" --ignore-scripts
 > fallback refuses `^` (a cmd metacharacter) and skips `github:` entirely, and
 > pnpm writes nearly every dependency with one or the other — so the fallback
 > never fires and recovery fails closed. Fixed on main: the fallback now pins the
-> version (or commit) the lockfile resolved. Ships in the next release.
+> version (or commit) the lockfile resolved. Fixed in 0.3.3 — on that version
+> `dsh-plugin-guard recover` does repair this.
 
 
 ## Agent tools
@@ -238,7 +239,7 @@ node <profile>/node_modules/@1e0zj/dsh-plugin-mall/src/cli.js guard launch --pro
 限制：缓刑期就是观察期——**之后**才暴露的故障（跑了几分钟才崩、或某个特定操作才触发）无法自动回滚：提交会删掉当前快照，此时 `guard recover` 已无可恢复的东西。`guard validate` 仍能诊断落盘状态，但提交之后的故障只能手工修复——卸载并重装插件（或恢复你另行保留的备份）。两条命令都只做**静态落盘校验**，都不证明插件真的能加载。pending 标记损坏时关闭式失败：不启动命令、不删除任何未校验路径。要**保留快照**、修复或恢复一个可信的标记后再跑 `guard recover`；只有在你已经独立核实过 profile、或决定放弃自动恢复之后，才去隔离（删除/移走）标记。
 
 
-## 升级后 dsh 起不来？（0.2.0 – 0.3.2 受影响）
+## 升级后 dsh 起不来？（0.2.0 – 0.3.2 受影响，0.3.3 已修复）
 
 症状：`dsh web` 报 `cannot resolve profile bundle "<包名>"` 直接退出。
 
@@ -259,7 +260,8 @@ pnpm --dir <profile> add "github:omdsh-dev/dsh-at-file" --ignore-scripts
 > 别指望 0.3.2 的 `dsh-plugin-guard recover` 修这个：它的 per-package 兜底会
 > 拒掉 `^`（cmd 转义符），`github:` 更是整个跳过，而 pnpm 存依赖几乎不是前者
 > 就是后者——兜底一次也不会触发，恢复只会 fail-closed。main 上已修：兜底改钉
-> lockfile 解析出的版本（或 commit），随下一版发布。
+> lockfile 解析出的版本（或 commit）。0.3.3 已修复——那个版本的
+> `dsh-plugin-guard recover` 确实能修这个故障。
 
 
 ## 工作原理
