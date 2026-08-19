@@ -1511,26 +1511,43 @@ export function pendingApprovalPaused(pending) {
 }
 
 /**
+ * Validate the pending marker, let `mutate` edit its metadata, write it back.
+ * The whole read-mutate-write sits under ONE try: the marker can disappear or
+ * be replaced between the validating read and the write (an install pausing
+ * while startup recovery consumes the same marker), and a pause mark is never
+ * worth turning that race into a thrown error in the middle of an install.
+ * Both callers below promise a boolean, so the failure is reported that way.
+ * @param mutate - returns true when it changed something worth persisting.
+ * @returns true when the marker was rewritten; false when there was nothing to
+ *   do or anything failed — never creates or heals a marker.
+ */
+function updatePendingMarkerMetadata(profileDir, mutate) {
+  try {
+    if (readValidatedPendingSnapshot(profileDir) === undefined) return false;
+    const markerPath = pendingPath(profileDir);
+    const marker = readJson(markerPath);
+    if (marker === null || typeof marker !== "object") return false;
+    // Validation above already guarantees metadata is a plain object.
+    const metadata = marker.metadata ?? {};
+    if (mutate(metadata) !== true) return false;
+    marker.metadata = metadata;
+    writeFileSync(markerPath, JSON.stringify(marker, undefined, 2) + "\n");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Mark the profile's existing pending marker as paused at the approval gate.
  * @returns true when a marker was marked; false when there is nothing to mark
  *   (no marker) or it fails validation (fail closed — never create or heal one).
  */
 export function markPendingApprovalPause(profileDir, reason = "paused for build-script approval") {
-  let pending;
-  try {
-    pending = readValidatedPendingSnapshot(profileDir);
-  } catch {
-    return false;
-  }
-  if (pending === undefined) return false;
-  const markerPath = pendingPath(profileDir);
-  const marker = readJson(markerPath);
-  if (marker === null || typeof marker !== "object") return false;
-  const metadata = marker.metadata ?? {};
-  metadata.paused = { reason, at: Date.now() };
-  marker.metadata = metadata;
-  writeFileSync(markerPath, JSON.stringify(marker, undefined, 2) + "\n");
-  return true;
+  return updatePendingMarkerMetadata(profileDir, (metadata) => {
+    metadata.paused = { reason, at: Date.now() };
+    return true;
+  });
 }
 
 /**
@@ -1539,22 +1556,13 @@ export function markPendingApprovalPause(profileDir, reason = "paused for build-
  * @returns true when a mark was removed, false when there was none to remove.
  */
 export function clearPendingApprovalPause(profileDir) {
-  let pending;
-  try {
-    pending = readValidatedPendingSnapshot(profileDir);
-  } catch {
-    return false;
-  }
-  if (pending === undefined || pendingApprovalPaused(pending) === undefined) return false;
-  const markerPath = pendingPath(profileDir);
-  const marker = readJson(markerPath);
-  if (marker === null || typeof marker !== "object") return false;
-  if (marker.metadata !== null && typeof marker.metadata === "object") {
-    delete marker.metadata.paused;
-    writeFileSync(markerPath, JSON.stringify(marker, undefined, 2) + "\n");
+  return updatePendingMarkerMetadata(profileDir, (metadata) => {
+    // Same notion of "a mark exists" as pendingApprovalPaused: a non-object
+    // reads as not paused, so there is nothing to clear.
+    if (metadata.paused === null || typeof metadata.paused !== "object") return false;
+    delete metadata.paused;
     return true;
-  }
-  return false;
+  });
 }
 
 export function recoverProfile(profileDir) {
