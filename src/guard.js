@@ -1570,6 +1570,50 @@ export function pendingApprovalPaused(pending) {
 }
 
 /**
+ * How the profile looked BEFORE a paused install began, for the one package
+ * that install is about, or undefined when nothing is paused (or the snapshot
+ * cannot be read, in which case callers should leave their own view alone).
+ *
+ * A paused transaction has already written its half: `pnpm add` swapped
+ * node_modules/<name> to the new version and the manifest declares it, but the
+ * build scripts were never approved, dsh has not loaded any of it, and the next
+ * startup rolls the whole thing back. Reporting that half-state as "installed"
+ * inverts the truth for the user — an UPDATE shows the new version number while
+ * the old one is what is actually running and what a restart will restore. So
+ * the marketplace lists this package the way the snapshot has it instead:
+ *
+ *   present: true  — it was already installed (an update). Show `version`, the
+ *                    version the snapshot's lockfile pins: what runs now and
+ *                    what a restart goes back to.
+ *   present: false — it was not installed at all (a fresh install). It should
+ *                    not appear in the list; nothing about it took effect.
+ *
+ * @returns {{name: string, present: boolean, spec?: string, version?: string}|undefined}
+ */
+export function pausedCandidateBeforeState(profileDir) {
+  let pending;
+  try {
+    pending = readValidatedPendingSnapshot(profileDir);
+  } catch {
+    return undefined;
+  }
+  if (pending === undefined || pendingApprovalPaused(pending) === undefined) return undefined;
+  const name = pending.preflight?.candidate?.name ?? pending.candidate?.name;
+  if (typeof name !== "string" || name.length === 0) return undefined;
+  let spec;
+  try {
+    // The snapshot's manifest — not the live one, which the paused install
+    // already rewrote — decides whether this package existed beforehand.
+    spec = readJson(join(pending.dir, "package.json"))?.dependencies?.[name];
+  } catch {
+    return undefined; // unreadable snapshot: do not touch the caller's view
+  }
+  if (spec === undefined) return { name, present: false };
+  // The snapshot's lockfile pins what that install would have kept running.
+  return { name, present: true, spec, version: pinnedLockfileVersion(pending.dir, name) };
+}
+
+/**
  * Validate the pending marker, let `mutate` edit its metadata, write it back.
  * The whole read-mutate-write sits under ONE try: the marker can disappear or
  * be replaced between the validating read and the write (an install pausing
@@ -1934,6 +1978,56 @@ async function selfTest() {
       if (readJson(join(p, "package.json")).dependencies?.good !== undefined) throw new Error("rollback must restore the pre-install manifest (no candidate)");
       if (existsSync(join(p, "node_modules", "good"))) throw new Error("rollback must prune the never-approved candidate");
       if (readPendingSnapshot(p) !== undefined) throw new Error("the rolled-back pause must consume its marker");
+    }
+
+    // pausedCandidateBeforeState: what the marketplace must SHOW while an
+    // install sits paused. The half-written profile says the new version is
+    // installed; the truth is that nothing took effect and a restart undoes it.
+    {
+      // An UPDATE: the package existed before, so the list keeps showing the
+      // version that is actually running — the snapshot's pinned one.
+      const p = join(root, "profiles", "paused-view-update");
+      mkdirSync(join(p, "node_modules", "good"), { recursive: true });
+      writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: { good: "^1.0.0" } }));
+      writeFileSync(join(p, "cordis.patch.yml"), "[]\n");
+      writeFileSync(join(p, "pnpm-lock.yaml"), [
+        "lockfileVersion: '9.0'", "importers:", "  .:", "    dependencies:",
+        "      good:", "        specifier: ^1.0.0", "        version: 1.0.0", "",
+      ].join("\n"));
+      writeFileSync(join(p, "node_modules", "good", "package.json"), JSON.stringify({ name: "good", version: "1.0.0" }));
+      const snap = createProfileSnapshot(p, { spec: "good@2.0.0" });
+      markPendingSnapshot(snap, { spec: "good@2.0.0", preflight: { candidate: { name: "good", version: "2.0.0", kind: "plain" } } });
+      if (pausedCandidateBeforeState(p) !== undefined) throw new Error("a marker with no pause mark must not rewrite the view");
+      // The paused half: pnpm already swapped in 2.0.0 and the manifest says so.
+      writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: { good: "^2.0.0" } }));
+      writeFileSync(join(p, "node_modules", "good", "package.json"), JSON.stringify({ name: "good", version: "2.0.0" }));
+      markPendingApprovalPause(p);
+      const view = pausedCandidateBeforeState(p);
+      if (view?.name !== "good" || view.present !== true) throw new Error(`a paused update must report the package as previously present, got ${JSON.stringify(view)}`);
+      if (view.version !== "1.0.0") throw new Error(`the reported version must be the snapshot's pin (what actually runs), got ${JSON.stringify(view.version)}`);
+      if (view.spec !== "^1.0.0") throw new Error(`the reported spec must be the snapshot's, got ${JSON.stringify(view.spec)}`);
+      rmSync(pendingPath(p), { force: true });
+      rmSync(snap.dir, { recursive: true, force: true });
+    }
+    {
+      // A FRESH install: the package did not exist before, so it must drop out
+      // of the list entirely — nothing about it took effect.
+      const p = join(root, "profiles", "paused-view-fresh");
+      mkdirSync(join(p, "node_modules"), { recursive: true });
+      writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: {} }));
+      writeFileSync(join(p, "cordis.patch.yml"), "[]\n");
+      const snap = createProfileSnapshot(p, { spec: "good@2.0.0" });
+      markPendingSnapshot(snap, { spec: "good@2.0.0", preflight: { candidate: { name: "good", version: "2.0.0", kind: "plain" } } });
+      writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: { good: "^2.0.0" } }));
+      mkdirSync(join(p, "node_modules", "good"), { recursive: true });
+      writeFileSync(join(p, "node_modules", "good", "package.json"), JSON.stringify({ name: "good", version: "2.0.0" }));
+      markPendingApprovalPause(p);
+      const view = pausedCandidateBeforeState(p);
+      if (view?.name !== "good" || view.present !== false) throw new Error(`a paused fresh install must report the package as absent beforehand, got ${JSON.stringify(view)}`);
+      if (view.version !== undefined) throw new Error("an absent package has no version to show");
+      rmSync(pendingPath(p), { force: true });
+      rmSync(snap.dir, { recursive: true, force: true });
+      if (pausedCandidateBeforeState(p) !== undefined) throw new Error("no marker means no view rewrite");
     }
 
     // Approval-pause mark, part 2: a cleared mark (token retry resumed and

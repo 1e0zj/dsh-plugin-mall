@@ -16,7 +16,7 @@ import { createHash } from "node:crypto";
 import { dump, load } from "js-yaml";
 import { DEFAULT_PROFILE_BUNDLES, PROFILE_TEMPLATES, initProfile, resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
 import { describeBuildScripts, npmNameOf } from "./github.js";
-import { clearPendingApprovalPause, commitPendingSnapshot, createProfileSnapshot, markPendingApprovalPause, markPendingSnapshot, pnpmGuardEnv, pnpmSpawnPlan, readValidatedPendingSnapshot, rollbackPendingSnapshot } from "./guard.js";
+import { clearPendingApprovalPause, commitPendingSnapshot, createProfileSnapshot, markPendingApprovalPause, markPendingSnapshot, pausedCandidateBeforeState, pendingApprovalPaused, pnpmGuardEnv, pnpmSpawnPlan, readValidatedPendingSnapshot, rollbackPendingSnapshot } from "./guard.js";
 
 // ── spec normalization ──────────────────────────────────────────────────────
 
@@ -188,7 +188,20 @@ export function reconcileBundles(profileDir, beforeDeps = new Set()) {
   return result;
 }
 
-/** List a profile's installed plugins (dependencies with classification + version). */
+/**
+ * List a profile's installed plugins (dependencies with classification +
+ * version).
+ *
+ * An install paused at the build-script approval gate is reported as the
+ * snapshot has it, not as the half-written profile has it: the candidate's
+ * scripts were never approved, dsh has not loaded it, and the next startup
+ * rolls it back, so calling it "installed" tells the user the opposite of what
+ * is true — an update would show the NEW version while the old one is what is
+ * actually running and what a restart restores. A paused fresh install drops
+ * out of the list entirely. Every consumer goes through here (the browser's
+ * installed panel, the `updates` check that decides whether an update button
+ * appears, and the `market_installed` agent tool), so they all agree.
+ */
 export function listInstalled(profile) {
   const dir = resolveProfileDir(profile);
   const manifestPath = join(dir, "package.json");
@@ -209,7 +222,13 @@ export function listInstalled(profile) {
     }
     return { name, version, kind };
   });
-  return { dir, deps };
+  const before = pausedCandidateBeforeState(dir);
+  if (before === undefined) return { dir, deps };
+  if (!before.present) return { dir, deps: deps.filter((dep) => dep.name !== before.name) };
+  return {
+    dir,
+    deps: deps.map((dep) => (dep.name === before.name ? { ...dep, version: before.version ?? "?" } : dep)),
+  };
 }
 
 // ── npm registry resolution ─────────────────────────────────────────────────
@@ -1455,12 +1474,19 @@ function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, pref
   try {
     existingMarker = readValidatedPendingSnapshot(profileDir);
   } catch (error) {
-    return failedNow(`profile has an unreadable pending marker — refusing to install ${spec} (${error.message}); run \`dsh-plugin-guard guard recover\` first`);
+    return failedNow(`profile 里有一个读不出来的安装记录，无法判断它是什么，因此拒绝安装 ${spec}（${error.message}）。请先运行 \`dsh-plugin-guard guard recover\` 处理它。`);
   }
   if (existingMarker !== undefined) {
     const previous = existingMarker.metadata?.spec ?? existingMarker.metadata?.packageName ?? "unknown";
     if (existingMarker.operation !== "install" || existingMarker.metadata?.spec !== spec) {
-      return failedNow(`profile has a pending ${existingMarker.operation} transaction for ${JSON.stringify(previous)} — refusing to install ${spec}; restart dsh (startup recovery) or run \`dsh-plugin-guard guard recover\` first`);
+      // 拒绝是对的（marker 是一次性事务，不能被覆盖），但用户看不见 marker，
+      // 所以要说清楚挡路的是什么、以及怎么让它让开。暂停在批准闸的那种最
+      // 常见——它正是用户刚点过取消的那次安装。
+      const paused = pendingApprovalPaused(existingMarker) !== undefined;
+      const what = existingMarker.operation === "remove" ? "卸载" : "安装";
+      return failedNow(paused
+        ? `${previous} 的${what}还没做完——它停在「允许安装依赖」那一步等你决定，没有批准就不会真正装上。现在无法安装 ${spec}。重启 dsh 会撤回那次未批准的${what}，之后就能重新操作；也可以运行 \`dsh-plugin-guard guard recover\` 立即撤回。`
+        : `${previous} 的${what}还没了结，现在无法安装 ${spec}。重启 dsh 会自动了结它（装好的提交、没批准的撤回），也可以运行 \`dsh-plugin-guard guard recover\` 手动处理。`);
     }
     push(`[dsh-plugin-mall] resuming the paused install transaction for ${spec} — its original snapshot stays the rollback target\n`);
     // 事务复活：清掉暂停标记，否则重试成功后的启动提交会被它拦下错误回滚。
@@ -1800,7 +1826,9 @@ function runRemoveInner({ profile, packageName, _profileDir, _spawn }, selfHeale
   // hard as a valid one, and is left untouched for the recovery path.
   const markerPath = pendingMarkerPath(profileDir);
   if (existsSync(markerPath)) {
-    return failedNow(`profile "${profile}" has a pending install transaction (${markerPath}) — refusing to remove ${packageName} until it is resolved; restart dsh (startup recovery) or run \`dsh-plugin-guard guard recover\` first`);
+    // 存在性判断（同 markPendingSnapshot）：坏 marker 也照样挡路。所以这里
+    // 只能拿到「有」而拿不到「是什么」，文案相应保持笼统，但仍要给出路。
+    return failedNow(`profile "${profile}" 里有一个还没了结的安装事务，在它了结之前无法卸载 ${packageName}。重启 dsh 会自动了结它（装好的提交、没批准的撤回），也可以运行 \`dsh-plugin-guard guard recover\` 手动处理（事务记录：${markerPath}）。`);
   }
   const manifestPath = join(profileDir, "package.json");
   if (!existsSync(manifestPath)) {
@@ -2199,6 +2227,29 @@ async function runTransactionFixtures() {
         })(),
       );
 
+      // 1a-ter. 暂停期间装别的包：拒绝是对的（marker 是一次性事务），但用户
+      // 看不见 marker，所以报错必须点名挡路的是那次「停在允许安装依赖」的
+      // 安装，并给出让它让开的办法。这里 marker 仍带 paused。
+      {
+        const during = scriptedSpawn([{ code: 0, out: "Done\n" }]);
+        const duringOutcome = await runInstall({
+          profile: "p",
+          spec: "other-during-pause",
+          preflight: preflightStub("other-during-pause"),
+          _profileDir: profileDir,
+          _spawn: during.spawnFn,
+          _describe: async () => [],
+        }).done;
+        check(
+          "暂停期间装别的包 → 拒绝，且报错点名「停在允许安装依赖」并给出撤回办法",
+          duringOutcome.status === "failed"
+            && /停在「允许安装依赖」/.test(duringOutcome.detail ?? "")
+            && /重启 dsh/.test(duringOutcome.detail ?? "")
+            && during.calls.length === 0,
+          `status=${duringOutcome.status} detail=${(duringOutcome.detail ?? "").slice(0, 120)}`,
+        );
+      }
+
       // 1a-bis. 同 spec 重试接管暂停的 marker：不再新建快照（回滚目标仍是
       // 第一次安装前的现场），继续 spawn pnpm；这次给批准后的成功路径——
       // completed 后 marker 保留给启动提交，且暂停标记必须已被接管清掉
@@ -2243,9 +2294,12 @@ async function runTransactionFixtures() {
           _describe: async () => [],
         }).done;
         check(
-          "异 spec 遇暂停 marker → 拒绝且不 spawn",
+          // 此刻 paused 已被上面的接管清掉，所以报错走的是「未了结」那一支，
+          // 而不是「停在允许安装依赖」那一支。
+          "异 spec 遇既有（已非暂停）marker → 拒绝且不 spawn",
           otherOutcome.status === "failed"
-            && /pending install transaction/.test(otherOutcome.detail ?? "")
+            && /还没了结/.test(otherOutcome.detail ?? "")
+            && !/停在「允许安装依赖」/.test(otherOutcome.detail ?? "")
             && other.calls.length === 0,
           `status=${otherOutcome.status} calls=${other.calls.length}`,
         );
@@ -2612,7 +2666,7 @@ async function runTransactionFixtures() {
       check(
         "损坏/既有 pending marker → install 不 spawn、不覆盖证据、不遗留新 snapshot",
         outcome.status === "failed"
-          && /unreadable pending marker/.test(outcome.detail ?? "")
+          && /读不出来的安装记录/.test(outcome.detail ?? "")
           && calls.length === 0
           && readFileSync(marker, "utf8") === corruptBytes
           && leftoverSnapshots.length === 0,
@@ -2635,7 +2689,7 @@ async function runTransactionFixtures() {
       check(
         "pending marker 存在 → remove 拒绝执行且不 spawn pnpm，marker 保留",
         outcome.status === "failed"
-          && /pending install transaction/.test(outcome.detail ?? "")
+          && /还没了结的安装事务/.test(outcome.detail ?? "")
           && procs.length === 0
           && existsSync(pendingMarkerPath(profileDir)),
         `status=${outcome.status} procs=${procs.length} ${JSON.stringify(outcome.detail)}`,
