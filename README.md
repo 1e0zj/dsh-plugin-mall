@@ -2,7 +2,7 @@
 
 **An open plugin marketplace for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh): search every GitHub repo tagged `topic:dsh-plugin`, automatically verify which ones are real dsh plugins, install and update with one click.**
 
-[中文说明](#中文说明) · [Install](#install) · [Why another marketplace](#why-another-marketplace)
+[中文说明](#中文说明) · [Install](#install) · [Why another marketplace](#why-another-marketplace) · [Roadmap](ROADMAP.md)
 
 Two surfaces: a **Settings → Plugins → Marketplace** tab in the dsh web UI, and five agent tools usable from any session.
 
@@ -136,6 +136,8 @@ pnpm --dir <profile> add "github:omdsh-dev/dsh-at-file" --ignore-scripts
 # 中文说明
 
 **dsh 插件市场** — 搜索 GitHub `dsh-plugin` 话题下的 DeepSeek Harness 插件仓库，自动验证哪些是真 dsh 插件，一键安装与更新。
+
+[路线图](ROADMAP.md)（安全 > 便捷 > 精简，以及明确不做的）
 
 与策展列表不同：**任何打上 `topic:dsh-plugin` 的仓库推送后立即可被发现**——无需投稿、无需审批。为保证开放性可用，做了这些事：
 
