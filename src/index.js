@@ -25,7 +25,7 @@ import { tmpdir } from "node:os";
 import { resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
 import { repoInfo, searchPlugins, verifyPlugins, cachedRepoManifest, fetchRawFile, preferNpmSpec, npmPackageInfo, compareVersions, assertSafeToInstall, mapLimit, NETWORK_CONCURRENCY } from "./github.js";
 import { ensureProfile, listInstalled, normalizeSpec, runInstall, runRemove, assertSafeSpec, resolveRegistry, serializeCanonicalProof, persistPluginDisabled } from "./installer.js";
-import { preflightInstall, inspectRemoteCandidate, recoverProfile } from "./guard.js";
+import { preflightInstall, inspectRemoteCandidate, recoverProfile, describeRollbackRebuild } from "./guard.js";
 
 export const name = "@1e0zj/dsh-plugin-mall";
 // `loader` 用来读装配树、并对单个 entry 做热开关（entry.update）。读法照抄
@@ -829,6 +829,9 @@ export function createJobTracker({ producerFactory } = {}) {
           record.status = status;
           record.detail = outcome?.detail;
           record.needsApproval = outcome?.needsApproval;
+          // 原因活不过一次重启的失败（被别的未了结事务挡住）：浏览器据此在
+          // 重启后撤掉记录，而不是把一段现在时的描述留在面板上当现状读。
+          record.staleOnRestart = outcome?.staleOnRestart === true;
           record.finishedAt = Date.now();
 
           if (status === "completed") {
@@ -940,6 +943,7 @@ export function createJobTracker({ producerFactory } = {}) {
           status: record.status,
           detail: record.detail,
           needsApproval: record.needsApproval,
+          staleOnRestart: record.staleOnRestart,
           approvalToken: isSameSession ? record.approvalToken : undefined,
           // extras（如预检结论）同样只对同一 session 可见，与 approvalToken 同规格。
           extras: isSameSession ? record.extras : undefined,
@@ -977,6 +981,7 @@ export function createJobTracker({ producerFactory } = {}) {
             status: record.status,
             detail: record.detail,
             needsApproval: record.needsApproval,
+            staleOnRestart: record.staleOnRestart,
             approvalToken: isSameSession ? record.approvalToken : undefined,
             extras: isSameSession ? record.extras : undefined,
             spec: record.spec,
@@ -1636,6 +1641,11 @@ export function apply(ctx, config = {}) {
       console.log(`[dsh-plugin-mall] startup recovery: committed the pending install for profile "${defaultProfile}"`);
     } else if (result.action === "rolled-back") {
       console.warn(`[dsh-plugin-mall] startup recovery: rolled back the pending install for profile "${defaultProfile}" — ${result.reason ?? "profile failed validation"}`);
+      // What the rebuild did, when it did anything. A rollback that relinked a
+      // package used to be silent, so a reconcile that silently no-opped and a
+      // fallback add that saved the profile looked exactly alike afterwards.
+      const rebuild = describeRollbackRebuild(result.rebuild);
+      if (rebuild !== undefined) console.warn(`[dsh-plugin-mall] startup recovery: node_modules rebuild — ${rebuild}`);
     }
   } catch (error) {
     // 恢复失败绝不能拖垮插件加载：报出来，让市场照常可用（用户还能手动

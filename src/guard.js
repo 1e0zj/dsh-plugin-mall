@@ -1008,6 +1008,32 @@ function addedDependencyNames(pending, originalDependencies = pending?.dependenc
 // that used to live there. Restoring manifest + lockfile is then only half the
 // job: the tree must be rebuilt from the restored lockfile, or the profile is
 // left declaring a dependency nothing provides.
+//
+// WHEN the reconcile short-circuits (the reason the per-package add fallback
+// below exists at all). pnpm decides "up to date" by comparing its virtual
+// store bookkeeping (node_modules/.pnpm/lock.yaml) against the profile's
+// pnpm-lock.yaml — and reconcileNodeModules deletes node_modules/<name>
+// WITHOUT touching either. So the outcome hinges on how far the failed install
+// got before the rollback:
+//
+//   pnpm add SUCCEEDED (e.g. it installed the new version and only then
+//     stopped at the build-script approval gate) — .pnpm/lock.yaml already
+//     records the new version, the restored pnpm-lock.yaml records the old
+//     one, they disagree, pnpm does the work and relinks the old copy. The
+//     fallback never runs.
+//
+//   pnpm add FAILED EARLY (or never ran) — .pnpm/lock.yaml still matches the
+//     restored pnpm-lock.yaml, so pnpm answers `install --frozen` with exit 0
+//     and does nothing while the package it was asked about is gone. Only the
+//     per-package add relinks it.
+//
+// This is why an approval-pause rollback is the WRONG scenario to validate the
+// fallback with: it is precisely the branch that never reaches it (confirmed on
+// a real profile — reconcile exit 0, package restored, fallback untouched). To
+// exercise it, reproduce the second row: install the package, leave
+// .pnpm/lock.yaml in agreement with pnpm-lock.yaml, mark a pending UPDATE
+// transaction, and roll back without running any pnpm in between. Both the `^`
+// range and the github: pinning paths were verified that way.
 
 /**
  * Env for any pnpm the guard (or its callers) spawns: peer auto-install stays
@@ -1062,26 +1088,86 @@ function fallbackAddArgs(target) {
 }
 
 /**
- * The argv target for a fallback `pnpm add` of one restored dependency, or
- * undefined when that spec cannot be added offline and safely. Semver ranges
- * become `name@range`, local file:/link: paths add by the spec itself;
- * github:/git+ specs need the network or git and stay fail-closed, and
- * anything carrying shell metacharacters (a multi-clause range like
- * `^1.0.0 || ^2.0.0` contains spaces and pipes) is skipped — the
- * shell-wrapped pnpm spawn joins argv with spaces without quoting.
+ * The lockfile's pinned resolution for one direct dependency, or undefined. In
+ * a rollback the lockfile has just been restored from the snapshot, so this IS
+ * the exact thing the rollback is trying to get back — not a guess. For a
+ * semver dependency it is the resolved version (`0.13.1`); for a git-hosted one
+ * it is the resolved tarball URL carrying the commit sha, which is precisely
+ * what makes a moving `github:` spec pinnable.
+ *
+ * Only the profile's own importer (`.`) is read — a dsh profile is a single
+ * package, never a workspace. A version carrying pnpm's peer suffix
+ * (`1.2.3(react@18.0.0)`, emitted when a peer is resolved from inside the
+ * project) is not a legal add spec; it is returned as-is and the caller's
+ * assertSafeSpec rejects it on the parens, so the fallback fails closed rather
+ * than adding something wrong. Profiles install with auto-install-peers off and
+ * take their peers from the host, so this has not been observed in practice.
  */
-function fallbackAddTarget(name, spec) {
-  const range = String(spec ?? "");
-  if (range.length === 0) return undefined;
-  const isLocal = /^(?:file:|link:)/i.test(range);
-  if (!isLocal && validRange(range) === null) return undefined;
-  const target = isLocal ? range : `${name}@${range}`;
+function pinnedLockfileVersion(profileDir, name) {
   try {
-    assertSafeSpec(target);
+    const doc = load(readFileSync(join(profileDir, "pnpm-lock.yaml"), "utf8"));
+    const version = doc?.importers?.["."]?.dependencies?.[name]?.version;
+    return typeof version === "string" && version.length > 0 ? version : undefined;
   } catch {
     return undefined;
   }
-  return target;
+}
+
+/** The target when it survives the spec blacklist, undefined when it does not. */
+function safeAddTarget(target) {
+  try {
+    assertSafeSpec(target);
+    return target;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The argv target for a fallback `pnpm add` of one restored dependency, or
+ * undefined when that spec cannot be added offline and safely.
+ *
+ * - `file:`/`link:` paths add by the spec itself: a local path is not a moving
+ *   target, it names one fixed thing.
+ * - `github:owner/repo` MUST be pinned to the lockfile's resolution and is
+ *   never added by the spec itself. A bare github spec means "whatever HEAD is
+ *   now", but a rollback needs "what I had" — and the freshest thing in pnpm's
+ *   resolution cache and store is exactly the commit the failed update just
+ *   fetched, i.e. the version being rolled back FROM. Adding the bare spec
+ *   would relink that commit, and candidateRestoredCompatible cannot catch it:
+ *   a non-semver spec has no range to check, so a present package passes on
+ *   name alone. The rollback would then clear the marker and delete the
+ *   snapshot, leaving node_modules on the rejected version, the lockfile
+ *   claiming the old one, and no recovery evidence at all — a fail-OPEN worse
+ *   than not trying. The pinned tarball URL carries the commit sha, so pnpm
+ *   either relinks that exact commit from the store or exits nonzero.
+ * - Semver ranges: `name@range` only when the range carries no shell
+ *   metacharacters — and `^` (the near-universal pnpm save prefix!) is one
+ *   (cmd's escape character: it mangles the argv through the shell-wrapped
+ *   spawn, so assertSafeSpec refuses it). For those — including multi-clause
+ *   ranges like `^1.0.0 || ^2.0.0` — the target becomes
+ *   `name@<lockfile pinned version>`: the lockfile is the authority this
+ *   rollback just restored, so its pinned version is by definition a legal
+ *   restore target for any range.
+ *
+ * Everything that cannot be pinned stays fail-closed (marker + snapshot kept
+ * for `guard recover` or manual repair), which is the whole point: an unpinned
+ * guess is not a recovery.
+ */
+function fallbackAddTarget(name, spec, profileDir) {
+  const range = String(spec ?? "");
+  if (range.length === 0) return undefined;
+  if (/^(?:file:|link:)/i.test(range)) return safeAddTarget(range);
+  const isGit = /^github:/i.test(range);
+  if (!isGit) {
+    if (validRange(range) === null) return undefined;
+    // A shell-safe range splices directly; `^` and friends fall through.
+    const direct = safeAddTarget(`${name}@${range}`);
+    if (direct !== undefined) return direct;
+  }
+  const pinned = pinnedLockfileVersion(profileDir, name);
+  if (pinned === undefined) return undefined;
+  return safeAddTarget(`${name}@${pinned}`);
 }
 
 /**
@@ -1263,6 +1349,14 @@ export function rollbackPendingSnapshot(profileDir) {
   // newly added candidate (absent from the restored manifest) needs nothing
   // reinstalled: removing its node_modules entry above is sufficient.
   // Without a lockfile a frozen install can never succeed, so it is skipped.
+  // What the rebuild actually did, reported back to the caller. A successful
+  // rollback used to be completely silent: reconcile and the per-package add
+  // leave no trace, so after the fact nobody can tell which one relinked the
+  // package — or whether either ran at all. That matters here more than usual,
+  // because the add fallback exists precisely for the case where reconcile
+  // silently no-ops, and "the profile looks right afterwards" does not
+  // distinguish the two.
+  const rebuild = { reconcile: undefined, fallback: [] };
   let attempt;
   if (isRemove) {
     // A failed/no-op remove commonly leaves the original direct package fully
@@ -1277,6 +1371,7 @@ export function rollbackPendingSnapshot(profileDir) {
   } else if (wasUpdate && pending.files?.["pnpm-lock.yaml"]?.present === true) {
     attempt = runReconcileInstall(profileDir);
   }
+  if (attempt !== undefined) rebuild.reconcile = { exitCode: attempt.exitCode };
 
   // Before clearing marker/snapshot after rollback, strictly verify ALL
   // direct dependencies declared by the restored manifest exist in that
@@ -1302,15 +1397,21 @@ export function rollbackPendingSnapshot(profileDir) {
     // whatever pnpm wrote: the add is only the means to relink node_modules,
     // the snapshot stays authoritative for the declaration files.
     for (const depName of [...unsatisfied]) {
-      const target = fallbackAddTarget(depName, restoredDependencies[depName]);
-      if (target === undefined) continue; // not offline-addable — fail closed below
+      const target = fallbackAddTarget(depName, restoredDependencies[depName], profileDir);
+      if (target === undefined) {
+        // Not offline-addable (an unpinnable spec, no lockfile entry) — record
+        // the refusal too, it is the reason the throw below is about to fire.
+        rebuild.fallback.push({ name: depName, target: undefined, exitCode: undefined, restored: false });
+        continue; // fail closed below
+      }
       const addAttempt = runFallbackAdd(profileDir, target);
+      let restored = false;
       if (addAttempt.exitCode === 0) {
         restoreProfileSnapshot(pending);
-        if (candidateRestoredCompatible(profileDir, depName, restoredDependencies[depName])) {
-          unsatisfied.splice(unsatisfied.indexOf(depName), 1);
-        }
+        restored = candidateRestoredCompatible(profileDir, depName, restoredDependencies[depName]);
+        if (restored) unsatisfied.splice(unsatisfied.indexOf(depName), 1);
       }
+      rebuild.fallback.push({ name: depName, target, exitCode: addAttempt.exitCode, restored });
     }
   }
 
@@ -1334,7 +1435,25 @@ export function rollbackPendingSnapshot(profileDir) {
 
   rmSync(pendingPath(profileDir), { force: true });
   rmSync(pending.dir, { recursive: true, force: true });
-  return pending;
+  return { ...pending, rebuild };
+}
+
+/**
+ * One line describing what a rollback's node_modules rebuild did, or undefined
+ * when there was nothing to rebuild (a fresh install's rollback only prunes).
+ * Kept next to the producer so the CLI and the plugin's startup recovery report
+ * it identically.
+ */
+export function describeRollbackRebuild(rebuild) {
+  if (rebuild === null || typeof rebuild !== "object") return undefined;
+  const parts = [];
+  if (rebuild.reconcile !== undefined) parts.push(`reconcile exit ${rebuild.reconcile.exitCode}`);
+  for (const entry of rebuild.fallback ?? []) {
+    parts.push(entry.target === undefined
+      ? `add ${entry.name}: refused (no pinnable offline target)`
+      : `add ${entry.target}: exit ${entry.exitCode}${entry.restored ? ", restored" : ", NOT restored"}`);
+  }
+  return parts.length > 0 ? parts.join("; ") : undefined;
 }
 
 // ── pending-snapshot recovery (startup + external CLI) ───────────────────────
@@ -1426,11 +1545,149 @@ export function validateRemoveCompletion(profileDir, candidateName) {
  * @param profileDir - the profile directory (may come straight from the marker).
  * @returns {{action: "none"|"committed"|"rolled-back", issues?, removed?}}
  */
+// ── approval-pause mark ──────────────────────────────────────────────────────
+//
+// A needsApproval pause otherwise lives only in console output: the marker
+// carries no trace of it, so a restart that passes the STATIC validation would
+// commit the new version with its build scripts never approved — a natively
+// built plugin is then left installed-but-broken and the rollback snapshot is
+// deleted. Both recovery commit points (recoverProfile here, cli.js's
+// commitLaunchSnapshot) must check this mark and roll back instead.
+//
+// Deliberately NOT mirrored into snapshot.json (it is written before the
+// transaction begins and cannot know about a later pause) and NOT a
+// SNAPSHOT_VERSION bump (a bump would fail-close every marker already written
+// by earlier versions, pushing users from auto-recoverable to manual).
+// sanitizeSnapshot ignores unknown metadata fields, so a missing `paused`
+// simply reads as "not paused" and old markers keep their behavior. Tampering
+// with the mark is fail-safe: forging it forces a rollback (refuses the new
+// plugin); deleting it restores the pre-mark behavior.
+
+/** The pause record on a validated pending marker, or undefined. */
+export function pendingApprovalPaused(pending) {
+  const paused = pending?.metadata?.paused;
+  return paused !== null && typeof paused === "object" ? paused : undefined;
+}
+
+/**
+ * How the profile looked BEFORE a paused install began, for the one package
+ * that install is about, or undefined when nothing is paused (or the snapshot
+ * cannot be read, in which case callers should leave their own view alone).
+ *
+ * A paused transaction has already written its half: `pnpm add` swapped
+ * node_modules/<name> to the new version and the manifest declares it, but the
+ * build scripts were never approved, dsh has not loaded any of it, and the next
+ * startup rolls the whole thing back. Reporting that half-state as "installed"
+ * inverts the truth for the user — an UPDATE shows the new version number while
+ * the old one is what is actually running and what a restart will restore. So
+ * the marketplace lists this package the way the snapshot has it instead:
+ *
+ *   present: true  — it was already installed (an update). Show `version`, the
+ *                    version the snapshot's lockfile pins: what runs now and
+ *                    what a restart goes back to.
+ *   present: false — it was not installed at all (a fresh install). It should
+ *                    not appear in the list; nothing about it took effect.
+ *
+ * @returns {{name: string, present: boolean, spec?: string, version?: string}|undefined}
+ */
+export function pausedCandidateBeforeState(profileDir) {
+  let pending;
+  try {
+    pending = readValidatedPendingSnapshot(profileDir);
+  } catch {
+    return undefined;
+  }
+  if (pending === undefined || pendingApprovalPaused(pending) === undefined) return undefined;
+  const name = pending.preflight?.candidate?.name ?? pending.candidate?.name;
+  if (typeof name !== "string" || name.length === 0) return undefined;
+  let spec;
+  try {
+    // The snapshot's manifest — not the live one, which the paused install
+    // already rewrote — decides whether this package existed beforehand.
+    spec = readJson(join(pending.dir, "package.json"))?.dependencies?.[name];
+  } catch {
+    return undefined; // unreadable snapshot: do not touch the caller's view
+  }
+  if (spec === undefined) return { name, present: false };
+  // The snapshot's lockfile pins what that install would have kept running.
+  return { name, present: true, spec, version: pinnedLockfileVersion(pending.dir, name) };
+}
+
+/**
+ * Validate the pending marker, let `mutate` edit its metadata, write it back.
+ * The whole read-mutate-write sits under ONE try: the marker can disappear or
+ * be replaced between the validating read and the write (an install pausing
+ * while startup recovery consumes the same marker), and a pause mark is never
+ * worth turning that race into a thrown error in the middle of an install.
+ * Both callers below promise a boolean, so the failure is reported that way.
+ * @param mutate - returns true when it changed something worth persisting.
+ * @returns true when the marker was rewritten; false when there was nothing to
+ *   do or anything failed — never creates or heals a marker.
+ */
+function updatePendingMarkerMetadata(profileDir, mutate) {
+  try {
+    if (readValidatedPendingSnapshot(profileDir) === undefined) return false;
+    const markerPath = pendingPath(profileDir);
+    const marker = readJson(markerPath);
+    if (marker === null || typeof marker !== "object") return false;
+    // Validation above already guarantees metadata is a plain object.
+    const metadata = marker.metadata ?? {};
+    if (mutate(metadata) !== true) return false;
+    marker.metadata = metadata;
+    writeFileSync(markerPath, JSON.stringify(marker, undefined, 2) + "\n");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Mark the profile's existing pending marker as paused at the approval gate.
+ * @returns true when a marker was marked; false when there is nothing to mark
+ *   (no marker) or it fails validation (fail closed — never create or heal one).
+ */
+export function markPendingApprovalPause(profileDir, reason = "paused for build-script approval") {
+  return updatePendingMarkerMetadata(profileDir, (metadata) => {
+    metadata.paused = { reason, at: Date.now() };
+    return true;
+  });
+}
+
+/**
+ * Clear the approval-pause mark: a token retry resumed the transaction, so its
+ * eventual completion must commit normally instead of being rolled back.
+ * @returns true when a mark was removed, false when there was none to remove.
+ */
+export function clearPendingApprovalPause(profileDir) {
+  return updatePendingMarkerMetadata(profileDir, (metadata) => {
+    // Same notion of "a mark exists" as pendingApprovalPaused: a non-object
+    // reads as not paused, so there is nothing to clear.
+    if (metadata.paused === null || typeof metadata.paused !== "object") return false;
+    delete metadata.paused;
+    return true;
+  });
+}
+
 export function recoverProfile(profileDir) {
   const pending = readValidatedPendingSnapshot(profileDir);
   if (pending === undefined) return { action: "none" };
-  const validation = validateInstalledProfile(profileDir);
   const isRemove = pending.operation === "remove";
+  // 批准闸暂停后被放弃：静态校验过得去也不许提交——那会把「构建脚本从未
+  // 批准」的新版本以已提交状态留下（原生构建插件装着但坏），且快照被删、
+  // 回滚目标消失。一律回滚到第一次安装前。
+  const pause = pendingApprovalPaused(pending);
+  if (!isRemove && pause !== undefined) {
+    const rolled = rollbackPendingSnapshot(profileDir);
+    return {
+      action: "rolled-back",
+      reason: "批准闸暂停后被放弃（构建脚本未获批准），已回滚到安装前状态",
+      issues: [issue("warn", "approval-paused-abandoned", "批准闸暂停后被放弃，已回滚",
+        `安装停在构建脚本批准处未被批准（${pause.reason}），profile 已回滚到安装前状态`)],
+      removed: addedDependencyNames(pending),
+      rebuild: rolled?.rebuild,
+    };
+  }
+  const validation = validateInstalledProfile(profileDir);
   const candidateName = pending.preflight?.candidate?.name ?? pending.candidate?.name;
   const removeValidation = isRemove
     ? validateRemoveCompletion(pending.profileDir, candidateName)
@@ -1441,8 +1698,20 @@ export function recoverProfile(profileDir) {
   }
   const recoveryIssues = [...validation.issues, ...removeValidation.issues];
   const added = isRemove ? [] : addedDependencyNames(pending);
-  rollbackPendingSnapshot(profileDir);
-  return { action: "rolled-back", issues: recoveryIssues, removed: added };
+  const rolled = rollbackPendingSnapshot(profileDir);
+  // The blockers are the reason; naming them beats the old generic wording,
+  // which said "profile failed validation" for every rollback including the
+  // ones that were not validation failures at all.
+  const blockers = recoveryIssues.filter((entry) => entry.severity === "block");
+  return {
+    action: "rolled-back",
+    reason: blockers.length > 0
+      ? `profile 静态校验未通过：${blockers.map((entry) => entry.title).join("; ")}`
+      : "profile 静态校验未通过",
+    issues: recoveryIssues,
+    removed: added,
+    rebuild: rolled?.rebuild,
+  };
 }
 
 /** Recover every profile with a pending marker under a dsh home. */
@@ -1680,6 +1949,105 @@ async function selfTest() {
       if (rec.action !== "committed") throw new Error(`recoverProfile should commit a healthy install, got ${rec.action}`);
       if (readPendingSnapshot(p) !== undefined) throw new Error("recoverProfile commit should clear the marker");
       if (existsSync(snap.dir)) throw new Error("recoverProfile commit should delete the snapshot dir");
+    }
+
+    // Approval-pause mark, part 1: a paused marker must NEVER commit on
+    // recovery — not even when the static validation would pass (the version
+    // sits there with its build scripts never approved; committing would drop
+    // the only rollback snapshot). Recovery rolls back to the pre-install
+    // state. Layout: the candidate is a NEW dependency (snapshot has none), so
+    // the rollback only prunes node_modules and never spawns pnpm.
+    {
+      const p = join(root, "profiles", "approval-pause");
+      mkdirSync(join(p, "node_modules", "good"), { recursive: true });
+      writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: {} }));
+      writeFileSync(join(p, "cordis.patch.yml"), "[]\n");
+      if (markPendingApprovalPause(p) !== false) throw new Error("markPendingApprovalPause without a marker must return false, not create one");
+      const snap = createProfileSnapshot(p, { fixture: true });
+      markPendingSnapshot(snap, { spec: "good@2.0.0", preflight: { candidate: { name: "good", version: "2.0.0", kind: "bundle" } } });
+      // 暂停现场：pnpm 已把候选装上、声明也写了——静态校验完全过得去，
+      // 这正是危险所在（提交 = 脚本从未批准的版本以已提交状态留下）。
+      writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: { good: "^2.0.0" } }));
+      writeFileSync(join(p, "node_modules", "good", "package.json"), JSON.stringify({ name: "good", version: "2.0.0" }));
+      if (markPendingApprovalPause(p) !== true) throw new Error("markPendingApprovalPause must mark an existing marker");
+      const pausedMarker = readJson(pendingPath(p));
+      if (pausedMarker?.metadata?.paused?.reason !== "paused for build-script approval") throw new Error("the pause mark must persist on the marker file");
+      const recPaused = recoverProfile(p);
+      if (recPaused.action !== "rolled-back") throw new Error(`a paused marker must roll back even when validation would pass, got ${recPaused.action}`);
+      if (!recPaused.issues.some((entry) => entry.code === "approval-paused-abandoned")) throw new Error("the rollback must carry the approval-paused-abandoned issue");
+      if (readJson(join(p, "package.json")).dependencies?.good !== undefined) throw new Error("rollback must restore the pre-install manifest (no candidate)");
+      if (existsSync(join(p, "node_modules", "good"))) throw new Error("rollback must prune the never-approved candidate");
+      if (readPendingSnapshot(p) !== undefined) throw new Error("the rolled-back pause must consume its marker");
+    }
+
+    // pausedCandidateBeforeState: what the marketplace must SHOW while an
+    // install sits paused. The half-written profile says the new version is
+    // installed; the truth is that nothing took effect and a restart undoes it.
+    {
+      // An UPDATE: the package existed before, so the list keeps showing the
+      // version that is actually running — the snapshot's pinned one.
+      const p = join(root, "profiles", "paused-view-update");
+      mkdirSync(join(p, "node_modules", "good"), { recursive: true });
+      writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: { good: "^1.0.0" } }));
+      writeFileSync(join(p, "cordis.patch.yml"), "[]\n");
+      writeFileSync(join(p, "pnpm-lock.yaml"), [
+        "lockfileVersion: '9.0'", "importers:", "  .:", "    dependencies:",
+        "      good:", "        specifier: ^1.0.0", "        version: 1.0.0", "",
+      ].join("\n"));
+      writeFileSync(join(p, "node_modules", "good", "package.json"), JSON.stringify({ name: "good", version: "1.0.0" }));
+      const snap = createProfileSnapshot(p, { spec: "good@2.0.0" });
+      markPendingSnapshot(snap, { spec: "good@2.0.0", preflight: { candidate: { name: "good", version: "2.0.0", kind: "plain" } } });
+      if (pausedCandidateBeforeState(p) !== undefined) throw new Error("a marker with no pause mark must not rewrite the view");
+      // The paused half: pnpm already swapped in 2.0.0 and the manifest says so.
+      writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: { good: "^2.0.0" } }));
+      writeFileSync(join(p, "node_modules", "good", "package.json"), JSON.stringify({ name: "good", version: "2.0.0" }));
+      markPendingApprovalPause(p);
+      const view = pausedCandidateBeforeState(p);
+      if (view?.name !== "good" || view.present !== true) throw new Error(`a paused update must report the package as previously present, got ${JSON.stringify(view)}`);
+      if (view.version !== "1.0.0") throw new Error(`the reported version must be the snapshot's pin (what actually runs), got ${JSON.stringify(view.version)}`);
+      if (view.spec !== "^1.0.0") throw new Error(`the reported spec must be the snapshot's, got ${JSON.stringify(view.spec)}`);
+      rmSync(pendingPath(p), { force: true });
+      rmSync(snap.dir, { recursive: true, force: true });
+    }
+    {
+      // A FRESH install: the package did not exist before, so it must drop out
+      // of the list entirely — nothing about it took effect.
+      const p = join(root, "profiles", "paused-view-fresh");
+      mkdirSync(join(p, "node_modules"), { recursive: true });
+      writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: {} }));
+      writeFileSync(join(p, "cordis.patch.yml"), "[]\n");
+      const snap = createProfileSnapshot(p, { spec: "good@2.0.0" });
+      markPendingSnapshot(snap, { spec: "good@2.0.0", preflight: { candidate: { name: "good", version: "2.0.0", kind: "plain" } } });
+      writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: { good: "^2.0.0" } }));
+      mkdirSync(join(p, "node_modules", "good"), { recursive: true });
+      writeFileSync(join(p, "node_modules", "good", "package.json"), JSON.stringify({ name: "good", version: "2.0.0" }));
+      markPendingApprovalPause(p);
+      const view = pausedCandidateBeforeState(p);
+      if (view?.name !== "good" || view.present !== false) throw new Error(`a paused fresh install must report the package as absent beforehand, got ${JSON.stringify(view)}`);
+      if (view.version !== undefined) throw new Error("an absent package has no version to show");
+      rmSync(pendingPath(p), { force: true });
+      rmSync(snap.dir, { recursive: true, force: true });
+      if (pausedCandidateBeforeState(p) !== undefined) throw new Error("no marker means no view rewrite");
+    }
+
+    // Approval-pause mark, part 2: a cleared mark (token retry resumed and
+    // finished the transaction) commits normally — the mark must not outlive
+    // the transaction it belonged to.
+    {
+      const p = join(root, "profiles", "approval-pause-cleared");
+      mkdirSync(join(p, "node_modules", "good"), { recursive: true });
+      writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: { good: "1.0.0" }, dsh: { profile: { bundles: ["good"] } } }));
+      writeFileSync(join(p, "cordis.patch.yml"), "[]\n");
+      writeFileSync(join(p, "node_modules", "good", "package.json"), JSON.stringify({ name: "good", version: "1.0.0", dsh: { bundle: { patch: "./cordis.patch.yml" } } }));
+      writeFileSync(join(p, "node_modules", "good", "cordis.patch.yml"), "- insert:\n    - id: good\n      name: good\n");
+      const snap = createProfileSnapshot(p, { fixture: true });
+      markPendingSnapshot(snap, { spec: "good", preflight: { candidate: { name: "good", version: "1.0.0", kind: "bundle" } } });
+      markPendingApprovalPause(p);
+      if (clearPendingApprovalPause(p) !== true) throw new Error("clearPendingApprovalPause must remove an existing mark");
+      const rec = recoverProfile(p);
+      if (rec.action !== "committed") throw new Error(`after the mark is cleared a healthy install must commit, got ${rec.action}`);
+      if (readPendingSnapshot(p) !== undefined) throw new Error("the commit must clear the marker");
+      if (clearPendingApprovalPause(p) !== false) throw new Error("clearPendingApprovalPause without a mark must return false");
     }
 
     // Remove rollback, no-op failure: the official command failed before
@@ -2021,6 +2389,69 @@ async function selfTest() {
       if (!args.includes("--ignore-scripts")) throw new Error("probe args must keep install scripts disabled");
     }
 
+    // fallbackAddTarget (pure): what one restored dependency may be offline
+    // re-added as. `^` ranges (pnpm's near-universal save prefix) cannot be
+    // spliced into a shell-wrapped argv (cmd eats the caret), so they resolve
+    // to the lockfile's pinned version — exactly what a rollback is restoring
+    // to. A `github:` spec resolves to its pinned tarball URL for a different
+    // and sharper reason: the bare spec means "HEAD now", and the freshest
+    // thing in pnpm's cache/store is the commit the failed update just fetched,
+    // so adding it bare would relink the very version being rolled back FROM —
+    // and a non-semver spec has no range for candidateRestoredCompatible to
+    // check, so that wrong copy would pass on name alone, clear the marker and
+    // delete the snapshot. Pinning is what keeps the fallback fail-closed.
+    {
+      const lockRoot = join(root, "profiles", "fbtarget");
+      mkdirSync(lockRoot, { recursive: true });
+      const tarball = "https://codeload.github.com/owner/repo/tar.gz/898369ece56ae6ec41afd8e014f187bb5b723409";
+      writeFileSync(join(lockRoot, "pnpm-lock.yaml"), [
+        "lockfileVersion: '9.0'",
+        "importers:",
+        "  .:",
+        "    dependencies:",
+        "      good:",
+        "        specifier: ^1.0.0",
+        "        version: 1.0.0",
+        "      hosted:",
+        "        specifier: github:owner/repo",
+        `        version: ${tarball}`,
+        "      peered:",
+        "        specifier: ^1.0.0",
+        "        version: 1.0.0(@deepseek-ai/cordis@4.0.1)",
+        "",
+      ].join("\n"));
+      if (fallbackAddTarget("good", "1.0.0", lockRoot) !== "good@1.0.0") throw new Error("a plain range splices directly");
+      if (fallbackAddTarget("good", "^1.0.0", lockRoot) !== "good@1.0.0") throw new Error("a ^-range must resolve to the lockfile pinned version");
+      if (fallbackAddTarget("good", "^1.0.0", join(root, "profiles", "no-lock-here")) !== undefined) {
+        throw new Error("a ^-range without a readable lockfile must stay fail-closed");
+      }
+      // A bare github spec must NEVER be added as itself: pinning to the
+      // lockfile's tarball URL is the only thing that names the old commit.
+      if (fallbackAddTarget("hosted", "github:owner/repo", lockRoot) !== `hosted@${tarball}`) {
+        throw new Error("a github spec must resolve to the lockfile pinned tarball, never to the moving bare spec");
+      }
+      if (fallbackAddTarget("hosted", "github:owner/repo", join(root, "profiles", "no-lock-here")) !== undefined) {
+        throw new Error("a github spec without a readable lockfile must stay fail-closed, not fall back to the bare spec");
+      }
+      if (fallbackAddTarget("absent", "github:owner/absent", lockRoot) !== undefined) {
+        throw new Error("a github spec with no lockfile entry must stay fail-closed");
+      }
+      // pnpm's peer suffix is not a legal add spec — the parens hit the spec
+      // blacklist, so the fallback fails closed instead of adding something odd.
+      if (fallbackAddTarget("peered", "^1.0.0", lockRoot) !== undefined) {
+        throw new Error("a peer-suffixed pinned version must stay fail-closed");
+      }
+      if (fallbackAddTarget("good", "file:D:\\pkg.tgz", lockRoot) !== "file:D:\\pkg.tgz") throw new Error("local file target expected");
+      // 多区间 range 直拼必被拒（空格/管道），但 lockfile 的 pinned 对任何
+      // range 都是合法恢复目标（lockfile 即权威）——同样走 pinned，
+      // 只有 lockfile 不可读/无该条目才 fail-closed。
+      if (fallbackAddTarget("good", "^1.0.0 || ^2.0.0", lockRoot) !== "good@1.0.0") throw new Error("a multi-clause range must resolve to the lockfile pinned version");
+      if (fallbackAddTarget("good", "^1.0.0 || ^2.0.0", join(root, "profiles", "no-lock-here")) !== undefined) {
+        throw new Error("a multi-clause range without a readable lockfile must stay fail-closed");
+      }
+      if (fallbackAddTarget("good", "", lockRoot) !== undefined) throw new Error("an empty spec has no target");
+    }
+
     // pnpmSpawnPlan (pure, plus a real spawn on Windows): the .cmd shim path
     // must carry its own quotes. Node's shell:true joins command and args
     // without per-argument quoting, so `D:\Program Files\nodejs\pnpm.CMD`
@@ -2188,12 +2619,27 @@ async function selfTest() {
       markPendingSnapshot(snap, { spec: "good@2.0.0", preflight: { candidate: { name: "good", version: "2.0.0", kind: "plain" } } });
       const previousPath = process.env.PATH;
       process.env.PATH = `${binDir}${delimiter}${previousPath ?? ""}`;
+      let rolled;
       try {
-        rollbackPendingSnapshot(p);
+        rolled = rollbackPendingSnapshot(p);
       } finally {
         if (previousPath === undefined) delete process.env.PATH;
         else process.env.PATH = previousPath;
       }
+      // The rebuild report is the ONLY way to tell "reconcile relinked it" from
+      // "reconcile no-opped and the add fallback saved it" after the fact —
+      // both leave an identical-looking profile behind.
+      if (rolled?.rebuild?.reconcile?.exitCode !== 0) throw new Error("the rebuild report must record the no-op reconcile and its exit code");
+      if (rolled.rebuild.fallback.length !== 1) throw new Error(`the rebuild report must record exactly one fallback add, got ${rolled.rebuild.fallback.length}`);
+      const [addReport] = rolled.rebuild.fallback;
+      if (addReport.name !== "good" || addReport.target !== "good@1.0.0" || addReport.exitCode !== 0 || addReport.restored !== true) {
+        throw new Error(`the fallback report must name the package, target, exit code and outcome, got ${JSON.stringify(addReport)}`);
+      }
+      const described = describeRollbackRebuild(rolled.rebuild);
+      if (!/reconcile exit 0/.test(described) || !/add good@1\.0\.0: exit 0, restored/.test(described)) {
+        throw new Error(`describeRollbackRebuild must render both steps, got ${JSON.stringify(described)}`);
+      }
+      if (describeRollbackRebuild(undefined) !== undefined) throw new Error("no rebuild means no line to print");
       if (readPendingSnapshot(p) !== undefined) throw new Error("an add-fallback-rescued rollback must clear the marker");
       if (existsSync(snap.dir)) throw new Error("an add-fallback-rescued rollback must delete the snapshot dir");
       if (readJson(join(p, "node_modules", "good", "package.json")).version !== "1.0.0") throw new Error("the add fallback must relink the old version");

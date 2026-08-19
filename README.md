@@ -73,9 +73,11 @@ node <profile>/node_modules/@1e0zj/dsh-plugin-mall/src/cli.js guard launch --pro
 
 **A plain `dsh web` already resolves pending installs.** The marketplace plugin runs
 recovery when it loads: reaching that point proves dsh booted far enough to compose
-the profile, so the pending marker is committed (or rolled back when the profile
-fails validation). Without this a single install would wedge the profile — every
-later install and uninstall refuses while a marker is outstanding.
+the profile, so the pending marker is committed — or rolled back, either because the
+profile fails validation or because the install was left paused at the build-script
+approval gate (an unapproved install is never committed, however healthy it looks).
+Without this a single install would wedge the profile — every later install and
+uninstall refuses while a marker is outstanding.
 
 **`guard launch` is still strictly better**, because it also covers what a plain
 start cannot: a plugin that boots fine and then crashes seconds later. It checks the
@@ -83,58 +85,39 @@ profile's pending-install marker before starting the command after `--`:
 
 - **No pending install** — the command runs as-is, inheriting the terminal, and its exit code is preserved.
 - **Clearly broken on disk** — the profile is rolled back to its pre-install snapshot *before* launch, then the command starts on the restored state.
-- **Alive through the grace period** (default **10 seconds**; `--grace-ms <ms>` to change) — the pending snapshot is committed and the wrapper keeps waiting on the process.
+- **Alive through the grace period** (default **10 seconds**; `--grace-ms <ms>` to change) — the pending snapshot is committed and the wrapper keeps waiting on the process. An install still paused at the approval gate is rolled back instead: surviving probation only proves the JS loads, not that you approved its build scripts.
 - **Exits 0 inside the grace period** (one-shot command) — the pending snapshot is committed.
 - **Crashes or exits nonzero inside the grace period** — the profile is rolled back and the *exact same command* is restarted once with the restored state (never in a loop); the restarted process's exit code is preserved. SIGINT/SIGTERM are forwarded to the child where the platform supports it; on Windows `.cmd`/`.bat` shims go through `%ComSpec%` with strict per-argument quoting.
 
 Limitations: the grace window is the probation period — a failure that only surfaces **after** it (a plugin that crashes minutes in, or on a specific interaction) cannot be rolled back automatically, because committing deletes the active snapshot and `guard recover` then has nothing to restore. `guard validate` still diagnoses the on-disk state, but a post-commit failure needs manual repair — uninstall and reinstall the plugin, or restore a backup you kept separately. Both commands do only **static on-disk validation**; neither proves the plugin actually loads. A corrupt pending marker fails closed: the command is not launched and no unvalidated path is deleted. Preserve the snapshot and repair or restore a trustworthy marker, then run `guard recover`; quarantine the marker only after you have independently verified the profile, or decided to abandon automatic recovery.
 
 
-## dsh won't start after an update? (affects 0.2.0 – 0.3.1, fixed in 0.3.2)
+## dsh won't start after an update? (affects 0.2.0 – 0.3.2)
 
 Symptom: `dsh web` exits with `cannot resolve profile bundle "<package>"`.
 
-Cause: in those versions, an **update of an already-installed plugin** that ended in
-a rollback (most commonly: the target carries build scripts and the flow paused at
-the approval card) could lose the package — the rollback's offline rebuild was
-fooled by pnpm's "Already up to date" short-circuit, so the plugin vanished from
-node_modules while its bundles declaration stayed. Fresh installs and removals are
-unaffected.
+Cause: **updating an already-installed plugin** into a rollback (most often the
+target carries build scripts and the flow paused at the approval card) could lose
+the package — the rollback's reinstall of the old version was fooled by pnpm's
+"Already up to date" short-circuit, so the plugin left node_modules while its
+bundles declaration stayed. Fresh installs and removals are unaffected.
 
-Recovery depends on **which install source the broken plugin used** (see its entry in the profile's `package.json`):
-
-**npm packages** (`"name": "^1.2.3"`) — `guard recover` can fix these automatically, or install the package straight back:
-
-```powershell
-# Windows PowerShell
-npx -p @1e0zj/dsh-plugin-mall@0.3.2 dsh-plugin-guard recover "$env:USERPROFILE\.dsh\profiles\web"
-# or install the latest straight back (recover + upgrade in one step; add
-# --registry=https://registry.npmjs.org if npmmirror has not synced it yet)
-pnpm --dir "$env:USERPROFILE\.dsh\profiles\web" add "@1e0zj/dsh-plugin-mall@0.3.2" --ignore-scripts
-```
+Recovery: add the package back exactly as the profile's `package.json` declares
+it, then run `dsh web`.
 
 ```bash
-# Linux / macOS
-npx -p @1e0zj/dsh-plugin-mall@0.3.2 dsh-plugin-guard recover ~/.dsh/profiles/web
-pnpm --dir ~/.dsh/profiles/web add "@1e0zj/dsh-plugin-mall@0.3.2" --ignore-scripts
+# <profile> = %USERPROFILE%\.dsh\profiles\web  or  ~/.dsh/profiles/web
+# npm package — package.json says "dsh-better-sidebar": "^0.13.1"
+pnpm --dir <profile> add "dsh-better-sidebar@^0.13.1" --ignore-scripts
+# GitHub source — package.json says "dsh-at-file": "github:omdsh-dev/dsh-at-file"
+pnpm --dir <profile> add "github:omdsh-dev/dsh-at-file" --ignore-scripts
 ```
 
-**GitHub sources** (`"name": "github:owner/repo"`) — the rollback rebuild does not
-cover git dependencies; if `guard recover` could not repair it (dsh still won't
-start), install it back manually, online:
-
-```powershell
-pnpm --dir "$env:USERPROFILE\.dsh\profiles\web" add "github:owner/repo" --ignore-scripts
-```
-
-```bash
-pnpm --dir ~/.dsh/profiles/web add "github:owner/repo" --ignore-scripts
-```
-
-Then `dsh web`. If npmmirror has not synced 0.3.2 yet, append
-`--registry=https://registry.npmjs.org` to B. As of 0.3.2 the rollback rebuild
-carries a per-package `pnpm add` fallback and the approval pause no longer rolls
-back, so this cannot happen anymore.
+> Do not reach for 0.3.2's `dsh-plugin-guard recover` here. Its per-package
+> fallback refuses `^` (a cmd metacharacter) and skips `github:` entirely, and
+> pnpm writes nearly every dependency with one or the other — so the fallback
+> never fires and recovery fails closed. Fixed on main: the fallback now pins the
+> version (or commit) the lockfile resolved. Ships in the next release.
 
 
 ## Agent tools
@@ -238,62 +221,45 @@ node <profile>/node_modules/@1e0zj/dsh-plugin-mall/src/cli.js guard launch --pro
 ```
 
 **普通的 `dsh web` 就会了结 pending 安装。** 本插件加载时即执行恢复——能加载
-本身就证明 dsh 已经组装好 profile、启动到了这一步，于是提交 pending 标记
-（profile 校验不过则回滚）。没有这一步的话，装完一个插件就会把 profile 卡住：
-只要标记还在，之后所有安装和卸载都会被拒绝。
+本身就证明 dsh 已经组装好 profile、启动到了这一步，于是提交 pending 标记；两种
+情况改为回滚：profile 校验不过，或者那次安装停在构建脚本批准闸而未获批准
+（没批准的安装绝不提交，哪怕它看起来一切正常）。没有这一步的话，装完一个插件
+就会把 profile 卡住：只要标记还在，之后所有安装和卸载都会被拒绝。
 
 **`guard launch` 仍然更强**，因为它覆盖普通启动覆盖不了的情况：插件启动正常、
 几秒后才崩。它在启动 `--` 之后的命令前检查该 profile 的 pending 安装标记：
 
 - **无 pending 安装** —— 命令原样运行（继承终端），透传退出码；
 - **静态校验明显过不了** —— 启动*之前*先把 profile 回滚到安装前快照，再在恢复后的状态上启动；
-- **活过缓刑期**（默认 **10 秒**，`--grace-ms <ms>` 可调）—— 提交 pending 快照，包装器继续守候该进程；
+- **活过缓刑期**（默认 **10 秒**，`--grace-ms <ms>` 可调）—— 提交 pending 快照，包装器继续守候该进程；但仍停在批准闸的安装改为回滚：活过缓刑期只证明 JS 能加载，不证明你批准了它的构建脚本；
 - **缓刑期内以 0 退出**（一次性命令）—— 同样提交 pending 快照；
 - **缓刑期内崩溃或非零退出** —— 回滚 profile，并用恢复后的状态**原样重启同一命令一次**（绝不循环），透传重启进程的退出码。支持的平台会把 SIGINT/SIGTERM 转发给子进程；Windows 上 `.cmd`/`.bat` 经 `%ComSpec%` 启动，逐参数严格加引号。
 
 限制：缓刑期就是观察期——**之后**才暴露的故障（跑了几分钟才崩、或某个特定操作才触发）无法自动回滚：提交会删掉当前快照，此时 `guard recover` 已无可恢复的东西。`guard validate` 仍能诊断落盘状态，但提交之后的故障只能手工修复——卸载并重装插件（或恢复你另行保留的备份）。两条命令都只做**静态落盘校验**，都不证明插件真的能加载。pending 标记损坏时关闭式失败：不启动命令、不删除任何未校验路径。要**保留快照**、修复或恢复一个可信的标记后再跑 `guard recover`；只有在你已经独立核实过 profile、或决定放弃自动恢复之后，才去隔离（删除/移走）标记。
 
 
-## 升级后 dsh 起不来？（0.2.0 – 0.3.1 受影响，0.3.2 已修复）
+## 升级后 dsh 起不来？（0.2.0 – 0.3.2 受影响）
 
 症状：`dsh web` 报 `cannot resolve profile bundle "<包名>"` 直接退出。
 
-原因：这两个版本里，**更新已有插件**时若安装走到失败回滚（最常见：目标插件
-带构建脚本、流程停在批准卡），回滚里「离线重建旧版本」的一步会被 pnpm 的
-"Already up to date" 空转骗过——插件从 node_modules 消失而 bundles 声明
-还在，profile 就此卡死。新装、卸载不受影响。
+原因：**更新已装插件**时若走到回滚（最常见：目标插件带构建脚本、停在批准卡），
+回滚里「装回旧版本」的一步会被 pnpm 的 "Already up to date" 空转骗过——包从
+node_modules 消失而 bundles 声明还在。新装、卸载不受影响。
 
-恢复方式**取决于出问题的插件是什么安装源**（看 profile `package.json` 里它的依赖写法）：
-
-**npm 包**（`"名字": "^1.2.3"` 这类）——guard recover 能自动修，也可以直接装回：
-
-```powershell
-# Windows PowerShell
-npx -p @1e0zj/dsh-plugin-mall@0.3.2 dsh-plugin-guard recover "$env:USERPROFILE\.dsh\profiles\web"
-# 或者直接装回最新版（一步恢复 + 升级；npmmirror 未同步时加 --registry=https://registry.npmjs.org）
-pnpm --dir "$env:USERPROFILE\.dsh\profiles\web" add "@1e0zj/dsh-plugin-mall@0.3.2" --ignore-scripts
-```
+恢复：照 profile `package.json` 里原本的写法把包装回去，然后 `dsh web`。
 
 ```bash
-# Linux / macOS
-npx -p @1e0zj/dsh-plugin-mall@0.3.2 dsh-plugin-guard recover ~/.dsh/profiles/web
-pnpm --dir ~/.dsh/profiles/web add "@1e0zj/dsh-plugin-mall@0.3.2" --ignore-scripts
+# <profile> = %USERPROFILE%\.dsh\profiles\web 或 ~/.dsh/profiles/web
+# npm 包 —— package.json 里是 "dsh-better-sidebar": "^0.13.1"
+pnpm --dir <profile> add "dsh-better-sidebar@^0.13.1" --ignore-scripts
+# GitHub 源 —— package.json 里是 "dsh-at-file": "github:omdsh-dev/dsh-at-file"
+pnpm --dir <profile> add "github:omdsh-dev/dsh-at-file" --ignore-scripts
 ```
 
-**GitHub 源**（`"名字": "github:owner/repo"` 这类）——guard recover 的回滚重建
-不覆盖 git 依赖；若它没能自动修复（dsh 仍起不来），手动联网装回：
-
-```powershell
-pnpm --dir "$env:USERPROFILE\.dsh\profiles\web" add "github:owner/repo" --ignore-scripts
-```
-
-```bash
-pnpm --dir ~/.dsh/profiles/web add "github:owner/repo" --ignore-scripts
-```
-
-然后 `dsh web`。npmmirror 尚未同步 0.3.2 时，给 B 追加
-`--registry=https://registry.npmjs.org`。0.3.2 起，回滚重建带 per-package
-add 兜底、批准暂停不再触发回滚，该问题不再发生。
+> 别指望 0.3.2 的 `dsh-plugin-guard recover` 修这个：它的 per-package 兜底会
+> 拒掉 `^`（cmd 转义符），`github:` 更是整个跳过，而 pnpm 存依赖几乎不是前者
+> 就是后者——兜底一次也不会触发，恢复只会 fail-closed。main 上已修：兜底改钉
+> lockfile 解析出的版本（或 commit），随下一版发布。
 
 
 ## 工作原理
