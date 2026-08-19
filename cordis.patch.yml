@@ -5,8 +5,19 @@
     - id: dsh-plugin-mall
       name: '@1e0zj/dsh-plugin-mall'
       config:
-        # The profile market_install targets when the caller names none.
-        defaultProfile: web
+        # defaultProfile is deliberately NOT set here.
+        #
+        # This file ships inside the package and is read as a bundle layer by
+        # every profile that installs the marketplace, so anything written here
+        # is an explicit config value in ALL of them. Pinning `defaultProfile:
+        # web` (as this file used to) meant a marketplace running in any other
+        # profile still defaulted its installs at web — and the value looked
+        # like the user's own choice, so nothing could tell it apart from one.
+        #
+        # Left unset, the plugin follows the profile this process actually
+        # booted (derived from the loader's config-tree anchor). Set it only to
+        # override that:
+        #   defaultProfile: web
         # GitHub REST API base (override for self-hosted mirrors/proxies).
         apiBase: https://api.github.com
         # npm registry for anti-squatting, update checks and the host-dependency
