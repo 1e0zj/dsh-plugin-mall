@@ -1008,6 +1008,32 @@ function addedDependencyNames(pending, originalDependencies = pending?.dependenc
 // that used to live there. Restoring manifest + lockfile is then only half the
 // job: the tree must be rebuilt from the restored lockfile, or the profile is
 // left declaring a dependency nothing provides.
+//
+// WHEN the reconcile short-circuits (the reason the per-package add fallback
+// below exists at all). pnpm decides "up to date" by comparing its virtual
+// store bookkeeping (node_modules/.pnpm/lock.yaml) against the profile's
+// pnpm-lock.yaml — and reconcileNodeModules deletes node_modules/<name>
+// WITHOUT touching either. So the outcome hinges on how far the failed install
+// got before the rollback:
+//
+//   pnpm add SUCCEEDED (e.g. it installed the new version and only then
+//     stopped at the build-script approval gate) — .pnpm/lock.yaml already
+//     records the new version, the restored pnpm-lock.yaml records the old
+//     one, they disagree, pnpm does the work and relinks the old copy. The
+//     fallback never runs.
+//
+//   pnpm add FAILED EARLY (or never ran) — .pnpm/lock.yaml still matches the
+//     restored pnpm-lock.yaml, so pnpm answers `install --frozen` with exit 0
+//     and does nothing while the package it was asked about is gone. Only the
+//     per-package add relinks it.
+//
+// This is why an approval-pause rollback is the WRONG scenario to validate the
+// fallback with: it is precisely the branch that never reaches it (confirmed on
+// a real profile — reconcile exit 0, package restored, fallback untouched). To
+// exercise it, reproduce the second row: install the package, leave
+// .pnpm/lock.yaml in agreement with pnpm-lock.yaml, mark a pending UPDATE
+// transaction, and roll back without running any pnpm in between. Both the `^`
+// range and the github: pinning paths were verified that way.
 
 /**
  * Env for any pnpm the guard (or its callers) spawns: peer auto-install stays
