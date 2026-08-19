@@ -43,6 +43,7 @@ import {
   clearPendingApprovalPause,
   commitPendingSnapshot,
   createProfileSnapshot,
+  describeRollbackRebuild,
   listPendingSnapshots,
   markPendingApprovalPause,
   markPendingSnapshot,
@@ -384,6 +385,8 @@ function cmdRecover({ home, profileDir }) {
     } else if (entry.action === "rolled-back") {
       console.log(`ROLLED BACK ${scope}: ${(entry.issues ?? []).map((issueEntry) => issueEntry.title).join("; ") || "profile would not load"}`);
       if (entry.removed?.length) console.log(`  removed from node_modules: ${entry.removed.join(", ")}`);
+      const rebuild = describeRollbackRebuild(entry.rebuild);
+      if (rebuild !== undefined) console.log(`  node_modules rebuild: ${rebuild}`);
     } else if (entry.action === "none") {
       console.log(`no pending  ${scope}`);
     } else {

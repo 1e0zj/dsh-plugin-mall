@@ -1323,6 +1323,14 @@ export function rollbackPendingSnapshot(profileDir) {
   // newly added candidate (absent from the restored manifest) needs nothing
   // reinstalled: removing its node_modules entry above is sufficient.
   // Without a lockfile a frozen install can never succeed, so it is skipped.
+  // What the rebuild actually did, reported back to the caller. A successful
+  // rollback used to be completely silent: reconcile and the per-package add
+  // leave no trace, so after the fact nobody can tell which one relinked the
+  // package — or whether either ran at all. That matters here more than usual,
+  // because the add fallback exists precisely for the case where reconcile
+  // silently no-ops, and "the profile looks right afterwards" does not
+  // distinguish the two.
+  const rebuild = { reconcile: undefined, fallback: [] };
   let attempt;
   if (isRemove) {
     // A failed/no-op remove commonly leaves the original direct package fully
@@ -1337,6 +1345,7 @@ export function rollbackPendingSnapshot(profileDir) {
   } else if (wasUpdate && pending.files?.["pnpm-lock.yaml"]?.present === true) {
     attempt = runReconcileInstall(profileDir);
   }
+  if (attempt !== undefined) rebuild.reconcile = { exitCode: attempt.exitCode };
 
   // Before clearing marker/snapshot after rollback, strictly verify ALL
   // direct dependencies declared by the restored manifest exist in that
@@ -1363,14 +1372,20 @@ export function rollbackPendingSnapshot(profileDir) {
     // the snapshot stays authoritative for the declaration files.
     for (const depName of [...unsatisfied]) {
       const target = fallbackAddTarget(depName, restoredDependencies[depName], profileDir);
-      if (target === undefined) continue; // not offline-addable — fail closed below
+      if (target === undefined) {
+        // Not offline-addable (an unpinnable spec, no lockfile entry) — record
+        // the refusal too, it is the reason the throw below is about to fire.
+        rebuild.fallback.push({ name: depName, target: undefined, exitCode: undefined, restored: false });
+        continue; // fail closed below
+      }
       const addAttempt = runFallbackAdd(profileDir, target);
+      let restored = false;
       if (addAttempt.exitCode === 0) {
         restoreProfileSnapshot(pending);
-        if (candidateRestoredCompatible(profileDir, depName, restoredDependencies[depName])) {
-          unsatisfied.splice(unsatisfied.indexOf(depName), 1);
-        }
+        restored = candidateRestoredCompatible(profileDir, depName, restoredDependencies[depName]);
+        if (restored) unsatisfied.splice(unsatisfied.indexOf(depName), 1);
       }
+      rebuild.fallback.push({ name: depName, target, exitCode: addAttempt.exitCode, restored });
     }
   }
 
@@ -1394,7 +1409,25 @@ export function rollbackPendingSnapshot(profileDir) {
 
   rmSync(pendingPath(profileDir), { force: true });
   rmSync(pending.dir, { recursive: true, force: true });
-  return pending;
+  return { ...pending, rebuild };
+}
+
+/**
+ * One line describing what a rollback's node_modules rebuild did, or undefined
+ * when there was nothing to rebuild (a fresh install's rollback only prunes).
+ * Kept next to the producer so the CLI and the plugin's startup recovery report
+ * it identically.
+ */
+export function describeRollbackRebuild(rebuild) {
+  if (rebuild === null || typeof rebuild !== "object") return undefined;
+  const parts = [];
+  if (rebuild.reconcile !== undefined) parts.push(`reconcile exit ${rebuild.reconcile.exitCode}`);
+  for (const entry of rebuild.fallback ?? []) {
+    parts.push(entry.target === undefined
+      ? `add ${entry.name}: refused (no pinnable offline target)`
+      : `add ${entry.target}: exit ${entry.exitCode}${entry.restored ? ", restored" : ", NOT restored"}`);
+  }
+  return parts.length > 0 ? parts.join("; ") : undefined;
 }
 
 // ── pending-snapshot recovery (startup + external CLI) ───────────────────────
@@ -1574,12 +1607,14 @@ export function recoverProfile(profileDir) {
   // 回滚目标消失。一律回滚到第一次安装前。
   const pause = pendingApprovalPaused(pending);
   if (!isRemove && pause !== undefined) {
-    rollbackPendingSnapshot(profileDir);
+    const rolled = rollbackPendingSnapshot(profileDir);
     return {
       action: "rolled-back",
+      reason: "批准闸暂停后被放弃（构建脚本未获批准），已回滚到安装前状态",
       issues: [issue("warn", "approval-paused-abandoned", "批准闸暂停后被放弃，已回滚",
         `安装停在构建脚本批准处未被批准（${pause.reason}），profile 已回滚到安装前状态`)],
       removed: addedDependencyNames(pending),
+      rebuild: rolled?.rebuild,
     };
   }
   const validation = validateInstalledProfile(profileDir);
@@ -1593,8 +1628,20 @@ export function recoverProfile(profileDir) {
   }
   const recoveryIssues = [...validation.issues, ...removeValidation.issues];
   const added = isRemove ? [] : addedDependencyNames(pending);
-  rollbackPendingSnapshot(profileDir);
-  return { action: "rolled-back", issues: recoveryIssues, removed: added };
+  const rolled = rollbackPendingSnapshot(profileDir);
+  // The blockers are the reason; naming them beats the old generic wording,
+  // which said "profile failed validation" for every rollback including the
+  // ones that were not validation failures at all.
+  const blockers = recoveryIssues.filter((entry) => entry.severity === "block");
+  return {
+    action: "rolled-back",
+    reason: blockers.length > 0
+      ? `profile 静态校验未通过：${blockers.map((entry) => entry.title).join("; ")}`
+      : "profile 静态校验未通过",
+    issues: recoveryIssues,
+    removed: added,
+    rebuild: rolled?.rebuild,
+  };
 }
 
 /** Recover every profile with a pending marker under a dsh home. */
@@ -2452,12 +2499,27 @@ async function selfTest() {
       markPendingSnapshot(snap, { spec: "good@2.0.0", preflight: { candidate: { name: "good", version: "2.0.0", kind: "plain" } } });
       const previousPath = process.env.PATH;
       process.env.PATH = `${binDir}${delimiter}${previousPath ?? ""}`;
+      let rolled;
       try {
-        rollbackPendingSnapshot(p);
+        rolled = rollbackPendingSnapshot(p);
       } finally {
         if (previousPath === undefined) delete process.env.PATH;
         else process.env.PATH = previousPath;
       }
+      // The rebuild report is the ONLY way to tell "reconcile relinked it" from
+      // "reconcile no-opped and the add fallback saved it" after the fact —
+      // both leave an identical-looking profile behind.
+      if (rolled?.rebuild?.reconcile?.exitCode !== 0) throw new Error("the rebuild report must record the no-op reconcile and its exit code");
+      if (rolled.rebuild.fallback.length !== 1) throw new Error(`the rebuild report must record exactly one fallback add, got ${rolled.rebuild.fallback.length}`);
+      const [addReport] = rolled.rebuild.fallback;
+      if (addReport.name !== "good" || addReport.target !== "good@1.0.0" || addReport.exitCode !== 0 || addReport.restored !== true) {
+        throw new Error(`the fallback report must name the package, target, exit code and outcome, got ${JSON.stringify(addReport)}`);
+      }
+      const described = describeRollbackRebuild(rolled.rebuild);
+      if (!/reconcile exit 0/.test(described) || !/add good@1\.0\.0: exit 0, restored/.test(described)) {
+        throw new Error(`describeRollbackRebuild must render both steps, got ${JSON.stringify(described)}`);
+      }
+      if (describeRollbackRebuild(undefined) !== undefined) throw new Error("no rebuild means no line to print");
       if (readPendingSnapshot(p) !== undefined) throw new Error("an add-fallback-rescued rollback must clear the marker");
       if (existsSync(snap.dir)) throw new Error("an add-fallback-rescued rollback must delete the snapshot dir");
       if (readJson(join(p, "node_modules", "good", "package.json")).version !== "1.0.0") throw new Error("the add fallback must relink the old version");

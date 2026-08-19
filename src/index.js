@@ -25,7 +25,7 @@ import { tmpdir } from "node:os";
 import { resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
 import { repoInfo, searchPlugins, verifyPlugins, cachedRepoManifest, fetchRawFile, preferNpmSpec, npmPackageInfo, compareVersions, assertSafeToInstall, mapLimit, NETWORK_CONCURRENCY } from "./github.js";
 import { ensureProfile, listInstalled, normalizeSpec, runInstall, runRemove, assertSafeSpec, resolveRegistry, serializeCanonicalProof, persistPluginDisabled } from "./installer.js";
-import { preflightInstall, inspectRemoteCandidate, recoverProfile } from "./guard.js";
+import { preflightInstall, inspectRemoteCandidate, recoverProfile, describeRollbackRebuild } from "./guard.js";
 
 export const name = "@1e0zj/dsh-plugin-mall";
 // `loader` 用来读装配树、并对单个 entry 做热开关（entry.update）。读法照抄
@@ -1636,6 +1636,11 @@ export function apply(ctx, config = {}) {
       console.log(`[dsh-plugin-mall] startup recovery: committed the pending install for profile "${defaultProfile}"`);
     } else if (result.action === "rolled-back") {
       console.warn(`[dsh-plugin-mall] startup recovery: rolled back the pending install for profile "${defaultProfile}" — ${result.reason ?? "profile failed validation"}`);
+      // What the rebuild did, when it did anything. A rollback that relinked a
+      // package used to be silent, so a reconcile that silently no-opped and a
+      // fallback add that saved the profile looked exactly alike afterwards.
+      const rebuild = describeRollbackRebuild(result.rebuild);
+      if (rebuild !== undefined) console.warn(`[dsh-plugin-mall] startup recovery: node_modules rebuild — ${rebuild}`);
     }
   } catch (error) {
     // 恢复失败绝不能拖垮插件加载：报出来，让市场照常可用（用户还能手动
