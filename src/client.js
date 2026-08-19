@@ -188,6 +188,7 @@ window.__ModuleLoader__.load({
                 status: snapshot.status,
                 detail: snapshot.detail,
                 needsApproval: snapshot.needsApproval,
+                staleOnRestart: snapshot.staleOnRestart,
                 approvalToken: snapshot.approvalToken,
                 kind: snapshot.kind,
                 output: output,
@@ -249,6 +250,7 @@ window.__ModuleLoader__.load({
             spec: snap.spec,
             detail: snap.detail,
             needsApproval: snap.needsApproval,
+            staleOnRestart: snap.staleOnRestart,
             approvalToken: snap.approvalToken,
             kind: snap.kind,
             output: entry.output || "",
@@ -259,9 +261,13 @@ window.__ModuleLoader__.load({
         // 不在本次服务器列表里的条目属于上一次宿主会话（进程重启后
         // tracker 清空）。已兑现的直接翻篇撤掉：completed 的重启已经
         // 发生；needsApproval 暂停的批准卡片已随进程失效（事务由启动
-        // 恢复处置），留着只会让人点一个必然失败的按钮。running 的标
-        // 中断，别让轮询对着不存在的 id 空转。failed 保留——日志还有
-        // 排障价值。这个判据不依赖 finishedAt（旧镜像里没有该字段）。
+        // 恢复处置），留着只会让人点一个必然失败的按钮；staleOnRestart
+        // 的失败是「被另一个未了结事务挡住」，而那个事务必然已被启动恢复
+        // 处置——它的报错是现在时写的（「还没做完」「现在无法安装」），
+        // 留到重启之后会被当成当前状态读，而它描述的情形已经不存在。
+        // running 的标中断，别让轮询对着不存在的 id 空转。其余 failed
+        // 保留——网络、预检阻断这类原因重启后可能仍然成立，日志有排障
+        // 价值。这个判据不依赖 finishedAt（旧镜像里没有该字段）。
         for (var key in next) {
           if (serverIds[key]) continue;
           var stale = next[key];
@@ -270,7 +276,9 @@ window.__ModuleLoader__.load({
               status: "killed",
               detail: "宿主进程已重启，该任务的记录随之丢失",
             });
-          } else if (stale.status === "completed" || (Array.isArray(stale.needsApproval) && stale.needsApproval.length > 0)) {
+          } else if (stale.status === "completed"
+            || stale.staleOnRestart === true
+            || (Array.isArray(stale.needsApproval) && stale.needsApproval.length > 0)) {
             delete next[key];
           }
         }

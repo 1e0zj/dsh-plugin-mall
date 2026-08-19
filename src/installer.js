@@ -1113,6 +1113,9 @@ export function createJobTracker() {
         // 待批准的构建脚本清单：浏览器侧据此渲染「允许并继续」，没有它就只有
         // 一段文本，用户看不出要批准的到底是什么。
         record.needsApproval = outcome.needsApproval;
+        // 这次失败的原因活不过一次重启（见 failedNow），浏览器据此在重启后
+        // 撤掉记录，而不是把一段现在时的描述当成当前状态留在面板上。
+        record.staleOnRestart = outcome.staleOnRestart === true;
         record.finishedAt = Date.now();
         onSettled?.(outcome);
       });
@@ -1131,6 +1134,7 @@ export function createJobTracker() {
           status: record.status,
           detail: record.detail,
           needsApproval: record.needsApproval,
+          staleOnRestart: record.staleOnRestart,
           spec: record.spec,
           startedAt: record.startedAt,
           finishedAt: record.finishedAt,
@@ -1486,7 +1490,8 @@ function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, pref
       const what = existingMarker.operation === "remove" ? "卸载" : "安装";
       return failedNow(paused
         ? `${previous} 的${what}还没做完——它停在「允许安装依赖」那一步等你决定，没有批准就不会真正装上。现在无法安装 ${spec}。重启 dsh 会撤回那次未批准的${what}，之后就能重新操作；也可以运行 \`dsh-plugin-guard guard recover\` 立即撤回。`
-        : `${previous} 的${what}还没了结，现在无法安装 ${spec}。重启 dsh 会自动了结它（装好的提交、没批准的撤回），也可以运行 \`dsh-plugin-guard guard recover\` 手动处理。`);
+        : `${previous} 的${what}还没了结，现在无法安装 ${spec}。重启 dsh 会自动了结它（装好的提交、没批准的撤回），也可以运行 \`dsh-plugin-guard guard recover\` 手动处理。`,
+      { staleOnRestart: true });
     }
     push(`[dsh-plugin-mall] resuming the paused install transaction for ${spec} — its original snapshot stays the rollback target\n`);
     // 事务复活：清掉暂停标记，否则重试成功后的启动提交会被它拦下错误回滚。
@@ -1787,10 +1792,21 @@ function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, pref
 // ── the background uninstall job ────────────────────────────────────────────
 
 /** A terminal producer for fast-fail cases (no pnpm spawn needed). */
-function failedNow(detail) {
+/**
+ * @param staleOnRestart - true when this failure's CAUSE cannot outlive a
+ *   restart, so the browser should drop the record instead of keeping it as
+ *   history. Only the "another transaction owns this profile" refusals qualify:
+ *   startup recovery settles that transaction on the way up, so the message
+ *   ("X is still waiting at the approval gate, so Y cannot install") describes a
+ *   situation that is guaranteed gone — and it is written in the present tense,
+ *   so a reader after the restart takes it for the current state. Ordinary
+ *   failures (network, preflight blockers, pnpm errors) may well still apply
+ *   after a restart and keep their diagnostic value, so they stay.
+ */
+function failedNow(detail, { staleOnRestart = false } = {}) {
   return {
     cancel: () => {},
-    done: Promise.resolve({ status: "failed", detail }),
+    done: Promise.resolve({ status: "failed", detail, staleOnRestart }),
     readOutput: () => "",
   };
 }
@@ -1828,7 +1844,9 @@ function runRemoveInner({ profile, packageName, _profileDir, _spawn }, selfHeale
   if (existsSync(markerPath)) {
     // 存在性判断（同 markPendingSnapshot）：坏 marker 也照样挡路。所以这里
     // 只能拿到「有」而拿不到「是什么」，文案相应保持笼统，但仍要给出路。
-    return failedNow(`profile "${profile}" 里有一个还没了结的安装事务，在它了结之前无法卸载 ${packageName}。重启 dsh 会自动了结它（装好的提交、没批准的撤回），也可以运行 \`dsh-plugin-guard guard recover\` 手动处理（事务记录：${markerPath}）。`);
+    return failedNow(
+      `profile "${profile}" 里有一个还没了结的安装事务，在它了结之前无法卸载 ${packageName}。重启 dsh 会自动了结它（装好的提交、没批准的撤回），也可以运行 \`dsh-plugin-guard guard recover\` 手动处理（事务记录：${markerPath}）。`,
+      { staleOnRestart: true });
   }
   const manifestPath = join(profileDir, "package.json");
   if (!existsSync(manifestPath)) {
@@ -2241,10 +2259,13 @@ async function runTransactionFixtures() {
           _describe: async () => [],
         }).done;
         check(
-          "暂停期间装别的包 → 拒绝，且报错点名「停在允许安装依赖」并给出撤回办法",
+          // staleOnRestart：这条报错是现在时写的，而挡路的事务必然被启动恢复
+          // 了结——留到重启之后会被当成当前状态读，所以面板要撤掉它。
+          "暂停期间装别的包 → 拒绝，报错点名「停在允许安装依赖」+ 撤回办法 + 标记重启后失效",
           duringOutcome.status === "failed"
             && /停在「允许安装依赖」/.test(duringOutcome.detail ?? "")
             && /重启 dsh/.test(duringOutcome.detail ?? "")
+            && duringOutcome.staleOnRestart === true
             && during.calls.length === 0,
           `status=${duringOutcome.status} detail=${(duringOutcome.detail ?? "").slice(0, 120)}`,
         );
@@ -2300,6 +2321,7 @@ async function runTransactionFixtures() {
           otherOutcome.status === "failed"
             && /还没了结/.test(otherOutcome.detail ?? "")
             && !/停在「允许安装依赖」/.test(otherOutcome.detail ?? "")
+            && otherOutcome.staleOnRestart === true
             && other.calls.length === 0,
           `status=${otherOutcome.status} calls=${other.calls.length}`,
         );
@@ -2636,6 +2658,8 @@ async function runTransactionFixtures() {
           && installOutcome.status === "failed"
           && removeOutcome.status === "failed"
           && /not a dependency/.test(removeOutcome.detail ?? "")
+          // 普通失败不标记：重启治不好「这个包本来就不在依赖里」。
+          && removeOutcome.staleOnRestart !== true
           && procs.length === 1,
         `procs=${procs.length} install=${installOutcome.status} remove=${removeOutcome.status} ${JSON.stringify(removeOutcome.detail)}`,
       );
@@ -2664,9 +2688,12 @@ async function runTransactionFixtures() {
       const snapshotsDir = join(dirname(marker), "snapshots");
       const leftoverSnapshots = existsSync(snapshotsDir) ? readdirSync(snapshotsDir) : [];
       check(
-        "损坏/既有 pending marker → install 不 spawn、不覆盖证据、不遗留新 snapshot",
+        // 不标 staleOnRestart：损坏的 marker 重启后仍然 fail-closed 留给人工
+        // 检查，不会被启动恢复了结——这条失败的原因活得过重启，面板要留着。
+        "损坏/既有 pending marker → install 不 spawn、不覆盖证据、不遗留新 snapshot，且不标记重启后失效",
         outcome.status === "failed"
           && /读不出来的安装记录/.test(outcome.detail ?? "")
+          && outcome.staleOnRestart !== true
           && calls.length === 0
           && readFileSync(marker, "utf8") === corruptBytes
           && leftoverSnapshots.length === 0,
@@ -2690,6 +2717,7 @@ async function runTransactionFixtures() {
         "pending marker 存在 → remove 拒绝执行且不 spawn pnpm，marker 保留",
         outcome.status === "failed"
           && /还没了结的安装事务/.test(outcome.detail ?? "")
+          && outcome.staleOnRestart === true
           && procs.length === 0
           && existsSync(pendingMarkerPath(profileDir)),
         `status=${outcome.status} procs=${procs.length} ${JSON.stringify(outcome.detail)}`,

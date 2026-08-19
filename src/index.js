@@ -829,6 +829,9 @@ export function createJobTracker({ producerFactory } = {}) {
           record.status = status;
           record.detail = outcome?.detail;
           record.needsApproval = outcome?.needsApproval;
+          // 原因活不过一次重启的失败（被别的未了结事务挡住）：浏览器据此在
+          // 重启后撤掉记录，而不是把一段现在时的描述留在面板上当现状读。
+          record.staleOnRestart = outcome?.staleOnRestart === true;
           record.finishedAt = Date.now();
 
           if (status === "completed") {
@@ -940,6 +943,7 @@ export function createJobTracker({ producerFactory } = {}) {
           status: record.status,
           detail: record.detail,
           needsApproval: record.needsApproval,
+          staleOnRestart: record.staleOnRestart,
           approvalToken: isSameSession ? record.approvalToken : undefined,
           // extras（如预检结论）同样只对同一 session 可见，与 approvalToken 同规格。
           extras: isSameSession ? record.extras : undefined,
@@ -977,6 +981,7 @@ export function createJobTracker({ producerFactory } = {}) {
             status: record.status,
             detail: record.detail,
             needsApproval: record.needsApproval,
+            staleOnRestart: record.staleOnRestart,
             approvalToken: isSameSession ? record.approvalToken : undefined,
             extras: isSameSession ? record.extras : undefined,
             spec: record.spec,
