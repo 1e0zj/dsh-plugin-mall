@@ -16,10 +16,10 @@
 import z from "@deepseek-ai/schemastery";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { existsSync, readFileSync, realpathSync, mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
@@ -36,13 +36,157 @@ export const name = "@1e0zj/dsh-plugin-mall";
 export const inject = ["tools", "jobs", "systemPrompt", "loader"];
 
 export const Config = z.object({
-  defaultProfile: z.string().default("web"),
+  // 没有 .default("web")：这个字段必须能分辨「用户显式选了 web」和「用户没配」。
+  // 带默认值时 apply 永远收到 "web"，下面的自动识别根本轮不到——而写死 web
+  // 的代价不只是装错地方，启动恢复也会去动一个本次没启动的 profile。
+  defaultProfile: z.string(),
   apiBase: z.string().default("https://api.github.com"),
   npmRegistry: z.string().default(""),
   rawSources: z.array(z.string()).default([]),
-  perPageMax: z.number().default(30),
+  // 实际语义一直是 1–30 的整数（搜索路径两处都在 clamp）。约束写进 schema，
+  // 坏配置就在插件加载时失败，而不是被静默夹回边界。
+  perPageMax: z.natural().min(1).max(30).default(30),
   allowRestart: z.boolean().default(true),
 });
+
+/** Compare two absolute paths, tolerating symlinks and Windows case. */
+function samePath(a, b) {
+  const canon = (value) => {
+    let path = value;
+    try { path = realpathSync(value); } catch { /* 不在磁盘上就按字面比 */ }
+    return process.platform === "win32" ? path.toLowerCase() : path;
+  };
+  return canon(a) === canon(b);
+}
+
+/**
+ * The profile this process actually booted, or undefined when it cannot be
+ * established.
+ *
+ * There is no profile service to ask — the host exposes no `activeProfile`
+ * anywhere. What it does expose is the config-tree anchor: `boot()` sets
+ *
+ *   ctx.baseUrl = pathToFileURL(dirname(absoluteConfigPath)).href + "/"
+ *
+ * and `absoluteConfigPath` is `<home>/profiles/<name>/cordis.yml`, so the
+ * anchor IS the profile directory. The whole tree composes over that single
+ * root — bundle layers are read as patch objects and merged, not mounted
+ * through `include` — so every entry inherits it. Official plugins already
+ * treat it as load-bearing: dsh-client-modules and dsh-typert-loader both
+ * throw outright when it is unset. This is the host's own answer about which
+ * profile is running, not an inference from argv.
+ *
+ * Returns undefined rather than guessing, because an `include` from elsewhere
+ * re-anchors baseUrl and a wrong answer here is worse than no answer: it would
+ * aim every install AND the startup recovery at a profile the user never
+ * booted. The name has to round-trip through resolveProfileDir() — the same
+ * validation every other profile input passes — for the answer to count.
+ *
+ * @param baseUrl - the consuming context's `baseUrl`.
+ * @param home - the Harness home; tests pass a temp root, callers omit it.
+ */
+export function detectProfile(baseUrl, home) {
+  if (typeof baseUrl !== "string" || !baseUrl.startsWith("file:")) return undefined;
+  let dir;
+  try {
+    dir = resolve(fileURLToPath(baseUrl));
+  } catch {
+    return undefined;
+  }
+  const name = basename(dir);
+  let expected;
+  try {
+    expected = resolve(resolveProfileDir(name, home)); // 非法 profile 名在此抛出
+  } catch {
+    return undefined;
+  }
+  return samePath(expected, dir) ? name : undefined;
+}
+
+/**
+ * Split the one thing that used to be a single `defaultProfile` into the two
+ * different questions it was silently answering:
+ *
+ * - `installProfile` — where installs go when the caller names no profile.
+ *   A user preference: an explicit config wins, because targeting another
+ *   profile from here is a legitimate thing to want.
+ * - `runningProfile` — which profile THIS process booted, or undefined when
+ *   that cannot be established. Not a preference; a fact, and the only thing
+ *   startup recovery may act on.
+ *
+ * Collapsing them is what the previous version got wrong: recovery ran against
+ * `configured ?? detected ?? "web"`, so `defaultProfile: web` while booting
+ * profile-a sent recovery at web — the exact cross-profile write this was
+ * supposed to end, just reached through the config instead of a hardcoded
+ * literal.
+ *
+ * @param configured - the `defaultProfile` config value, if any.
+ * @param baseUrl - the consuming context's `baseUrl`.
+ * @param home - the Harness home; tests pass a temp root, callers omit it.
+ * @param log - console sink; tests pass a collector.
+ */
+export function resolveProfileTargets({ configured, baseUrl, home, log = console } = {}) {
+  const explicit = typeof configured === "string" && configured.trim().length > 0
+    ? configured.trim()
+    : undefined;
+  const runningProfile = detectProfile(baseUrl, home);
+  const installProfile = explicit ?? runningProfile ?? "web";
+  if (explicit === undefined && runningProfile === undefined) {
+    log.warn(`[dsh-plugin-mall] could not determine the running profile from the config-tree anchor; installs default to "web" — set defaultProfile if that is wrong`);
+  }
+  return { installProfile, runningProfile };
+}
+
+/**
+ * Startup recovery. A pending install marker blocks every later install and
+ * uninstall in that profile until something resolves it — and until now the
+ * only thing that did was `guard launch`, a wrapper nobody uses: people type
+ * `dsh web`. One install then wedged the profile permanently, with an error
+ * telling users to run a CLI they have never heard of.
+ *
+ * Reaching `apply` IS the proof the pending install did not break the host:
+ * this code only runs because dsh booted far enough to compose the profile and
+ * load this plugin. So resolve the marker right here — recoverProfile commits
+ * when the profile validates and rolls back when it does not. The grace-window
+ * probation of `guard launch` stays strictly better (it also catches a crash
+ * seconds later); this is the floor for a plain start.
+ *
+ * That proof covers EXACTLY ONE profile: the one that booted. Recovering any
+ * other from here would commit its half-finished install on the strength of a
+ * boot that never exercised it — and delete the snapshot it would have been
+ * rolled back to — while the booted profile's own marker stayed forever. So
+ * when the running profile is unknown this skips rather than falling back:
+ * a blocked profile the user can still repair beats a wrongly committed one
+ * they cannot.
+ *
+ * @param runningProfile - the booted profile, or undefined when unestablished.
+ * @param recover - recovery implementation; tests inject a spy.
+ * @param log - console sink; tests pass a collector.
+ */
+export function runStartupRecovery(runningProfile, { recover = recoverProfile, log = console } = {}) {
+  if (runningProfile === undefined) {
+    log.warn(`[dsh-plugin-mall] startup recovery skipped: this boot's profile could not be established, and no other profile's pending install may be settled on the strength of it. A pending install stays blocked until it is resolved.`);
+    return { action: "skipped" };
+  }
+  try {
+    const result = recover(resolveProfileDir(runningProfile));
+    if (result.action === "committed") {
+      log.log(`[dsh-plugin-mall] startup recovery: committed the pending install for profile "${runningProfile}"`);
+    } else if (result.action === "rolled-back") {
+      log.warn(`[dsh-plugin-mall] startup recovery: rolled back the pending install for profile "${runningProfile}" — ${result.reason ?? "profile failed validation"}`);
+      // What the rebuild did, when it did anything. A rollback that relinked a
+      // package used to be silent, so a reconcile that silently no-opped and a
+      // fallback add that saved the profile looked exactly alike afterwards.
+      const rebuild = describeRollbackRebuild(result.rebuild);
+      if (rebuild !== undefined) log.warn(`[dsh-plugin-mall] startup recovery: node_modules rebuild — ${rebuild}`);
+    }
+    return result;
+  } catch (error) {
+    // 恢复失败绝不能拖垮插件加载：报出来，让市场照常可用，而不是连界面都进不去。
+    log.error("[dsh-plugin-mall] startup recovery failed:", error);
+    return { action: "failed", error };
+  }
+}
 
 /**
  * The registry to query for a profile: an explicit `npmRegistry` config wins,
@@ -1620,38 +1764,14 @@ function registerRpcChannel(ctx, config, token) {
 }
 
 export function apply(ctx, config = {}) {
-  const { defaultProfile = "web", apiBase = "https://api.github.com", perPageMax = 30, npmRegistry = "", rawSources = [] } = config;
+  const { apiBase = "https://api.github.com", perPageMax = 30, npmRegistry = "", rawSources = [] } = config;
+  const { installProfile: defaultProfile, runningProfile } = resolveProfileTargets({
+    configured: config.defaultProfile,
+    baseUrl: ctx?.baseUrl,
+  });
   const token = process.env.GITHUB_TOKEN ?? process.env.DSH_MARKET_GITHUB_TOKEN;
 
-  // Startup recovery. A pending install marker blocks every later install and
-  // uninstall in that profile until something resolves it — and until now the
-  // only thing that did was `guard launch`, a wrapper nobody uses: people type
-  // `dsh web`. One install then wedged the profile permanently, with an error
-  // telling users to run a CLI they have never heard of.
-  //
-  // Reaching `apply` IS the proof the pending install did not break the host:
-  // this code only runs because dsh booted far enough to compose the profile
-  // and load this plugin. So resolve the marker right here — recoverProfile
-  // commits when the profile validates and rolls back when it does not. The
-  // grace-window probation of `guard launch` stays strictly better (it also
-  // catches a crash seconds later); this is the floor for a plain start.
-  try {
-    const result = recoverProfile(resolveProfileDir(defaultProfile));
-    if (result.action === "committed") {
-      console.log(`[dsh-plugin-mall] startup recovery: committed the pending install for profile "${defaultProfile}"`);
-    } else if (result.action === "rolled-back") {
-      console.warn(`[dsh-plugin-mall] startup recovery: rolled back the pending install for profile "${defaultProfile}" — ${result.reason ?? "profile failed validation"}`);
-      // What the rebuild did, when it did anything. A rollback that relinked a
-      // package used to be silent, so a reconcile that silently no-opped and a
-      // fallback add that saved the profile looked exactly alike afterwards.
-      const rebuild = describeRollbackRebuild(result.rebuild);
-      if (rebuild !== undefined) console.warn(`[dsh-plugin-mall] startup recovery: node_modules rebuild — ${rebuild}`);
-    }
-  } catch (error) {
-    // 恢复失败绝不能拖垮插件加载：报出来，让市场照常可用（用户还能手动
-    // `dsh-plugin-guard guard recover`），而不是连界面都进不去。
-    console.error("[dsh-plugin-mall] startup recovery failed:", error);
-  }
+  runStartupRecovery(runningProfile);
 
   ctx.systemPrompt.section({
     name: "tool:market",
@@ -1964,7 +2084,9 @@ export function apply(ctx, config = {}) {
     }),
   }));
 
-  registerRpcChannel(ctx, config, token);
+  // 解析后的 defaultProfile 必须一起传下去：Web 侧和 Agent 侧共用同一个目标
+  // profile，两边判定不能分叉。
+  registerRpcChannel(ctx, { ...config, defaultProfile }, token);
 }
 
 // ── offline fixtures / self-test ────────────────────────────────────────────
@@ -2493,6 +2615,147 @@ export async function runSelfTests() {
     check("configId 缺失时可被识别（调用方据此拒绝写 patch）", loaderEntriesByPackage(fakeLoaderCtx([
       { id: "anon-1", options: { name: "no-id-pkg" }, disabled: false },
     ]))["no-id-pkg"]?.entries[0].configId === undefined);
+
+    // ── 9. 当前 profile 识别 ────────────────────────────────────────────────
+    // 判错的代价不是「装错地方」而已：apply 的启动恢复会据此提交或回滚半装
+    // 状态，指错 profile 等于拿一次无关的启动为另一个 profile 的完整性背书。
+    // 所以这里的重点全在「什么时候必须返回 undefined」。
+    const fakeHome = join(root, "detect-home");
+    const detectDir = join(fakeHome, "profiles", "guard-test");
+    mkdirSync(detectDir, { recursive: true });
+    const urlOf = (path) => pathToFileURL(path).href.replace(/\/?$/, "/");
+
+    check("profile 目录锚点 → 识别出目录名", detectProfile(urlOf(detectDir), fakeHome) === "guard-test");
+    check("锚点带尾斜杠与否都识别", detectProfile(pathToFileURL(detectDir).href, fakeHome) === "guard-test");
+
+    // 以下每一条都必须是 undefined —— 宁可退回配置/兜底，也不能猜。
+    check("非 file: 锚点 → 不猜", detectProfile("https://example.com/profiles/web/", fakeHome) === undefined);
+    check("锚点缺失 → 不猜", detectProfile(undefined, fakeHome) === undefined);
+    check("锚点非字符串 → 不猜", detectProfile({ href: urlOf(detectDir) }, fakeHome) === undefined);
+    // include 从别处重锚：目录名碰巧合法，但不在 <home>/profiles/ 下。
+    const strayDir = join(root, "elsewhere", "guard-test");
+    mkdirSync(strayDir, { recursive: true });
+    check("profiles/ 之外的同名目录 → 不猜", detectProfile(urlOf(strayDir), fakeHome) === undefined);
+    // profiles 目录本身：basename 是 "profiles"，回算得到 profiles/profiles。
+    check("锚点指向 profiles/ 本身 → 不猜", detectProfile(urlOf(join(fakeHome, "profiles")), fakeHome) === undefined);
+    // 深一层：<home>/profiles/web/node_modules 的 basename 是 node_modules，
+    // 而 resolveProfileDir 明确拒绝这个名字。
+    const nestedDir = join(fakeHome, "profiles", "web", "node_modules");
+    mkdirSync(nestedDir, { recursive: true });
+    check("锚点指向 profile 内的 node_modules → 不猜", detectProfile(urlOf(nestedDir), fakeHome) === undefined);
+
+    // ── 10. Config schema 约束 ──────────────────────────────────────────────
+    // perPageMax 的 1–30 语义此前只活在两处 clamp 里，坏配置被静默夹回边界。
+    check("perPageMax 合法值通过", Config({ defaultProfile: "web", perPageMax: 10 }).perPageMax === 10);
+    check("perPageMax 缺省为 30", Config({ defaultProfile: "web" }).perPageMax === 30);
+    const rejectsConfig = (value) => {
+      try { Config({ defaultProfile: "web", perPageMax: value }); return false; } catch { return true; }
+    };
+    check("perPageMax 超上限被拒", rejectsConfig(31));
+    check("perPageMax 为 0 被拒", rejectsConfig(0));
+    check("perPageMax 为负被拒", rejectsConfig(-1));
+    check("perPageMax 非整数被拒", rejectsConfig(2.5));
+    // defaultProfile 没有默认值，才能让 apply 分辨「没配」。摘掉默认值时最该
+    // 怕的是它变成必填：真实 profile 里我们那行压根没有 config: 键，Config
+    // 收到的是 undefined，一旦这里抛错插件直接加载不了。
+    check("defaultProfile 未配置时保持 undefined", Config({}).defaultProfile === undefined);
+    check("条目无 config: 键（Config 收到 undefined）不抛错", (() => {
+      try { return Config(undefined).defaultProfile === undefined; } catch { return false; }
+    })());
+
+    // ── 10b. 发布的 bundle patch 不许钉死 defaultProfile ────────────────────
+    // 这个文件随包发布，被每个装了市场的 profile 当 bundle 层读取，所以写在
+    // 里面的任何值在所有 profile 里都是「显式配置」。此前它钉着
+    // defaultProfile: web，于是自动识别对所有真实用户都是空转——而且那个值
+    // 和用户自己配的分辨不开。真机实测才暴露出来，fixture 之前够不着。
+    const bundlePatchPath = join(dirname(fileURLToPath(import.meta.url)), "..", "cordis.patch.yml");
+    const bundlePatch = readFileSync(bundlePatchPath, "utf8");
+    const pinsDefaultProfile = bundlePatch
+      .split(/\r?\n/)
+      .some((line) => line.trim().startsWith("defaultProfile:"));
+    check("发布的 bundle patch 未钉死 defaultProfile（钉了自动识别就永远不触发）", !pinsDefaultProfile);
+
+    // ── 11. 安装目标 vs 恢复目标：两个问题，不能共用一个答案 ────────────────
+    // 上一版把两者合成一个 defaultProfile，于是「显式配置」和「兜底 web」都能
+    // 把恢复指向一个没启动的 profile——正是本次要根除的跨 profile 写入，只是
+    // 换成从配置绕进来。这里按「谁能证明什么」逐一钉死。
+    const quietLog = () => {
+      const lines = [];
+      return { lines, warn: (m) => lines.push(m), log: (m) => lines.push(m), error: (m) => lines.push(m) };
+    };
+    const targetsFor = (configured, dirName) => resolveProfileTargets({
+      configured,
+      baseUrl: dirName === undefined ? undefined : urlOf(join(fakeHome, "profiles", dirName)),
+      home: fakeHome,
+      log: quietLog(),
+    });
+    mkdirSync(join(fakeHome, "profiles", "profile-a"), { recursive: true });
+
+    // 场景 1：启动 profile-a，却配了 defaultProfile: profile-b。
+    const crossed = targetsFor("profile-b", "profile-a");
+    check("配置指向别的 profile：安装目标听配置", crossed.installProfile === "profile-b");
+    check("配置指向别的 profile：恢复目标仍是启动的那个", crossed.runningProfile === "profile-a");
+
+    // 场景 2：识别不出运行 profile。安装兜底 web 可以接受（用户还能改配置）；
+    // 恢复不行——本次启动没有证明 web 是好的。
+    const unknown = targetsFor(undefined, undefined);
+    check("识别失败：安装目标兜底 web", unknown.installProfile === "web");
+    check("识别失败：恢复目标为 undefined，不兜底", unknown.runningProfile === undefined);
+
+    // 场景 3：识别失败 + 显式配置。配置只喂安装侧，喂不到恢复侧。
+    const unknownConfigured = targetsFor("profile-b", undefined);
+    check("识别失败但有配置：安装目标听配置", unknownConfigured.installProfile === "profile-b");
+    check("识别失败但有配置：恢复目标仍为 undefined", unknownConfigured.runningProfile === undefined);
+
+    // 场景 4：正常情况——没配置，识别成功，两者一致。
+    const plain = targetsFor(undefined, "profile-a");
+    check("未配置且识别成功：两个目标都是启动的 profile",
+      plain.installProfile === "profile-a" && plain.runningProfile === "profile-a");
+    check("空白字符串配置视同未配置", targetsFor("   ", "profile-a").installProfile === "profile-a");
+
+    // 只有「没配置且识别不出」才该提醒安装兜底；有配置时兜底不存在，不该吵。
+    const warnLog = quietLog();
+    resolveProfileTargets({ configured: undefined, baseUrl: undefined, home: fakeHome, log: warnLog });
+    check("识别失败且未配置 → 提示安装兜底 web", warnLog.lines.some((line) => line.includes(`default to "web"`)));
+    const quietWhenConfigured = quietLog();
+    resolveProfileTargets({ configured: "profile-b", baseUrl: undefined, home: fakeHome, log: quietWhenConfigured });
+    check("识别失败但已配置 → 不提示兜底", quietWhenConfigured.lines.length === 0);
+
+    // ── 12. 恢复执行：识别不出就一次都不许调用 ──────────────────────────────
+    // 前面钉的是「算出什么」，这里钉「据此做了什么」——两者之间正是上一版
+    // 出问题的地方，只测前者等于没测。
+    let recoverCalls = [];
+    const spyRecover = (dir) => { recoverCalls.push(dir); return { action: "none" }; };
+
+    recoverCalls = [];
+    const skipLog = quietLog();
+    const skipped = runStartupRecovery(undefined, { recover: spyRecover, log: skipLog });
+    check("运行 profile 未知 → recoverProfile 一次都不调用", recoverCalls.length === 0);
+    check("运行 profile 未知 → 结算为 skipped", skipped.action === "skipped");
+    check("跳过时说明原因（不静默）", skipLog.lines.some((line) => line.includes("startup recovery skipped")));
+
+    recoverCalls = [];
+    runStartupRecovery("profile-a", { recover: spyRecover, log: quietLog() });
+    check("运行 profile 已知 → 只对该 profile 调用一次",
+      recoverCalls.length === 1 && basename(recoverCalls[0]) === "profile-a");
+
+    // 恢复抛错不能拖垮插件加载：这条是 apply 能否起来的底线。
+    recoverCalls = [];
+    const throwLog = quietLog();
+    const threw = runStartupRecovery("profile-a", {
+      recover: () => { throw new Error("boom"); },
+      log: throwLog,
+    });
+    check("恢复抛错 → 吞掉并记录，不向上抛", threw.action === "failed");
+    check("恢复抛错 → 有日志", throwLog.lines.some((line) => line.includes("startup recovery failed")));
+
+    // 提交/回滚两条播报路径。
+    const committedLog = quietLog();
+    runStartupRecovery("profile-a", { recover: () => ({ action: "committed" }), log: committedLog });
+    check("提交路径播报所恢复的 profile 名", committedLog.lines.some((line) => line.includes('committed the pending install for profile "profile-a"')));
+    const rolledLog = quietLog();
+    runStartupRecovery("profile-a", { recover: () => ({ action: "rolled-back", reason: "静态校验未通过" }), log: rolledLog });
+    check("回滚路径播报原因", rolledLog.lines.some((line) => line.includes("rolled back") && line.includes("静态校验未通过")));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

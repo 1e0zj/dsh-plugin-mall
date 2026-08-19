@@ -324,10 +324,14 @@ pnpm --dir <profile> add "github:omdsh-dev/dsh-at-file" --ignore-scripts
   三处。`allowBuilds` 是持久化的安全配置，所以安装最终失败时这次放宽会被
   **撤销** —— 否则一个没装成的插件会让那个包名从此静默获得构建脚本执行权。
 - 配置（`cordis.patch.yml` 中可改）：`defaultProfile`（默认装进哪个 profile，
-  默认 `web`）、`apiBase`（GitHub API 地址）、`npmRegistry`（npm 查询源，留空
-  则跟随 pnpm 实际安装源）、`rawSources`（验证用的 package.json 源模板列表，
-  `{repo}` 会替换成 owner/name，留空用内置的 jsDelivr + raw 双源）、
-  `perPageMax`（搜索单页上限）、`allowRestart`（是否允许一键重启，默认 `true`）。
+  **不配则跟随本进程实际启动的那个** —— 从 loader 的配置树锚点 `ctx.baseUrl`
+  推导，那正是 profile 目录；推不出来才退回 `web` 并打日志）、`apiBase`
+  （GitHub API 地址）、`npmRegistry`（npm 查询源，留空则跟随 pnpm 实际安装
+  源）、`rawSources`（验证用的 package.json 源模板列表，`{repo}` 会替换成
+  owner/name，留空用内置的 jsDelivr + raw 双源）、`perPageMax`（搜索单页上限，
+  1–30 的整数，默认 30）、`allowRestart`（是否允许一键重启，默认 `true`）。
+  自动识别同时决定**启动恢复作用在哪个 profile 上**：能在此提交半装状态，
+  凭据是「本次启动成功了」，而那只能证明启动的那个 profile 是好的。
 
 ## 发布
 
