@@ -1062,9 +1062,20 @@ function fallbackAddArgs(target) {
 }
 
 /**
- * The lockfile's pinned version for one direct dependency, or undefined. In a
- * rollback the lockfile has just been restored from the snapshot, so this IS
- * the exact version the rollback is trying to get back — not a guess.
+ * The lockfile's pinned resolution for one direct dependency, or undefined. In
+ * a rollback the lockfile has just been restored from the snapshot, so this IS
+ * the exact thing the rollback is trying to get back — not a guess. For a
+ * semver dependency it is the resolved version (`0.13.1`); for a git-hosted one
+ * it is the resolved tarball URL carrying the commit sha, which is precisely
+ * what makes a moving `github:` spec pinnable.
+ *
+ * Only the profile's own importer (`.`) is read — a dsh profile is a single
+ * package, never a workspace. A version carrying pnpm's peer suffix
+ * (`1.2.3(react@18.0.0)`, emitted when a peer is resolved from inside the
+ * project) is not a legal add spec; it is returned as-is and the caller's
+ * assertSafeSpec rejects it on the parens, so the fallback fails closed rather
+ * than adding something wrong. Profiles install with auto-install-peers off and
+ * take their peers from the host, so this has not been observed in practice.
  */
 function pinnedLockfileVersion(profileDir, name) {
   try {
@@ -1076,17 +1087,34 @@ function pinnedLockfileVersion(profileDir, name) {
   }
 }
 
+/** The target when it survives the spec blacklist, undefined when it does not. */
+function safeAddTarget(target) {
+  try {
+    assertSafeSpec(target);
+    return target;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * The argv target for a fallback `pnpm add` of one restored dependency, or
  * undefined when that spec cannot be added offline and safely.
  *
- * - `github:owner/repo` adds by the spec itself — pnpm keeps a git resolution
- *   cache, so `--offline` add relinks from the store on a cache hit (verified
- *   on a real profile: exit 0, zero downloads) and exits nonzero otherwise,
- *   falling through to the same fail-closed path. `--offline` keeps the
- *   recovery network-free either way. The marketplace's primary source IS
- *   github:, so this branch covers most real plugins.
- * - `file:/link:` paths add by the spec itself.
+ * - `file:`/`link:` paths add by the spec itself: a local path is not a moving
+ *   target, it names one fixed thing.
+ * - `github:owner/repo` MUST be pinned to the lockfile's resolution and is
+ *   never added by the spec itself. A bare github spec means "whatever HEAD is
+ *   now", but a rollback needs "what I had" — and the freshest thing in pnpm's
+ *   resolution cache and store is exactly the commit the failed update just
+ *   fetched, i.e. the version being rolled back FROM. Adding the bare spec
+ *   would relink that commit, and candidateRestoredCompatible cannot catch it:
+ *   a non-semver spec has no range to check, so a present package passes on
+ *   name alone. The rollback would then clear the marker and delete the
+ *   snapshot, leaving node_modules on the rejected version, the lockfile
+ *   claiming the old one, and no recovery evidence at all — a fail-OPEN worse
+ *   than not trying. The pinned tarball URL carries the commit sha, so pnpm
+ *   either relinks that exact commit from the store or exits nonzero.
  * - Semver ranges: `name@range` only when the range carries no shell
  *   metacharacters — and `^` (the near-universal pnpm save prefix!) is one
  *   (cmd's escape character: it mangles the argv through the shell-wrapped
@@ -1094,39 +1122,26 @@ function pinnedLockfileVersion(profileDir, name) {
  *   ranges like `^1.0.0 || ^2.0.0` — the target becomes
  *   `name@<lockfile pinned version>`: the lockfile is the authority this
  *   rollback just restored, so its pinned version is by definition a legal
- *   restore target for any range. Only a missing/unreadable lockfile entry
- *   stays fail-closed.
+ *   restore target for any range.
+ *
+ * Everything that cannot be pinned stays fail-closed (marker + snapshot kept
+ * for `guard recover` or manual repair), which is the whole point: an unpinned
+ * guess is not a recovery.
  */
 function fallbackAddTarget(name, spec, profileDir) {
   const range = String(spec ?? "");
   if (range.length === 0) return undefined;
-  const isLocal = /^(?:file:|link:)/i.test(range);
+  if (/^(?:file:|link:)/i.test(range)) return safeAddTarget(range);
   const isGit = /^github:/i.test(range);
-  if (isLocal || isGit) {
-    try {
-      assertSafeSpec(range);
-      return range;
-    } catch {
-      return undefined;
-    }
-  }
-  if (validRange(range) === null) return undefined;
-  const direct = `${name}@${range}`;
-  try {
-    assertSafeSpec(direct);
-    return direct;
-  } catch {
-    /* ^-prefixed and other shell-hostile ranges: fall through to the pinned version */
+  if (!isGit) {
+    if (validRange(range) === null) return undefined;
+    // A shell-safe range splices directly; `^` and friends fall through.
+    const direct = safeAddTarget(`${name}@${range}`);
+    if (direct !== undefined) return direct;
   }
   const pinned = pinnedLockfileVersion(profileDir, name);
   if (pinned === undefined) return undefined;
-  const pinnedTarget = `${name}@${pinned}`;
-  try {
-    assertSafeSpec(pinnedTarget);
-    return pinnedTarget;
-  } catch {
-    return undefined;
-  }
+  return safeAddTarget(`${name}@${pinned}`);
 }
 
 /**
@@ -2200,16 +2215,20 @@ async function selfTest() {
     }
 
     // fallbackAddTarget (pure): what one restored dependency may be offline
-    // re-added as. github: specs add by the spec itself — pnpm keeps a git
-    // resolution cache, so `--offline` add relinks from the store on a cache
-    // hit (verified on a real profile: exit 0, zero downloads) and exits
-    // nonzero otherwise, falling through to the same fail-closed path.
-    // `^` ranges (pnpm's near-universal save prefix) cannot be spliced into a
-    // shell-wrapped argv (cmd eats the caret), so they resolve to the
-    // lockfile's pinned version — exactly what a rollback is restoring to.
+    // re-added as. `^` ranges (pnpm's near-universal save prefix) cannot be
+    // spliced into a shell-wrapped argv (cmd eats the caret), so they resolve
+    // to the lockfile's pinned version — exactly what a rollback is restoring
+    // to. A `github:` spec resolves to its pinned tarball URL for a different
+    // and sharper reason: the bare spec means "HEAD now", and the freshest
+    // thing in pnpm's cache/store is the commit the failed update just fetched,
+    // so adding it bare would relink the very version being rolled back FROM —
+    // and a non-semver spec has no range for candidateRestoredCompatible to
+    // check, so that wrong copy would pass on name alone, clear the marker and
+    // delete the snapshot. Pinning is what keeps the fallback fail-closed.
     {
       const lockRoot = join(root, "profiles", "fbtarget");
       mkdirSync(lockRoot, { recursive: true });
+      const tarball = "https://codeload.github.com/owner/repo/tar.gz/898369ece56ae6ec41afd8e014f187bb5b723409";
       writeFileSync(join(lockRoot, "pnpm-lock.yaml"), [
         "lockfileVersion: '9.0'",
         "importers:",
@@ -2218,6 +2237,12 @@ async function selfTest() {
         "      good:",
         "        specifier: ^1.0.0",
         "        version: 1.0.0",
+        "      hosted:",
+        "        specifier: github:owner/repo",
+        `        version: ${tarball}`,
+        "      peered:",
+        "        specifier: ^1.0.0",
+        "        version: 1.0.0(@deepseek-ai/cordis@4.0.1)",
         "",
       ].join("\n"));
       if (fallbackAddTarget("good", "1.0.0", lockRoot) !== "good@1.0.0") throw new Error("a plain range splices directly");
@@ -2225,7 +2250,22 @@ async function selfTest() {
       if (fallbackAddTarget("good", "^1.0.0", join(root, "profiles", "no-lock-here")) !== undefined) {
         throw new Error("a ^-range without a readable lockfile must stay fail-closed");
       }
-      if (fallbackAddTarget("good", "github:owner/repo", lockRoot) !== "github:owner/repo") throw new Error("a github spec must add by itself");
+      // A bare github spec must NEVER be added as itself: pinning to the
+      // lockfile's tarball URL is the only thing that names the old commit.
+      if (fallbackAddTarget("hosted", "github:owner/repo", lockRoot) !== `hosted@${tarball}`) {
+        throw new Error("a github spec must resolve to the lockfile pinned tarball, never to the moving bare spec");
+      }
+      if (fallbackAddTarget("hosted", "github:owner/repo", join(root, "profiles", "no-lock-here")) !== undefined) {
+        throw new Error("a github spec without a readable lockfile must stay fail-closed, not fall back to the bare spec");
+      }
+      if (fallbackAddTarget("absent", "github:owner/absent", lockRoot) !== undefined) {
+        throw new Error("a github spec with no lockfile entry must stay fail-closed");
+      }
+      // pnpm's peer suffix is not a legal add spec — the parens hit the spec
+      // blacklist, so the fallback fails closed instead of adding something odd.
+      if (fallbackAddTarget("peered", "^1.0.0", lockRoot) !== undefined) {
+        throw new Error("a peer-suffixed pinned version must stay fail-closed");
+      }
       if (fallbackAddTarget("good", "file:D:\\pkg.tgz", lockRoot) !== "file:D:\\pkg.tgz") throw new Error("local file target expected");
       // 多区间 range 直拼必被拒（空格/管道），但 lockfile 的 pinned 对任何
       // range 都是合法恢复目标（lockfile 即权威）——同样走 pinned，

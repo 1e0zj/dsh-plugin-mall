@@ -120,9 +120,10 @@ pnpm --dir ~/.dsh/profiles/web add "@1e0zj/dsh-plugin-mall@0.3.2" --ignore-scrip
 ```
 
 **GitHub sources** (`"name": "github:owner/repo"`) — try `guard recover` first:
-for git dependencies it attempts an offline re-add from pnpm's resolution cache
-(a cache hit repairs it automatically). If dsh still won't start (cache miss),
-install it back manually, online:
+for git dependencies it re-adds the exact commit the lockfile pins, offline, so
+a store hit repairs it automatically and anything else is left untouched for
+manual repair. If dsh still won't start, install it back manually, online (this
+takes the repo's latest commit, not the one you had):
 
 ```powershell
 pnpm --dir "$env:USERPROFILE\.dsh\profiles\web" add "github:owner/repo" --ignore-scripts
@@ -132,8 +133,7 @@ pnpm --dir "$env:USERPROFILE\.dsh\profiles\web" add "github:owner/repo" --ignore
 pnpm --dir ~/.dsh/profiles/web add "github:owner/repo" --ignore-scripts
 ```
 
-Then `dsh web`. If npmmirror has not synced 0.3.2 yet, append
-`--registry=https://registry.npmjs.org` to B. As of 0.3.2 the rollback rebuild
+Then `dsh web`. As of 0.3.2 the rollback rebuild
 carries a per-package `pnpm add` fallback and the approval pause no longer rolls
 back, so this cannot happen anymore.
 
@@ -282,8 +282,9 @@ pnpm --dir ~/.dsh/profiles/web add "@1e0zj/dsh-plugin-mall@0.3.2" --ignore-scrip
 ```
 
 **GitHub 源**（`"名字": "github:owner/repo"` 这类）——先跑上面的 guard
-recover：它对 git 依赖会尝试从 pnpm 的解析缓存离线装回（缓存命中即可自动
-修复）；若仍起不来（缓存未命中），手动联网装回：
+recover：它对 git 依赖会按 lockfile 钉住的那个 commit 离线装回，store 命中
+即自动修复，其余情况原样保留现场交给手工处理。若仍起不来，手动联网装回
+（这会装成仓库最新的 commit，不是你原来那个）：
 
 ```powershell
 pnpm --dir "$env:USERPROFILE\.dsh\profiles\web" add "github:owner/repo" --ignore-scripts
@@ -293,8 +294,7 @@ pnpm --dir "$env:USERPROFILE\.dsh\profiles\web" add "github:owner/repo" --ignore
 pnpm --dir ~/.dsh/profiles/web add "github:owner/repo" --ignore-scripts
 ```
 
-然后 `dsh web`。npmmirror 尚未同步 0.3.2 时，给 B 追加
-`--registry=https://registry.npmjs.org`。0.3.2 起，回滚重建带 per-package
+然后 `dsh web`。0.3.2 起，回滚重建带 per-package
 add 兜底、批准暂停不再触发回滚，该问题不再发生。
 
 
