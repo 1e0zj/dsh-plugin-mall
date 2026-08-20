@@ -47,6 +47,13 @@ Restart dsh after installing.
 > spec (recipe in the 安装 section below). Do not hand-overwrite files under
 > `node_modules`: they are hard-linked into pnpm's global store, and any later
 > `pnpm add/remove` rebuilds the tree and restores them anyway.
+>
+> Re-packing and running `add` again does **nothing**: the `file:` spec and the
+> version are unchanged, so pnpm calls it already installed and never compares
+> the tarball's bytes. The command succeeds, `package.json` looks right, and
+> `node_modules` still holds the previous build. Always `remove` before `add`,
+> or give the test build its own version. Then restart dsh completely — the
+> install ran inside the host process still executing the old code.
 
 ## Startup protection (guard CLI)
 
@@ -183,7 +190,16 @@ dsh plugin --profile web add link:C:\path\to\dsh-plugin-mall
 > ```
 >
 > 这样 pnpm 的规范副本本身就是新代码，后续任何 `pnpm add/remove` 重建依赖树都不会
-> 把它换掉；顺带还验证了 `files` 字段没漏文件。改完代码重新 `npm pack` + 重装即可。
+> 把它换掉；顺带还验证了 `files` 字段没漏文件。
+>
+> **`remove` 那一步不能省。** 改完代码重新 `npm pack` 之后只跑 `add`，pnpm 会
+> **什么都不做**：spec（`file:` 路径）和版本号都没变，它就判定「已经装好了」而
+> 跳过，根本不去比对 tarball 的字节。表现是命令成功返回、`package.json` 看着也
+> 对，但 `node_modules` 里还是上一版代码——排查时极难想到这一层。要么每次都
+> `remove` + `add`，要么给测试包换一个版本号（如 `0.3.5-test.1`）。
+>
+> 同理，**装完必须完整重启 dsh**（不是刷新页面）：卸载/安装是由**正在运行的那个
+> 宿主进程**执行的，它内存里跑的还是旧代码。新装的代码要下一次启动才生效。
 >
 > **不要用直接覆盖 `node_modules` 里文件的办法。** 它有两个坑：
 > 一是 pnpm 装出来的文件是**硬链接**（与全局 store 共享 inode），直接 `cp` 覆盖会
