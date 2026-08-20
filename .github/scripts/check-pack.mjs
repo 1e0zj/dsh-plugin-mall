@@ -21,6 +21,15 @@ import { pathToFileURL } from "node:url";
 const repo = resolve(process.cwd());
 const manifest = JSON.parse(readFileSync(join(repo, "package.json"), "utf8"));
 
+// 下面的真实加载要经宿主解析裸导入。缺了就直说 —— 否则报的是解包之后
+// cpSync 的一句裸 ENOENT，看栈完全猜不到该跑哪条命令（CI 首跑就栽在这）。
+const hostModules = join(repo, ".github/fixtures/guard-tests/node_modules");
+if (!existsSync(hostModules)) {
+  console.error(`缺少 fixture 的宿主依赖：${hostModules}`);
+  console.error("先跑：npm ci --prefix .github/fixtures/guard-tests --ignore-scripts");
+  process.exit(1);
+}
+
 let failed = 0;
 const check = (label, ok, extra = "") => {
   if (ok) {
@@ -79,7 +88,7 @@ try {
   check("tarball 解包出 package/", existsSync(pkgDir));
 
   // 裸导入（@deepseek-ai/*）要经宿主解析，和真实 profile 里一样。
-  cpSync(join(repo, ".github/fixtures/guard-tests/node_modules"), join(pkgDir, "node_modules"), { recursive: true });
+  cpSync(hostModules, join(pkgDir, "node_modules"), { recursive: true });
 
   const loaded = await import(pathToFileURL(join(pkgDir, "src/index.js")).href);
 

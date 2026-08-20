@@ -79,6 +79,10 @@ jobs:
           node-version: '24'
           package-manager-cache: false
 
+      # 解包后的真实加载要经宿主解析裸导入，和 test job 同一套锁定依赖。
+      - name: 安装锁定的 fixture 依赖
+        run: npm ci --prefix .github/fixtures/guard-tests --ignore-scripts --no-audit --no-fund
+
       # 漏打包一个文件的后果和代码写错一样严重，而且只有用户装了才发现：
       # 0.1.x 曾漏过 cordis.patch.yml，装上去的插件不挂载任何东西。
       - name: npm pack 后核对产物清单
