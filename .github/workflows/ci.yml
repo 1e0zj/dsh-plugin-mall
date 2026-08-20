@@ -1,0 +1,111 @@
+# 每次 push 和 PR 都跑，而不是只在发布 tag 上验。
+#
+# 在这之前，第一次运行完整检查的时刻就是发布的时刻——问题暴露时版本号已经
+# 打出去了。真出过事：一次卸载中途失败让 profile 起不来，是用户手工发现的。
+#
+# Windows 不是可选项。这个项目一大半的坑是 Windows 专属的：.cmd shim、路径
+# 空格、CON/NUL 保留设备名、进程树终止、以及 pnpm 写 lockfile 时的 EPERM。
+# 只跑 Linux 等于没测到真实用户环境。
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+# 同一分支上的新提交取消旧任务：跑到一半的结果没人看，白占 runner。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} · node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # 一个组合失败不掩盖其他组合的结果——Windows 专属故障最常见的形态就是
+      # 「Linux 全绿、Windows 单挂」。
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        # 22 = 宿主要求的下限（dsh 的 trusted publishing 要 >= 22.14.0），
+        # 24 = 发布 workflow 实际使用的版本。
+        node: ['22', '24']
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+
+      # 不对仓库根跑 npm ci：根 package.json 的宿主 peer 不是开发依赖，而且
+      # 框架包的 dist-tags 横跨两条发布线（dsh-tools 还在 0.0.1-rc.x，
+      # dsh-app-boot 已到 0.1.0-rc.x），peer 区间无交集，必然 ERESOLVE。
+      # fixture 依赖树单独锁定重放。
+      - name: 安装锁定的 fixture 依赖
+        run: npm ci --prefix .github/fixtures/guard-tests --ignore-scripts --no-audit --no-fund
+
+      # release.yml 用 `ln -s`，那在 Windows 的 PowerShell 下不通用。改用
+      # fs.cpSync：两个平台上行为一致，也不依赖开发者模式或管理员权限。
+      - name: 让裸导入解析得到宿主包
+        run: node -e "require('node:fs').cpSync('.github/fixtures/guard-tests/node_modules','node_modules',{recursive:true})"
+
+      # 五套离线 fixture。无网络、无 pnpm、无 dsh，也不触碰真实 profile。
+      # 每套单独一步，失败时一眼看出是哪套——合成一步的话 Windows 上要靠翻
+      # 日志才能定位。
+      - name: fixture · github（离线）
+        run: node src/github.js --self-test --offline
+      - name: fixture · guard
+        run: node src/guard.js --self-test
+      - name: fixture · cli
+        run: node src/cli.js self-test
+      - name: fixture · installer
+        run: node src/installer.js --self-test
+      - name: fixture · index
+        run: node src/index.js --self-test
+
+  pack:
+    name: 打包产物
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      # 漏打包一个文件的后果和代码写错一样严重，而且只有用户装了才发现：
+      # 0.1.x 曾漏过 cordis.patch.yml，装上去的插件不挂载任何东西。
+      - name: npm pack 后核对产物清单
+        run: node .github/scripts/check-pack.mjs
+
+  space-path:
+    # 路径空格是 Windows 上反复出问题的一类（.cmd shim 走 shell 时参数被空格
+    # 切开）。代码里有针对性的判定，但那些 fixture 自己构造路径；这一项验的是
+    # 「整个项目从一个带空格的目录跑起来」也没问题。
+    name: 带空格的路径（windows）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: 'dir with spaces/dsh plugin mall'
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: 安装锁定的 fixture 依赖
+        working-directory: 'dir with spaces/dsh plugin mall'
+        run: npm ci --prefix .github/fixtures/guard-tests --ignore-scripts --no-audit --no-fund
+      - name: 让裸导入解析得到宿主包
+        working-directory: 'dir with spaces/dsh plugin mall'
+        run: node -e "require('node:fs').cpSync('.github/fixtures/guard-tests/node_modules','node_modules',{recursive:true})"
+      - name: fixture · installer 与 cli（进程与路径处理集中在这两套）
+        working-directory: 'dir with spaces/dsh plugin mall'
+        run: |
+          node src/installer.js --self-test
+          node src/cli.js self-test
