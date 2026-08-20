@@ -93,10 +93,32 @@ function writeJsonChecked(filePath, nextContent, label) {
 function writePatchChecked(filePath, nextContent) {
   return writeChecked(filePath, nextContent, (text) => {
     const doc = load(text);
-    if (doc !== null && doc !== undefined && !Array.isArray(doc)) {
-      throw new Error("expected a top-level array of patch entries");
+    // null/undefined 曾被放行——那是一个只剩注释的文档，我们的校验说它没问题，
+    // 而 dsh 的 parsePatchList 明确 `if (!Array.isArray(parsed)) throw ... must
+    // be a top-level YAML array`，于是 profile 写完就起不来。写后回读校验的全部
+    // 意义是「写出去的东西消费方能吃」，判据必须和消费方一致，不能更宽松。
+    if (!Array.isArray(doc)) {
+      throw new Error("expected a top-level array of patch entries (dsh refuses to boot on anything else, including a comments-only file)");
     }
   }, "cordis.patch.yml");
+}
+
+/**
+ * Serialize a patch file back after rows were spliced out.
+ *
+ * A file that keeps its header comments but loses every entry parses as `null`,
+ * not `[]` — and dsh refuses to boot on it. So the empty result has to carry an
+ * explicit `[]`, exactly like the stock template does.
+ *
+ * @param lines - the remaining lines after splicing.
+ * @returns the text to write.
+ */
+function serializePatchLines(lines) {
+  const next = lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (next.length === 0) return "[]\n";
+  // 还有条目就原样保留；一条不剩（只余注释）必须补回空数组。
+  const hasEntries = next.split("\n").some((line) => /^\s*-\s/.test(line));
+  return hasEntries ? `${next}\n` : `${next}\n[]\n`;
 }
 
 // ── profile management ──────────────────────────────────────────────────────
@@ -399,9 +421,72 @@ export function removeClientRow(profileDir, packageName) {
     break;
   }
   if (!removed) return { removed: false };
-  const next = lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
-  writePatchChecked(patchPath, next.length === 0 ? "[]\n" : `${next}\n`);
+  writePatchChecked(patchPath, serializePatchLines(lines));
   return { removed: true, rowId };
+}
+
+/**
+ * Drop the enable/disable override rows this profile holds for `packageName`.
+ *
+ * Uninstall has cleaned up the *insert* row it writes for browser plugins since
+ * it existed (v0.1.17). The enable/disable feature arrived three days later
+ * (v0.3.0) and introduced a second kind of row — an id-targeted override —
+ * which nothing ever removed. Uninstalling a plugin you had toggled therefore
+ * left a row pointing at an entry that no longer exists, and dsh warns about it
+ * on every boot: `patch: entry "x" not found`.
+ *
+ * The warning is the mild half. The row also **comes back to life on reinstall**
+ * — a plugin uninstalled while disabled returns disabled, looking installed and
+ * doing nothing, with no visible reason.
+ *
+ * Only rows in exactly the shape {@link setPatchRowDisabled} writes are removed:
+ * an id, our `name` guard, and a literal boolean `disabled`. Anything else is
+ * the user's own content and stays, warning and all —
+ *
+ *   - `disabled: !!js …` is a condition they wrote (see setPatchRowDisabled,
+ *     which refuses to overwrite it for the same reason). The package is gone,
+ *     but the expression is still theirs.
+ *   - a row carrying `config:` or other keys means more than a toggle.
+ *
+ * A leftover warning costs a line of console noise. Deleting user configuration
+ * silently costs something we cannot give back.
+ *
+ * @param profileDir - the profile whose patch layer to edit.
+ * @param packageName - the module name in the rows' `name:` guard.
+ * @returns the entry ids whose rows were removed.
+ */
+export function removeToggleRows(profileDir, packageName) {
+  const patchPath = join(profileDir, PROFILE_PATCH_FILENAME);
+  if (!existsSync(patchPath)) return { removed: [] };
+  const content = readFileSync(patchPath, "utf8");
+  // 文件坏了就整个不碰——和 mergeAllowBuilds 同样的态度：只会越弄越糟。
+  try {
+    load(content);
+  } catch {
+    return { removed: [] };
+  }
+  const lines = content.split("\n");
+  const quoted = `'${packageName}'`;
+  const removed = [];
+  // 从后往前删，前面的下标才不会被影响。
+  for (let index = lines.length - 3; index >= 0; index--) {
+    const idMatch = /^-\s+id:\s*(\S+)\s*$/.exec(lines[index]);
+    if (idMatch === null) continue;
+    const nameMatch = /^\s{2}name:\s*(\S+)\s*$/.exec(lines[index + 1]);
+    if (nameMatch === null) continue;
+    if (nameMatch[1] !== quoted && nameMatch[1] !== packageName) continue;
+    // 第三行必须是字面量布尔的 disabled，且第四行不能还属于这一条——
+    // 多一个键就说明这行不只是个开关，留给用户。
+    if (!/^\s{2}disabled:\s*(?:true|false)\s*$/.test(lines[index + 2])) continue;
+    // 这一条不能还有别的内容。额外键必然是缩进的（`  config:`），而顶格的
+    // 注释或下一条 `- ` 不属于它——把注释当成额外键会让这行永远删不掉。
+    if (/^\s+\S/.test(lines[index + 3] ?? "")) continue;
+    lines.splice(index, 3);
+    removed.unshift(idMatch[1]);
+  }
+  if (removed.length === 0) return { removed: [] };
+  writePatchChecked(patchPath, serializePatchLines(lines));
+  return { removed };
 }
 
 // ── enable / disable persistence ────────────────────────────────────────────
@@ -2080,6 +2165,8 @@ function runRemoveInner({ profile, packageName, _profileDir, _spawn }, selfHeale
     try {
       const bundles = reconcileBundles(profileDir, beforeDeps);
       const clientRow = removeClientRow(profileDir, packageName);
+      // 启用/停用留下的覆盖行也要一起带走——否则它会在重装时复活。
+      const toggleRows = removeToggleRows(profileDir, packageName);
       // 退出码 0 不等于卸干净了。落盘校验用的是启动恢复同一套判据：
       // profile 整体仍然自洽，且这个包确实从清单和装配层里消失了。任何一条
       // 不过就还原——一个「装着但坏」的 profile 比一个没卸掉的插件糟得多。
@@ -2094,6 +2181,7 @@ function runRemoveInner({ profile, packageName, _profileDir, _spawn }, selfHeale
       commitPendingSnapshot(profileDir);
       const notes = [`bundle layer(s) now: ${bundles.join(", ") || "none (template only)"}`];
       if (clientRow.removed) notes.push(`removed client loader row "${clientRow.rowId}" from cordis.patch.yml`);
+      if (toggleRows.removed.length > 0) notes.push(`removed enable/disable row(s) ${toggleRows.removed.map((id) => `"${id}"`).join(", ")} from cordis.patch.yml`);
       return { status: "completed", detail: `removed ${packageName} from profile "${profile}" — ${notes.join("; ")}. Restart dsh for the change to take effect.` };
     } catch (error) {
       return rollbackRemove(`pnpm removed ${packageName} but post-remove reconciliation failed: ${error?.message ?? String(error)}`);
@@ -3452,6 +3540,90 @@ function runToggleFixtures() {
   check("多条目：不误伤相邻条目的 disabled", setPatchRowDisabled(multi, "a", true)?.includes("- id: z\n  name: pkg-z\n  disabled: true") === true);
 
   check("带引号的 id 也能匹配", setPatchRowDisabled(`- id: '@scope/pkg'\n  name: x\n`, "@scope/pkg", true) !== undefined);
+
+  // ── 卸载时清理启用/停用覆盖行 ─────────────────────────────────────────────
+  //
+  // 这些行是 v0.3.0 的 toggle 功能引入的，而卸载的 patch 清理写于 v0.1.17，
+  // 只认 insert 行。于是「停用过再卸载」会留下一条指向不存在条目的覆盖行：
+  // 每次启动一条 `patch: entry "x" not found`，更要紧的是**重装时它会复活**，
+  // 插件带着停用状态回来、界面显示已装却不工作。
+  //
+  // 这组用例的重点全在「什么不许删」：patch 层是用户手写的文件，删错的代价
+  // 是无声丢配置，而留着的代价只是一行警告。
+  const toggleCleanup = (content, packageName = "dsh-at-file") => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-mall-toggle-clean-"));
+    try {
+      writeFileSync(join(dir, PROFILE_PATCH_FILENAME), content);
+      const result = removeToggleRows(dir, packageName);
+      return { result, text: readFileSync(join(dir, PROFILE_PATCH_FILENAME), "utf8") };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  const ourShape = "- id: at-file\n  name: 'dsh-at-file'\n  disabled: false\n";
+  const cleaned = toggleCleanup(ourShape);
+  check("我们写的形状 → 删掉，文件回到空列表",
+    cleaned.result.removed.join(",") === "at-file" && cleaned.text.trim() === "[]",
+    JSON.stringify(cleaned.text));
+
+  // 删空一个**带头部注释**的文件时，剩下的只有注释——那解析成 null 而不是
+  // []，dsh 的 parsePatchList 会直接拒绝启动。真实 profile 的模板恰恰带着
+  // 这段注释，所以这是必经路径，不是边角。
+  const stockShaped = "# Your patch layer for this dsh profile\n# 第二行注释\n- id: at-file\n  name: 'dsh-at-file'\n  disabled: false\n";
+  const stockCleaned = toggleCleanup(stockShaped);
+  check("删光带注释文件的最后一行 → 补回 []，保持 dsh 能解析的形状",
+    Array.isArray(load(stockCleaned.text))
+      && stockCleaned.text.includes("# Your patch layer")
+      && stockCleaned.text.includes("[]"),
+    JSON.stringify(stockCleaned.text));
+
+  const jsExpr = "- id: at-file\n  name: 'dsh-at-file'\n  disabled: !!js process.platform === 'win32'\n";
+  check("disabled 是 !!js 表达式 → 留着（那是用户写的条件逻辑）",
+    toggleCleanup(jsExpr).text === jsExpr);
+
+  const withConfig = "- id: at-file\n  name: 'dsh-at-file'\n  disabled: false\n  config:\n    foo: 1\n";
+  check("行里还带 config: → 留着（不只是个开关）",
+    toggleCleanup(withConfig).text === withConfig);
+
+  const noNameGuard = "- id: at-file\n  disabled: false\n";
+  check("没有 name 守卫的行 → 留着（无法确认属于这个包）",
+    toggleCleanup(noNameGuard).text === noNameGuard);
+
+  const otherPkg = "- id: sidebar\n  name: 'dsh-better-sidebar'\n  disabled: true\n";
+  check("别的包的行 → 一个字节不动",
+    toggleCleanup(otherPkg).text === otherPkg && toggleCleanup(otherPkg).result.removed.length === 0);
+
+  // 一个包可以插入多行（loaderEntriesByPackage 就是为此存在的），要全删。
+  const multiRow = "- id: a1\n  name: 'dsh-at-file'\n  disabled: true\n- id: keep\n  name: 'other'\n  disabled: true\n- id: a2\n  name: 'dsh-at-file'\n  disabled: false\n";
+  const multiCleaned = toggleCleanup(multiRow);
+  check("同一个包的多条行 → 全部删除，且顺序保持",
+    multiCleaned.result.removed.join(",") === "a1,a2" && multiCleaned.text.includes("- id: keep"),
+    JSON.stringify(multiCleaned.text));
+  check("多行清理后不误伤相邻条目",
+    multiCleaned.text.includes("name: 'other'") && !multiCleaned.text.includes("dsh-at-file"));
+
+  const broken = "- id: at-file\n  name: 'dsh-at-file'\n disabled: [oops\n";
+  check("文件解析不过 → 整个不碰",
+    toggleCleanup(broken).text === broken);
+
+  const commentedRow = "# 我手写的说明\n- id: at-file\n  name: 'dsh-at-file'\n  disabled: false\n# 尾部注释\n";
+  const commentCleaned = toggleCleanup(commentedRow);
+  check("删除目标行时保留周围注释",
+    commentCleaned.text.includes("# 我手写的说明") && commentCleaned.text.includes("# 尾部注释")
+      && !commentCleaned.text.includes("dsh-at-file"),
+    JSON.stringify(commentCleaned.text));
+
+  check("patch 文件不存在 → 安静返回，不创建文件", (() => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-mall-toggle-none-"));
+    try {
+      const result = removeToggleRows(dir, "dsh-at-file");
+      return result.removed.length === 0 && !existsSync(join(dir, PROFILE_PATCH_FILENAME));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  })());
+
   return failed;
 }
 
