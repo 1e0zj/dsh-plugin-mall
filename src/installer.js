@@ -1822,7 +1822,24 @@ function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, pref
     return { status: "failed", detail: `pnpm add ${spec} still failed after allowing build scripts (exit code ${retryOutcome.exitCode}). See job output.` };
   };
 
-  const first = spawnAdd();
+  // spawn 也可能**同步**抛（无效参数、平台细节）。此刻 marker 已写下，且
+  // pnpm-workspace.yaml 正停在被中和的状态——异常若绕过下面的 .catch 冒出去，
+  // restoreOriginalWorkspace() 永远不会执行。那不只是遗留一个 marker：启动
+  // 恢复看到 profile 校验通过就会 commit 并删掉快照，用户的 allowBuilds 批准
+  // 就此永久丢失。所以这里必须自己接住并走完整的收尾。
+  let first;
+  try {
+    first = spawnAdd();
+  } catch (error) {
+    restoreOriginalWorkspace();
+    const detail = `could not start pnpm: ${error?.message ?? String(error)}`;
+    try {
+      rollbackPendingSnapshot(profileDir);
+      return { cancel: () => {}, done: Promise.resolve({ status: "failed", detail: `${detail}; the profile was restored to its pre-install state` }), readOutput: () => deltaQueue.splice(0).join("") };
+    } catch (rollbackError) {
+      return { cancel: () => {}, done: Promise.resolve({ status: "failed", detail: `${detail}; rollback also failed and the pending marker was kept for recovery: ${rollbackError.message}` }), readOutput: () => deltaQueue.splice(0).join("") };
+    }
+  }
   current = first;
   const done = first.done
     .then((outcome) => settle(outcome))
@@ -2006,13 +2023,22 @@ function runRemoveInner({ profile, packageName, _profileDir, _spawn }, selfHeale
   };
 
   const plan = _spawn === undefined ? pnpmSpawnPlan() : { command: "pnpm", shell: false, treeKill: false };
-  const proc = (_spawn ?? spawn)(plan.command, ["remove", packageName, "--reporter=append-only"], {
-    cwd: profileDir,
-    env: process.env,
-    shell: plan.shell,
-    stdio: ["ignore", "pipe", "pipe"],
-    windowsHide: true,
-  });
+  // spawn 也可能**同步**抛（无效参数、平台细节），而 marker 此刻已经写下了。
+  // 不接住的话异常会绕过 rollbackRemove 直接冒到 serializedProducer，marker
+  // 留在盘上挡住这个 profile 后续所有安装和卸载，直到下次启动恢复收拾它。
+  let proc;
+  try {
+    proc = (_spawn ?? spawn)(plan.command, ["remove", packageName, "--reporter=append-only"], {
+      cwd: profileDir,
+      env: process.env,
+      shell: plan.shell,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+  } catch (error) {
+    const settled = rollbackRemove(`could not start pnpm: ${error?.message ?? String(error)}`);
+    return { cancel: () => {}, done: Promise.resolve(settled), readOutput: () => deltaQueue.splice(0).join("") };
+  }
   current = { proc, treeKill: plan.treeKill };
   const done = new Promise((resolve) => {
     proc.on("error", (error) => resolve({ spawnError: error }));
@@ -2025,8 +2051,14 @@ function runRemoveInner({ profile, packageName, _profileDir, _spawn }, selfHeale
       if (outcome.spawnError.code === "ENOENT" && selfHealed !== true) {
         const healed = await enablePnpmViaCorepack(push);
         // 重试前先把本轮的事务状态收掉——否则重试那一轮会被自己的 marker 挡住。
+        // 收不掉就不许重试：递归只会撞上自己的 marker 并返回笼统的「有未了结
+        // 事务」，把真正的回滚错因盖掉，而那正是用户需要看到的东西。
         if (healed) {
-          try { rollbackPendingSnapshot(profileDir); } catch { /* 交给下面的重试，失败也不该盖住原因 */ }
+          try {
+            rollbackPendingSnapshot(profileDir);
+          } catch (rollbackError) {
+            return { status: "failed", detail: `pnpm was missing and corepack enabled it, but clearing this remove's pending marker failed, so the retry was not attempted: ${rollbackError.message}. The marker was kept for recovery (restart dsh, or run \`dsh-plugin-guard guard recover\`).` };
+          }
           return await runRemoveInner({ profile, packageName, _profileDir, _spawn }, true).done;
         }
       }
@@ -3143,6 +3175,119 @@ async function runTransactionFixtures() {
       );
     } finally {
       cleanup();
+    }
+  }
+
+  // 3b-5. 卸载成功 → marker 与 snapshot 都必须被提交清理干净。
+  // 留下任何一个都会挡住这个 profile 后续所有安装和卸载，直到下次启动恢复。
+  {
+    const { profileDir, cleanup } = makeTempProfile("remove-success-cleanup", { "pkg-f": "1.0.0" });
+    try {
+      materializeFakePackage(profileDir, "pkg-f", "1.0.0");
+      const { spawnFn } = scriptedSpawn([{
+        code: 0,
+        out: "Done\n",
+        // pnpm 真正卸掉：清单与目录都拿走，落盘校验才会通过。
+        beforeExit: () => {
+          const manifest = JSON.parse(readFileSync(join(profileDir, "package.json"), "utf8"));
+          delete manifest.dependencies["pkg-f"];
+          writeFileSync(join(profileDir, "package.json"), JSON.stringify(manifest, undefined, 2) + "\n");
+          rmSync(join(profileDir, "node_modules", "pkg-f"), { recursive: true, force: true });
+        },
+      }]);
+      const outcome = await runRemove({ profile: "p", packageName: "pkg-f", _profileDir: profileDir, _spawn: spawnFn }).done;
+      const snapshotsLeft = existsSync(join(profileDir, ".dsh-plugin-guard"))
+        ? readdirSync(join(profileDir, ".dsh-plugin-guard")).filter((entry) => entry !== "pending.json")
+        : [];
+      check(
+        "卸载成功 → marker 与 snapshot 都被提交清理，不留残留",
+        outcome.status === "completed"
+          && !existsSync(pendingMarkerPath(profileDir))
+          && snapshotsLeft.length === 0,
+        `status=${outcome.status} marker=${existsSync(pendingMarkerPath(profileDir))} snapshots=${snapshotsLeft.join(",")} detail=${JSON.stringify(outcome.detail)}`,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+
+  // 3b-6. 在途取消：必须等进程真正退出后才回滚，否则会与还在写盘的 pnpm 抢。
+  // 安装路径早有这条，卸载路径此前没有。
+  {
+    const { profileDir, cleanup } = makeTempProfile("remove-cancel-inflight", { "pkg-g": "1.0.0" });
+    try {
+      materializeFakePackage(profileDir, "pkg-g", "1.0.0");
+      const { spawnFn, procs } = blockingSpawn();
+      const producer = runRemove({ profile: "p", packageName: "pkg-g", _profileDir: profileDir, _spawn: spawnFn });
+      await flush();
+      // 与 install 的取消用例同规格：spawn 起来了、marker 已登记，取消之后
+      // 结局是 killed 且 marker 被收掉。回滚接在 'close' 的 promise 之后，
+      // 所以它必然晚于进程退出（FakeProc.kill 同步触发 close，时序无法在
+      // 用例里再细分，由代码结构保证）。
+      const spawnedAndMarked = procs.length === 1 && existsSync(pendingMarkerPath(profileDir));
+      producer.cancel();
+      const outcome = await producer.done;
+      check(
+        "取消在途 remove → killed + 回滚收 marker，包仍在盘上",
+        spawnedAndMarked
+          && outcome.status === "killed"
+          && !existsSync(pendingMarkerPath(profileDir))
+          && existsSync(join(profileDir, "node_modules", "pkg-g")),
+        `spawnedAndMarked=${spawnedAndMarked} status=${outcome.status} marker=${existsSync(pendingMarkerPath(profileDir))} detail=${JSON.stringify(outcome.detail)}`,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+
+  // 3b-7. spawn 同步抛错：marker 已经写下了，异常绝不能绕过收尾。
+  // 安装侧后果更重——workspace 正停在被中和的状态，漏掉恢复就等于把用户的
+  // allowBuilds 批准弄丢（启动恢复会 commit 掉快照，此后再也拿不回来）。
+  {
+    const throwingSpawn = () => { throw new TypeError("spawn EINVAL (synthetic)"); };
+    {
+      const { profileDir, cleanup } = makeTempProfile("remove-spawn-throw", { "pkg-h": "1.0.0" });
+      try {
+        materializeFakePackage(profileDir, "pkg-h", "1.0.0");
+        const outcome = await runRemove({ profile: "p", packageName: "pkg-h", _profileDir: profileDir, _spawn: throwingSpawn }).done;
+        check(
+          "remove 的 spawn 同步抛错 → 走完收尾，不遗留 marker",
+          outcome.status === "failed"
+            && /could not start pnpm/.test(outcome.detail ?? "")
+            && !existsSync(pendingMarkerPath(profileDir)),
+          `status=${outcome.status} marker=${existsSync(pendingMarkerPath(profileDir))} detail=${JSON.stringify(outcome.detail)}`,
+        );
+      } finally {
+        cleanup();
+      }
+    }
+    {
+      const { profileDir, cleanup } = makeTempProfile("install-spawn-throw", { "pkg-i": "1.0.0" });
+      try {
+        const initialWs = "packages:\n  - .\n\nallowBuilds:\n  native-pkg: true\n\nnodeLinker: hoisted\n";
+        writeFileSync(join(profileDir, "pnpm-workspace.yaml"), initialWs);
+        // 清单里声明的直系依赖必须都在盘上，否则回滚的完整性校验会失败并
+        // 保留 marker——那是另一条正确行为，会盖住这条要测的东西。
+        materializeFakePackage(profileDir, "pkg-i", "1.0.0");
+        materializeFakePackage(profileDir, "native-pkg", "1.0.0", { install: "node build.js" });
+        const outcome = await runInstall({
+          profile: "p",
+          spec: "some-plugin",
+          preflight: preflightStub("some-plugin"),
+          _profileDir: profileDir,
+          _spawn: throwingSpawn,
+          _describe: describeStub,
+        }).done;
+        check(
+          "install 的 spawn 同步抛错 → 恢复 workspace 原字节且不遗留 marker（否则用户的 allowBuilds 会被永久中和）",
+          outcome.status === "failed"
+            && readFileSync(join(profileDir, "pnpm-workspace.yaml"), "utf8") === initialWs
+            && !existsSync(pendingMarkerPath(profileDir)),
+          `status=${outcome.status} marker=${existsSync(pendingMarkerPath(profileDir))} ws=${JSON.stringify(readFileSync(join(profileDir, "pnpm-workspace.yaml"), "utf8"))}`,
+        );
+      } finally {
+        cleanup();
+      }
     }
   }
 
