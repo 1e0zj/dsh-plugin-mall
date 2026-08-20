@@ -3272,11 +3272,20 @@ async function runTransactionFixtures() {
     const { profileDir, cleanup } = makeTempProfile("remove-success-cleanup", { "pkg-f": "1.0.0" });
     try {
       materializeFakePackage(profileDir, "pkg-f", "1.0.0");
+      // 快照落在 <home>/guard/snapshots/（guard.js 的 snapshotRoot），不在
+      // profile 目录里。第一版查的是 profileDir/.dsh-plugin-guard —— 那个路径
+      // 根本不存在，于是「残留为空」恒成立，这半条断言等于没写。
+      const snapshotDir = join(dirname(dirname(profileDir)), "guard", "snapshots");
+      const listSnapshots = () => (existsSync(snapshotDir) ? readdirSync(snapshotDir) : []);
+      // 只查「结束后为空」还不够：快照压根没被创建也会通过。在 pnpm 在途的
+      // 那一刻取一次，先钉住它确实存在过，再钉住它被提交清理掉。
+      let snapshotsWhileRunning = [];
       const { spawnFn } = scriptedSpawn([{
         code: 0,
         out: "Done\n",
         // pnpm 真正卸掉：清单与目录都拿走，落盘校验才会通过。
         beforeExit: () => {
+          snapshotsWhileRunning = listSnapshots();
           const manifest = JSON.parse(readFileSync(join(profileDir, "package.json"), "utf8"));
           delete manifest.dependencies["pkg-f"];
           writeFileSync(join(profileDir, "package.json"), JSON.stringify(manifest, undefined, 2) + "\n");
@@ -3284,15 +3293,14 @@ async function runTransactionFixtures() {
         },
       }]);
       const outcome = await runRemove({ profile: "p", packageName: "pkg-f", _profileDir: profileDir, _spawn: spawnFn }).done;
-      const snapshotsLeft = existsSync(join(profileDir, ".dsh-plugin-guard"))
-        ? readdirSync(join(profileDir, ".dsh-plugin-guard")).filter((entry) => entry !== "pending.json")
-        : [];
+      const snapshotsLeft = listSnapshots();
       check(
-        "卸载成功 → marker 与 snapshot 都被提交清理，不留残留",
+        "卸载成功 → marker 与 snapshot 都被提交清理（且快照确实创建过）",
         outcome.status === "completed"
+          && snapshotsWhileRunning.length === 1
           && !existsSync(pendingMarkerPath(profileDir))
           && snapshotsLeft.length === 0,
-        `status=${outcome.status} marker=${existsSync(pendingMarkerPath(profileDir))} snapshots=${snapshotsLeft.join(",")} detail=${JSON.stringify(outcome.detail)}`,
+        `status=${outcome.status} 运行中快照=${snapshotsWhileRunning.join(",")} marker=${existsSync(pendingMarkerPath(profileDir))} 残留快照=${snapshotsLeft.join(",")} detail=${JSON.stringify(outcome.detail)}`,
       );
     } finally {
       cleanup();
