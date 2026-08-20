@@ -12,9 +12,10 @@ change.
 
 The one hard promise, stated so you can check it rather than trust it:
 
-> Whatever you install, from whatever source, and whatever goes wrong
-> mid-install — a crash, a network failure, a broken package — `dsh` still
-> starts the next time you run it.
+> Whatever the marketplace does to a profile — install, update, uninstall,
+> enable, disable — and whatever goes wrong midway through it — a crash, a
+> network failure, a broken package, a file the OS would not let it rename —
+> `dsh` still starts the next time you run it.
 
 The marketplace writes into a profile that dsh boots from. A half-written
 `package.json`, a `cordis.patch.yml` that no longer parses, or a dependency
@@ -82,8 +83,9 @@ which is what the marketplace is for.
 
 唯一的硬承诺，写成可检验的形式，不用你相信：
 
-> 无论你装什么、从哪装，也无论安装中途出什么事——崩溃、断网、包本身是坏
-> 的——下次运行 `dsh` 它都还能正常启动。
+> 无论市场对 profile 做什么——安装、更新、卸载、启用、停用——也无论中途出
+> 什么事——崩溃、断网、包本身是坏的、某个文件系统不让它改名——下次运行
+> `dsh` 它都还能正常启动。
 
 市场写入的是 dsh 启动时要读的 profile。一个写坏的 `package.json`、一个不
 再能解析的 `cordis.patch.yml`、一棵 pnpm 解不开的依赖树，后果不是体验变
