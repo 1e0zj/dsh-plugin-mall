@@ -16,7 +16,7 @@ import { createHash } from "node:crypto";
 import { dump, load } from "js-yaml";
 import { DEFAULT_PROFILE_BUNDLES, PROFILE_TEMPLATES, initProfile, resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
 import { describeBuildScripts, npmNameOf } from "./github.js";
-import { clearPendingApprovalPause, commitPendingSnapshot, createProfileSnapshot, markPendingApprovalPause, markPendingSnapshot, pausedCandidateBeforeState, pendingApprovalPaused, pnpmGuardEnv, pnpmSpawnPlan, readValidatedPendingSnapshot, rollbackPendingSnapshot } from "./guard.js";
+import { clearPendingApprovalPause, commitPendingSnapshot, createProfileSnapshot, describeRollbackRebuild, markPendingApprovalPause, markPendingSnapshot, pausedCandidateBeforeState, pendingApprovalPaused, pnpmGuardEnv, pnpmSpawnPlan, readValidatedPendingSnapshot, rollbackPendingSnapshot, validateInstalledProfile, validateRemoveCompletion } from "./guard.js";
 
 // ── spec normalization ──────────────────────────────────────────────────────
 
@@ -1959,6 +1959,52 @@ function runRemoveInner({ profile, packageName, _profileDir, _spawn }, selfHeale
   };
   let current = undefined;
 
+  // Snapshot + pending marker, exactly as an install does.
+  //
+  // `pnpm remove` was treated as atomic here, and it is not: a real removal
+  // deleted node_modules/<pkg>, then failed writing pnpm-lock.yaml (EPERM on
+  // Windows — the rename target was held by another process) and exited
+  // nonzero. This function reported "failed" and returned, leaving a profile
+  // whose package.json still declared the package as a bundle layer while its
+  // directory was gone. dsh then refused to boot at all: resolveBundleDir
+  // throws while composing the profile, which happens BEFORE any plugin — so
+  // the startup recovery inside apply() could never have run either, and no
+  // marker existed for it to act on regardless.
+  //
+  // The install path has carried this protection from the start, and so has
+  // `guard remove` in the CLI. Only this one, the path the marketplace UI and
+  // the agent tool both use, was left outside it.
+  let snapshot;
+  try {
+    snapshot = createProfileSnapshot(profileDir, { operation: "remove", packageName });
+  } catch (error) {
+    return failedNow(`cannot snapshot profile "${profile}" before removing ${packageName}: ${error.message} — refusing to touch the profile`);
+  }
+  try {
+    markPendingSnapshot(snapshot, { operation: "remove", candidate: { name: packageName } });
+  } catch (error) {
+    rmSync(snapshot.dir, { recursive: true, force: true });
+    return failedNow(`cannot register the remove pending marker for ${packageName}: ${error.message} — refusing to touch the profile`);
+  }
+
+  /** Restore the pre-remove bytes and settle the marker; never throws. */
+  const rollbackRemove = (reason) => {
+    try {
+      const rolled = rollbackPendingSnapshot(profileDir);
+      if (rolled === undefined) {
+        // marker 不见了（外部删除、或本轮压根没登记成功）——没有还原目标，
+        // 就绝不能声称已还原。说实话比说好听重要：用户据此决定要不要手工检查。
+        return { status: "failed", detail: `${reason}; no pending marker was found, so the profile could NOT be restored automatically — check it before the next start (\`dsh-plugin-guard guard validate --profile ${profile}\`)` };
+      }
+      const rebuild = describeRollbackRebuild(rolled.rebuild);
+      return { status: "failed", detail: `${reason}; the profile was restored to its pre-remove state${rebuild === undefined ? "" : ` (node_modules rebuild — ${rebuild})`}` };
+    } catch (rollbackError) {
+      // 回滚失败时**保留 marker**：磁盘状态未知，交给启动恢复/`guard recover`，
+      // 绝不能声称已还原。
+      return { status: "failed", detail: `${reason}; rollback also failed and the pending marker was kept for recovery: ${rollbackError.message}` };
+    }
+  };
+
   const plan = _spawn === undefined ? pnpmSpawnPlan() : { command: "pnpm", shell: false, treeKill: false };
   const proc = (_spawn ?? spawn)(plan.command, ["remove", packageName, "--reporter=append-only"], {
     cwd: profileDir,
@@ -1978,31 +2024,49 @@ function runRemoveInner({ profile, packageName, _profileDir, _spawn }, selfHeale
       // outcome，返回 producer 本体会让 tracker 把成功任务记成 failed）。
       if (outcome.spawnError.code === "ENOENT" && selfHealed !== true) {
         const healed = await enablePnpmViaCorepack(push);
-        if (healed) return await runRemoveInner({ profile, packageName, _profileDir, _spawn }, true).done;
+        // 重试前先把本轮的事务状态收掉——否则重试那一轮会被自己的 marker 挡住。
+        if (healed) {
+          try { rollbackPendingSnapshot(profileDir); } catch { /* 交给下面的重试，失败也不该盖住原因 */ }
+          return await runRemoveInner({ profile, packageName, _profileDir, _spawn }, true).done;
+        }
       }
       const hint = outcome.spawnError.code === "ENOENT"
         ? "pnpm not found on PATH — install pnpm (e.g. `corepack enable pnpm`) to manage profile plugins"
         : `could not start pnpm: ${outcome.spawnError.message}`;
-      return { status: "failed", detail: hint };
+      return rollbackRemove(hint);
     }
     if (outcome.exitCode === null) {
-      return { status: "killed", detail: outcome.signal ? `signal: ${outcome.signal}` : "killed before exit" };
+      // 取消也要还原：pnpm 可能已经删掉了 node_modules 里的目录。
+      const killed = rollbackRemove(outcome.signal ? `signal: ${outcome.signal}` : "killed before exit");
+      return { ...killed, status: "killed" };
     }
     if (outcome.exitCode !== 0) {
-      return { status: "failed", detail: `pnpm remove ${packageName} failed (exit code ${outcome.exitCode}). See job output.` };
+      return rollbackRemove(`pnpm remove ${packageName} failed (exit code ${outcome.exitCode}). See job output.`);
     }
     // 卸完后的对账（bundle 列表、client 行）抛错也必须落成 terminal failed，
     // 不能让 done 拒绝。
     try {
       const bundles = reconcileBundles(profileDir, beforeDeps);
       const clientRow = removeClientRow(profileDir, packageName);
+      // 退出码 0 不等于卸干净了。落盘校验用的是启动恢复同一套判据：
+      // profile 整体仍然自洽，且这个包确实从清单和装配层里消失了。任何一条
+      // 不过就还原——一个「装着但坏」的 profile 比一个没卸掉的插件糟得多。
+      const profileCheck = validateInstalledProfile(profileDir);
+      const removeCheck = validateRemoveCompletion(profileDir, packageName);
+      if (!profileCheck.ok || !removeCheck.ok) {
+        const blockers = [...profileCheck.issues, ...removeCheck.issues]
+          .filter((entry) => entry.severity === "block")
+          .map((entry) => entry.title);
+        return rollbackRemove(`pnpm remove ${packageName} exited 0 but the profile did not validate afterwards${blockers.length > 0 ? `: ${blockers.join("; ")}` : ""}`);
+      }
+      commitPendingSnapshot(profileDir);
       const notes = [`bundle layer(s) now: ${bundles.join(", ") || "none (template only)"}`];
       if (clientRow.removed) notes.push(`removed client loader row "${clientRow.rowId}" from cordis.patch.yml`);
       return { status: "completed", detail: `removed ${packageName} from profile "${profile}" — ${notes.join("; ")}. Restart dsh for the change to take effect.` };
     } catch (error) {
-      return { status: "failed", detail: `pnpm removed ${packageName} but post-remove reconciliation failed: ${error?.message ?? String(error)}` };
+      return rollbackRemove(`pnpm removed ${packageName} but post-remove reconciliation failed: ${error?.message ?? String(error)}`);
     }
-  }).catch((error) => ({ status: "failed", detail: `remove of ${packageName} hit an internal error: ${error?.message ?? String(error)}` }));
+  }).catch((error) => rollbackRemove(`remove of ${packageName} hit an internal error: ${error?.message ?? String(error)}`));
   proc.stdout?.on("data", (data) => push(data.toString()));
   proc.stderr?.on("data", (data) => push(data.toString()));
 
@@ -2991,6 +3055,91 @@ async function runTransactionFixtures() {
           && procs.length === 0
           && existsSync(pendingMarkerPath(profileDir)),
         `status=${outcome.status} procs=${procs.length} ${JSON.stringify(outcome.detail)}`,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+
+  // 3b-2. 卸载中途失败必须留下可恢复的状态 —— 这条钉的是一次真实故障。
+  //
+  // `pnpm remove` 删掉了 node_modules/<pkg>，随后写 pnpm-lock.yaml 时 EPERM
+  // 失败并非零退出。当时 runRemove 没有任何事务保护，只是报了个 failed 就
+  // 返回，于是 package.json 仍把该包声明为 bundle 层、目录却没了。dsh 从此
+  // 拒绝启动：resolveBundleDir 在组装 profile 时抛错，那发生在任何插件加载
+  // 之前，所以 apply() 里的启动恢复根本执行不到——何况当时也没有 marker 可
+  // 供它接手。
+  //
+  // 现在的要求：中途失败之后，profile 要么被还原，要么留下 marker 让恢复路径
+  // 接手。**绝不允许「既没还原、也没 marker」这第三种结局。**
+  {
+    const { profileDir, cleanup } = makeTempProfile("remove-midway-failure", { "pkg-c": "1.0.0" });
+    try {
+      materializeFakePackage(profileDir, "pkg-c", "1.0.0");
+      const manifestBefore = readFileSync(join(profileDir, "package.json"), "utf8");
+      const { spawnFn } = scriptedSpawn([{
+        code: 1,
+        out: "removing pkg-c\nEPERM: operation not permitted, rename '...pnpm-lock.yaml.tmp' -> 'pnpm-lock.yaml'\n",
+        // pnpm 已经把目录删掉了才失败 —— 正是那次故障的形状。
+        beforeExit: () => rmSync(join(profileDir, "node_modules", "pkg-c"), { recursive: true, force: true }),
+      }]);
+      const outcome = await runRemove({ profile: "p", packageName: "pkg-c", _profileDir: profileDir, _spawn: spawnFn }).done;
+      const manifestAfter = readFileSync(join(profileDir, "package.json"), "utf8");
+      const declaresPkg = JSON.parse(manifestAfter).dependencies?.["pkg-c"] !== undefined;
+      const pkgOnDisk = existsSync(join(profileDir, "node_modules", "pkg-c"));
+      const markerLeft = existsSync(pendingMarkerPath(profileDir));
+      // 自洽 = 「声明了就得在盘上」。要么两者都在（已还原），要么 marker 还在
+      // （交给恢复路径）。声明着却不在盘上、且没有 marker，就是那次砖化的形状。
+      const consistent = declaresPkg === pkgOnDisk;
+      check(
+        "卸载中途失败（node_modules 已删）→ 要么还原、要么留 marker，绝不留下「声明了却不在盘上」且无人接手的 profile",
+        outcome.status === "failed"
+          && manifestAfter === manifestBefore
+          && (consistent || markerLeft),
+        `status=${outcome.status} declares=${declaresPkg} onDisk=${pkgOnDisk} marker=${markerLeft} detail=${JSON.stringify(outcome.detail)}`,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+
+  // 3b-3. 早期失败（pnpm 还没动 node_modules）→ 干净回滚，marker 收掉，
+  // profile 与卸载前逐字节一致。
+  {
+    const { profileDir, cleanup } = makeTempProfile("remove-early-failure", { "pkg-d": "1.0.0" });
+    try {
+      materializeFakePackage(profileDir, "pkg-d", "1.0.0");
+      const manifestBefore = readFileSync(join(profileDir, "package.json"), "utf8");
+      const { spawnFn } = scriptedSpawn([{ code: 1, out: "ERR_PNPM_NO_MATCHING_VERSION\n" }]);
+      const outcome = await runRemove({ profile: "p", packageName: "pkg-d", _profileDir: profileDir, _spawn: spawnFn }).done;
+      check(
+        "卸载早期失败 → 回滚到卸载前字节、marker 收掉、包仍在盘上",
+        outcome.status === "failed"
+          && /restored to its pre-remove state/.test(outcome.detail ?? "")
+          && readFileSync(join(profileDir, "package.json"), "utf8") === manifestBefore
+          && existsSync(join(profileDir, "node_modules", "pkg-d"))
+          && !existsSync(pendingMarkerPath(profileDir)),
+        `status=${outcome.status} marker=${existsSync(pendingMarkerPath(profileDir))} detail=${JSON.stringify(outcome.detail)}`,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+
+  // 3b-4. 退出码 0 不等于卸干净了：包还留在清单里就必须回滚，
+  // 不能把一个半卸的 profile 当成功提交。
+  {
+    const { profileDir, cleanup } = makeTempProfile("remove-exit0-incomplete", { "pkg-e": "1.0.0" });
+    try {
+      materializeFakePackage(profileDir, "pkg-e", "1.0.0");
+      // pnpm 声称成功，却没有改动清单（半完成）。
+      const { spawnFn } = scriptedSpawn([{ code: 0, out: "Done\n" }]);
+      const outcome = await runRemove({ profile: "p", packageName: "pkg-e", _profileDir: profileDir, _spawn: spawnFn }).done;
+      check(
+        "pnpm remove 退 0 但包仍在清单里 → 判为未完成并回滚，不提交",
+        outcome.status === "failed"
+          && /did not validate afterwards/.test(outcome.detail ?? ""),
+        `status=${outcome.status} detail=${JSON.stringify(outcome.detail)}`,
       );
     } finally {
       cleanup();
