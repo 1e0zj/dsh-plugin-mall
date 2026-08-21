@@ -19,6 +19,8 @@ import { existsSync, readFileSync, realpathSync, mkdirSync, mkdtempSync, writeFi
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import { EventEmitter } from "node:events";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -26,6 +28,7 @@ import { resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
 import { repoInfo, searchPlugins, verifyPlugins, cachedRepoManifest, fetchRawFile, preferNpmSpec, npmPackageInfo, compareVersions, assertSafeToInstall, mapLimit, NETWORK_CONCURRENCY } from "./github.js";
 import { ensureProfile, listInstalled, normalizeSpec, runInstall, runRemove, assertSafeSpec, resolveRegistry, serializeCanonicalProof, persistPluginDisabled } from "./installer.js";
 import { preflightInstall, inspectRemoteCandidate, recoverProfile, describeRollbackRebuild } from "./guard.js";
+import { createRestartHelperReadyMessage, RESTART_HELPER_READY_TYPE, RESTART_RESPONSE_DRAIN_MS, superviseRestartHelper } from "./restart-protocol.js";
 
 export const name = "@1e0zj/dsh-plugin-mall";
 // `loader` 用来读装配树、并对单个 entry 做热开关（entry.update）。读法照抄
@@ -288,12 +291,10 @@ export function computeProfileFingerprint(profileDir) {
 const compatCache = new Map();
 const COMPAT_TTL = 600000;
 
-// When this plugin instance loaded — for a host process this is effectively the
-// host's start time (the loader mounts plugins at boot). Sent with `jobs` so a
-// remounted client can tell "completed, restart still pending" from "completed
-// and the restart already happened": a finishedAt older than this value means
-// the task's Restart-dsh button has already done its job.
-const pluginLoadedAt = Date.now();
+// Node captures performance.timeOrigin once at process startup. It therefore
+// stays byte-for-byte stable across Cordis remounts/HMR while still changing
+// for a successor process, even if the wall clock is corrected backwards.
+const hostProcessStartedAt = Math.floor(performance.timeOrigin);
 
 function compatCacheGet(key) {
   const cached = compatCache.get(key);
@@ -921,6 +922,23 @@ export function resolveRestartLaunchPlan({ profile, config = {}, isWindows }) {
 export function restartLogPath(profileDir, profile) {
   // <home>/profiles/<name> → <home>/guard/, beside the pending markers.
   return join(dirname(dirname(profileDir)), "guard", `restart-${profile}.log`);
+}
+
+function appendRestartDiagnostic(logPath, message) {
+  const line = `[dsh-plugin-mall] ${message}\n`;
+  console.error(line.trimEnd());
+  if (logPath === undefined) return;
+  let fd;
+  try {
+    fd = openSync(logPath, "a");
+    writeSync(fd, line);
+  } catch {
+    /* the console diagnostic is still useful */
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* already closed */ }
+    }
+  }
 }
 
 // ── in-process job tracker for browser RPC ───────────────────────────────────
@@ -1713,7 +1731,7 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
       // dropping all React state. The task records live here.
       try {
         const session = requireBrowserSession(payload?.session);
-        return rpcOk({ jobs: tracker.list(session), hostStartedAt: pluginLoadedAt });
+        return rpcOk({ jobs: tracker.list(session), hostStartedAt: hostProcessStartedAt });
       } catch (error) {
         return rpcFail(error);
       }
@@ -1727,6 +1745,12 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
       }
       const plan = resolveRestartLaunchPlan({ profile, config });
       if (!plan.ok) {
+        let diagnosticPath;
+        try {
+          diagnosticPath = restartLogPath(resolveProfileDir(profile), profile);
+          mkdirSync(dirname(diagnosticPath), { recursive: true });
+        } catch { /* invalid profile/home: console remains the diagnostic sink */ }
+        appendRestartDiagnostic(diagnosticPath, `restart plan rejected: ${plan.error}; old Host remains running`);
         return rpcFail(new Error(plan.error));
       }
       // Everything the restart prints goes to a file. `stdio: "ignore"` used to
@@ -1745,17 +1769,50 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
         console.error(`[dsh-plugin-mall] restart log unavailable (${error.message}); continuing without it`);
         logFd = undefined;
       }
-      const child = spawn(plan.nodePath, plan.args, {
-        shell: false,
-        detached: true,
-        stdio: logFd === undefined ? "ignore" : ["ignore", logFd, logFd],
-        cwd: process.cwd(),
-        windowsHide: true,
+      let child;
+      try {
+        child = spawn(plan.nodePath, plan.args, {
+          shell: false,
+          detached: true,
+          // fd 3 is an IPC channel used only for the readiness handshake. An
+          // old/incompatible CLI either exits on --await-exit or times out; it
+          // can never make the current Host leave merely by spawning.
+          stdio: ["ignore", logFd ?? "ignore", logFd ?? "ignore", "ipc"],
+          cwd: process.cwd(),
+          windowsHide: true,
+        });
+      } catch (error) {
+        if (logFd !== undefined) closeSync(logFd);
+        appendRestartDiagnostic(logPath, `restart helper could not be spawned: ${error.message}; old Host remains running`);
+        return rpcFail(new Error(`automatic restart helper could not be spawned; the current dsh is still running${logPath ? ` (see ${logPath})` : ""}`));
+      }
+      if (logFd !== undefined) closeSync(logFd); // the child holds its own duplicates
+
+      const handoff = superviseRestartHelper(child, {
+        awaitExitPid: plan.awaitExitPid,
+        onFailure: (message) => appendRestartDiagnostic(logPath, `${message}; old Host remains running`),
       });
-      child.unref();
-      if (logFd !== undefined) closeSync(logFd); // the child holds its own duplicate
-      setTimeout(() => process.exit(0), 1000);
-      return rpcOk({ restarting: true, logPath });
+      let disposeHandoffEffect;
+      try {
+        // Cordis runs this disposer on HMR/config unload. In particular, the
+        // process-exit timer can no longer outlive the plugin instance that
+        // created it and kill the Host one second later.
+        disposeHandoffEffect = ctx.effect(
+          () => handoff.dispose,
+          "@1e0zj/dsh-plugin-mall: restart handoff",
+        );
+      } catch (error) {
+        handoff.dispose();
+        appendRestartDiagnostic(logPath, `restart handoff could not join the plugin lifecycle: ${error.message}; old Host remains running`);
+        return rpcFail(new Error("automatic restart was cancelled because the marketplace plugin is unloading; the current dsh is still running"));
+      }
+
+      const accepted = await handoff.ready;
+      if (!accepted.ok) {
+        await disposeHandoffEffect();
+        return rpcFail(new Error(`${accepted.error}; the current dsh is still running${logPath ? ` (see ${logPath})` : ""}`));
+      }
+      return rpcOk({ restarting: true, handoffAccepted: true, logPath });
     }
     case "jobCancel": {
       try {
@@ -2626,6 +2683,164 @@ export async function runSelfTests() {
     }
 
     check("重启日志落在 <home>/guard/ 下", restartLogPath(join("/h", "profiles", "web"), "web").replace(/\\/g, "/").endsWith("/h/guard/restart-web.log"));
+
+    {
+      const dshHomeBefore = process.env.DSH_HOME;
+      const consoleErrorBefore = console.error;
+      const diagnostics = [];
+      const fixtureHome = join(root, "restart-plan-home");
+      let response;
+      let logged = "";
+      try {
+        process.env.DSH_HOME = fixtureHome;
+        console.error = (...args) => { diagnostics.push(args.join(" ")); };
+        response = await rpcDispatch(
+          {},
+          "restart",
+          { profile: "web", session: `sess_${"a".repeat(32)}` },
+          { defaultProfile: "web", allowRestart: false },
+          undefined,
+          {},
+        );
+        logged = readFileSync(join(fixtureHome, "guard", "restart-web.log"), "utf8");
+      } finally {
+        console.error = consoleErrorBefore;
+        if (dshHomeBefore === undefined) delete process.env.DSH_HOME;
+        else process.env.DSH_HOME = dshHomeBefore;
+      }
+      check(
+        "重启 plan 失败 → 页面返回原错误且诊断同时落盘",
+        response?.ok === false && /restart disabled/.test(response.error?.message)
+          && /restart plan rejected: restart disabled/.test(logged)
+          && diagnostics.some((line) => /restart plan rejected/.test(line)),
+      );
+    }
+
+    // The restart helper is a protocol peer, not merely a spawned pid. These
+    // fixtures pin the fail-safe: every pre-handoff failure keeps the old Host
+    // alive, while only an explicit, stable readiness message permits exit.
+    {
+      class FakeRestartChild extends EventEmitter {
+        constructor() {
+          super();
+          this.connected = true;
+          this.exitCode = null;
+          this.signalCode = null;
+          this.killed = false;
+          this.killCalls = 0;
+          this.unrefCalls = 0;
+          this.disconnectCalls = 0;
+        }
+        kill() { this.killed = true; this.killCalls++; }
+        unref() { this.unrefCalls++; }
+        disconnect() { this.connected = false; this.disconnectCalls++; }
+        exit(code, signal = null) {
+          this.exitCode = code;
+          this.signalCode = signal;
+          this.emit("exit", code, signal);
+        }
+      }
+      const wait = (ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+      const supervise = (child, overrides = {}) => {
+        let hostExits = 0;
+        const failures = [];
+        const handoff = superviseRestartHelper(child, {
+          awaitExitPid: 4242,
+          handshakeTimeoutMs: 30,
+          stabilityMs: 4,
+          responseDelayMs: 4,
+          onHostExit: () => { hostExits++; },
+          onFailure: (message, meta) => { failures.push({ message, meta }); },
+          ...overrides,
+        });
+        return { handoff, failures, hostExits: () => hostExits };
+      };
+
+      const spawnErrorChild = new FakeRestartChild();
+      const spawnError = supervise(spawnErrorChild);
+      spawnErrorChild.emit("error", new Error("ENOENT"));
+      const spawnErrorReady = await spawnError.handoff.ready;
+      await wait(10);
+      check(
+        "重启 helper spawn error → 旧 Host 不退出且 error listener 已清理",
+        !spawnErrorReady.ok && /ENOENT/.test(spawnErrorReady.error)
+          && spawnError.hostExits() === 0
+          && spawnErrorChild.listenerCount("error") === 0,
+      );
+
+      const usageChild = new FakeRestartChild();
+      const usage = supervise(usageChild);
+      usageChild.exit(2);
+      const usageReady = await usage.handoff.ready;
+      await wait(10);
+      check(
+        "旧 CLI 因 --await-exit 以 code 2 快速退出 → 旧 Host 保持运行",
+        !usageReady.ok && /code 2/.test(usageReady.error) && usage.hostExits() === 0,
+      );
+
+      const silentChild = new FakeRestartChild();
+      const silent = supervise(silentChild, { handshakeTimeoutMs: 8 });
+      const silentReady = await silent.handoff.ready;
+      check(
+        "helper 建立后静默至握手超时 → 终止 helper 且旧 Host 保持运行",
+        !silentReady.ok && /did not acknowledge/.test(silentReady.error)
+          && silentChild.killCalls === 1 && silent.hostExits() === 0
+          && silentChild.listenerCount("message") === 0,
+      );
+
+      const mismatchChild = new FakeRestartChild();
+      const mismatch = supervise(mismatchChild);
+      mismatchChild.emit("message", { type: RESTART_HELPER_READY_TYPE, protocol: 99, awaitExitPid: 4242 });
+      const mismatchReady = await mismatch.handoff.ready;
+      check(
+        "同版本不同内容/协议不匹配 → fail closed，不靠 package version 放行",
+        !mismatchReady.ok && /protocol mismatch/.test(mismatchReady.error)
+          && mismatchChild.killCalls === 1 && mismatch.hostExits() === 0,
+      );
+
+      const unstableChild = new FakeRestartChild();
+      const unstable = supervise(unstableChild, { stabilityMs: 20 });
+      unstableChild.emit("message", createRestartHelperReadyMessage(4242));
+      unstableChild.exit(1);
+      const unstableReady = await unstable.handoff.ready;
+      check(
+        "helper 握手后在稳定窗口内退出 → 取消旧 Host 退出",
+        !unstableReady.ok && unstable.hostExits() === 0,
+      );
+
+      const healthyChild = new FakeRestartChild();
+      const healthy = supervise(healthyChild);
+      healthyChild.emit("message", createRestartHelperReadyMessage(4242));
+      const healthyReady = await healthy.handoff.ready;
+      await wait(12);
+      check(
+        "helper 明确握手并活过稳定窗口 → 旧 Host 只退出一次",
+        healthyReady.ok && healthy.hostExits() === 1
+          && healthyChild.disconnectCalls === 1 && healthyChild.unrefCalls === 1,
+      );
+
+      const disposedChild = new FakeRestartChild();
+      const disposed = supervise(disposedChild, { responseDelayMs: 40 });
+      disposedChild.emit("message", createRestartHelperReadyMessage(4242));
+      const disposedReady = await disposed.handoff.ready;
+      disposed.handoff.dispose(); // mirrors the disposer returned from ctx.effect()
+      await wait(50);
+      check(
+        "插件卸载/HMR disposer → 清理退出 timer、结束 helper、旧 Host 不退出",
+        disposedReady.ok && disposed.hostExits() === 0 && disposedChild.killCalls === 1
+          && disposedChild.listenerCount("exit") === 0,
+      );
+
+      check(
+        "默认保留旧实现的一秒 RPC 响应排空窗口",
+        RESTART_RESPONSE_DRAIN_MS === 1000,
+      );
+      check(
+        "进程启动标识来自稳定的 performance.timeOrigin",
+        Number.isFinite(hostProcessStartedAt)
+          && hostProcessStartedAt > 0 && hostProcessStartedAt <= Date.now(),
+      );
+    }
 
     // ── 7. Tracker isolation: producer.done rejection handling ───────────────
     let settledOutcome = null;

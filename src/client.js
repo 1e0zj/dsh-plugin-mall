@@ -661,6 +661,25 @@ window.__ModuleLoader__.load({
       // No boolean warning-consent map is kept.
       var sessionNonce = useRef(generateSessionNonce()).current;
       var approvalTokensRef = useRef({});
+      var restartControlRef = useRef({ mounted: true, ping: null });
+      var clearRestartPing = useCallback(function () {
+        var control = restartControlRef.current;
+        if (control.ping !== null) {
+          clearInterval(control.ping);
+          control.ping = null;
+        }
+      }, []);
+      useEffect(function () {
+        var control = restartControlRef.current;
+        control.mounted = true;
+        return function () {
+          control.mounted = false;
+          if (control.ping !== null) {
+            clearInterval(control.ping);
+            control.ping = null;
+          }
+        };
+      }, []);
 
       var call = useCallback(function (endpoint, payload) {
         var body = Object.assign({ session: sessionNonce }, payload || {});
@@ -887,28 +906,49 @@ window.__ModuleLoader__.load({
         if (typeof window !== "undefined" && typeof window.confirm === "function") {
           if (window.confirm("重启 dsh？正在进行的任务会中断。") !== true) return;
         }
+        clearRestartPing();
         setRestarting(true);
         setError(null);
+        var requestedAt = Date.now();
+        var previousHostStartedAt = Number(hostStartedAt);
         call("restart", {}).then(function () {
+          if (restartControlRef.current.mounted !== true) return;
           var tries = 0;
           var ping = setInterval(function () {
+            if (restartControlRef.current.mounted !== true) {
+              clearRestartPing();
+              return;
+            }
             tries++;
             if (tries > 40) {
-              clearInterval(ping);
+              clearRestartPing();
               setRestarting(false);
               setError("2 分钟内未检测到 dsh 重启完成，请手动检查 dsh 状态后刷新页面。");
               return;
             }
-            rpc.call("/market", "installed", {}).then(function () {
-              clearInterval(ping);
+            // Prefer identity change over wall-clock ordering: NTP may move the
+            // successor's timeOrigin backwards. If initial restore did not
+            // provide an identity, retain the stricter requestedAt fallback.
+            call("jobs", {}).then(function (value) {
+              if (restartControlRef.current.mounted !== true) return;
+              var observedHostStartedAt = Number(value.hostStartedAt);
+              if (!Number.isFinite(observedHostStartedAt) || observedHostStartedAt <= 0) return;
+              var hadPreviousIdentity = Number.isFinite(previousHostStartedAt) && previousHostStartedAt > 0;
+              if (hadPreviousIdentity
+                ? observedHostStartedAt === previousHostStartedAt
+                : observedHostStartedAt <= requestedAt) return;
+              clearRestartPing();
               window.location.reload();
             }).catch(function () { /* host restarting */ });
           }, 3000);
+          restartControlRef.current.ping = ping;
         }).catch(function (e) {
+          if (restartControlRef.current.mounted !== true) return;
+          clearRestartPing();
           setRestarting(false);
           setError(errorText(e));
         });
-      }, [call, rpc]);
+      }, [call, clearRestartPing, hostStartedAt]);
 
       var doUninstall = useCallback(function (name) {
         delete approvalTokensRef.current[name];

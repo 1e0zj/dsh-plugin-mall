@@ -66,7 +66,7 @@ for (const path of new Set(declared)) {
 }
 
 // CLI 是独立 bin，用户可能直接按路径跑；它 import 的同目录模块必须一起打包。
-for (const path of ["src/guard.js", "src/installer.js", "src/github.js"]) {
+for (const path of ["src/guard.js", "src/installer.js", "src/github.js", "src/restart-protocol.js"]) {
   check(`${path} 在产物里`, entries.has(path));
 }
 check("README.md 在产物里（npm 包页要用）", entries.has("README.md"));

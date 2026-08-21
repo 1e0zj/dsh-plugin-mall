@@ -62,6 +62,7 @@ import {
 // github.js imports node builtins only — the host-independence of this CLI is
 // preserved (it must keep working when the dsh host itself is broken).
 import { npmPackageInfo } from "./github.js";
+import { createRestartHelperReadyMessage } from "./restart-protocol.js";
 
 /**
  * Pin a bare package name to name@latest: pnpm's minimumReleaseAge policy
@@ -77,6 +78,24 @@ export async function pinSpecToLatest(spec, npmInfo = npmPackageInfo) {
     if (info?.latest) return `${spec}@${info.latest}`;
   } catch { /* offline or registry failure — keep the bare spec */ }
   return spec;
+}
+
+/**
+ * Tell the outgoing Web Host that this exact CLI understands its handoff
+ * protocol and has finished parsing --await-exit. A normal terminal launch has
+ * no IPC channel and simply skips the announcement.
+ */
+export async function announceRestartHelperReady(awaitExitPid, send = process.send?.bind(process)) {
+  if (awaitExitPid === undefined || typeof send !== "function") return false;
+  const message = createRestartHelperReadyMessage(awaitExitPid);
+  await new Promise((resolvePromise, rejectPromise) => {
+    try {
+      send(message, (error) => error ? rejectPromise(error) : resolvePromise());
+    } catch (error) {
+      rejectPromise(error);
+    }
+  });
+  return true;
 }
 
 // ── small helpers ────────────────────────────────────────────────────────────
@@ -884,7 +903,15 @@ function markerLooksValid(marker, profileDir, home) {
  * A corrupt or legacy (pre-v2) marker, or a failed static-recovery step, fails
  * closed: the command is NOT launched and no unvalidated path is deleted.
  */
-async function cmdLaunch({ profile, home, graceMs, commandArgv, awaitExitPid, _waitForExit = waitForProcessExit }) {
+async function cmdLaunch({
+  profile,
+  home,
+  graceMs,
+  commandArgv,
+  awaitExitPid,
+  _waitForExit = waitForProcessExit,
+  _onAwaitExit = announceRestartHelperReady,
+}) {
   const profileDir = profileDirOf(home, profile);
   const grace = graceMs ?? DEFAULT_GRACE_MS;
   const [command, ...args] = commandArgv;
@@ -899,6 +926,10 @@ async function cmdLaunch({ profile, home, graceMs, commandArgv, awaitExitPid, _w
   // the outcome that costs the user their install; not starting leaves the old
   // host running and the marker pending, which the next launch resolves.
   if (awaitExitPid !== undefined) {
+    // This is the exact handoff boundary: arguments and profile are valid, and
+    // the helper is about to block on the outgoing Host. The Web parent waits
+    // for this IPC acknowledgement before it allows itself to exit.
+    await _onAwaitExit(awaitExitPid);
     if (!await _waitForExit(awaitExitPid, AWAIT_EXIT_TIMEOUT_MS)) {
       throw new Error(`process ${awaitExitPid} was still running after ${AWAIT_EXIT_TIMEOUT_MS}ms — refusing to start a second host that would collide with it on the listening port (the old one is still up; nothing was changed)`);
     }
@@ -1184,6 +1215,18 @@ async function selfTest() {
       // A pid after `--` belongs to the wrapped command, not to us.
       const p6 = parseArgs(["launch", "--profile", "web", "--", "dsh", "--await-exit", "7"]);
       if (p6.awaitExit !== undefined || p6.commandArgv.join(" ") !== "dsh --await-exit 7") throw new Error("--await-exit after `--` must stay with the wrapped command");
+
+      let announced;
+      const didAnnounce = await announceRestartHelperReady(4321, (message, callback) => {
+        announced = message;
+        callback();
+      });
+      if (!didAnnounce || announced?.awaitExitPid !== 4321 || announced?.protocol !== 1) {
+        throw new Error("restart helper must announce the parsed pid and protocol over IPC");
+      }
+      if (await announceRestartHelperReady(undefined, () => { throw new Error("must not send"); }) !== false) {
+        throw new Error("a normal launch without --await-exit must not announce a restart handoff");
+      }
     }
 
     // `--await-exit`: the successor must not start while the outgoing host is
@@ -1199,6 +1242,7 @@ async function selfTest() {
 
       let launched = false;
       const neverExits = async () => false;
+      let announcedPid;
       let refused = false;
       try {
         await cmdLaunch({
@@ -1207,11 +1251,13 @@ async function selfTest() {
           commandArgv: [process.execPath, "-e", "launched=1"],
           awaitExitPid: 999999,
           _waitForExit: neverExits,
+          _onAwaitExit: async (pid) => { announcedPid = pid; },
         });
       } catch (error) {
         refused = /still running after/.test(error.message);
       }
       if (!refused) throw new Error("a pid that outlives the timeout must refuse the launch, not race it");
+      if (announcedPid !== 999999) throw new Error("launch must announce readiness immediately before waiting for the outgoing pid");
 
       // …and a pid that does go away lets the command through.
       const exitsPromptly = async () => true;
