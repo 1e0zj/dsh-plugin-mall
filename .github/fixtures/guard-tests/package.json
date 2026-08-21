@@ -4,6 +4,7 @@
   "private": true,
   "description": "Locked dependencies for the release workflow's offline fixtures",
   "dependencies": {
+    "@deepseek-ai/cordis-plugin-include": "1.0.6",
     "@deepseek-ai/dsh-app-boot": "0.1.0-rc.6",
     "@deepseek-ai/dsh-tools": "0.1.0-rc.6",
     "js-yaml": "4.3.1",

@@ -2597,15 +2597,26 @@ async function selfTest() {
     // is the tree dsh boots. Example fixtures can only show that the cases we
     // thought of agree. This feeds the SAME layers to the official
     // `applyEntryPatches` and to `composeEntries`, on hand-written shapes and
-    // on randomly generated ones, and compares the resulting trees. When the
-    // include package is not resolvable (a bare checkout with no fixture
-    // tree), it says so and skips rather than pretending to have run.
+    // on randomly generated ones, and compares the resulting trees.
+    //
+    // It is a HARD failure when the include package will not import. This is
+    // the one test the rest of the file leans on, and it used to skip itself
+    // with a console line — so the day the fixture tree stopped carrying
+    // @deepseek-ai/cordis-plugin-include (it arrives as a transitive
+    // dependency of dsh-app-boot, and nothing pinned it), the load-bearing
+    // check would quietly stop running while the suite still said PASS. The
+    // package is a declared fixture dependency now; skipping is opt-in and has
+    // to be typed out.
     {
       let applyEntryPatches;
       try {
         ({ applyEntryPatches } = await import("@deepseek-ai/cordis-plugin-include"));
-      } catch {
-        console.log("SKIP differential vs applyEntryPatches (@deepseek-ai/cordis-plugin-include not resolvable)");
+      } catch (error) {
+        if (process.env.DSH_GUARD_SKIP_DIFFERENTIAL !== "1") {
+          throw new Error(`differential vs applyEntryPatches cannot run: @deepseek-ai/cordis-plugin-include failed to import (${error.message}). `
+            + "Install the locked fixture dependencies (npm ci --prefix .github/fixtures/guard-tests) — or set DSH_GUARD_SKIP_DIFFERENTIAL=1 to run the rest of the suite without the one check that proves our composition matches the loader's.");
+        }
+        console.log("SKIP differential vs applyEntryPatches (DSH_GUARD_SKIP_DIFFERENTIAL=1)");
       }
       if (applyEntryPatches !== undefined) {
         const composeOurs = (documents) => composeEntries(documents.map((document, index) => ({
