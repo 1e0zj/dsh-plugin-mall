@@ -15,7 +15,7 @@
 
 import z from "@deepseek-ai/schemastery";
 import { defineTool } from "@deepseek-ai/dsh-tools";
-import { existsSync, readFileSync, realpathSync, mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, openSync, closeSync, writeSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -888,7 +888,16 @@ export function resolveRestartLaunchPlan({ profile, config = {}, isWindows }) {
 
   const nodePath = process.execPath;
   const originalDshArgs = process.argv.slice(2);
-  const args = [cliPath, "guard", "launch", "--profile", name, "--", nodePath, dshEntry, ...originalDshArgs];
+  // A restart is always requested from a page that is open and that reconnects
+  // to the successor on its own, so dsh's start-up browser handoff would only
+  // add a second window onto the one already showing the result. Suppressing it
+  // is safe HERE and nowhere else: this route is gated on a live browser
+  // session. If the flag is already in the original argv, leave it alone.
+  const suppressOpen = !originalDshArgs.includes("--no-open");
+  const dshArgs = suppressOpen ? [...originalDshArgs, "--no-open"] : [...originalDshArgs];
+  // The outgoing host names itself so `guard launch` can wait for it to be
+  // gone before binding the port — see --await-exit in cli.js.
+  const args = [cliPath, "guard", "launch", "--profile", name, "--await-exit", String(process.pid), "--", nodePath, dshEntry, ...dshArgs];
 
   return {
     ok: true,
@@ -897,7 +906,21 @@ export function resolveRestartLaunchPlan({ profile, config = {}, isWindows }) {
     cliPath,
     dshEntry,
     profile: name,
+    suppressedBrowserOpen: suppressOpen,
+    awaitExitPid: process.pid,
   };
+}
+
+/**
+ * Where a restart's output goes. The successor is spawned from a process that
+ * is about to exit, so it cannot inherit anything that outlives the handoff —
+ * and on Windows the console it does get is not attached to its stdio, which
+ * is how `[guard] … rolled back` used to vanish. Append to a per-profile file
+ * instead, so whatever the restart says survives it.
+ */
+export function restartLogPath(profileDir, profile) {
+  // <home>/profiles/<name> → <home>/guard/, beside the pending markers.
+  return join(dirname(dirname(profileDir)), "guard", `restart-${profile}.log`);
 }
 
 // ── in-process job tracker for browser RPC ───────────────────────────────────
@@ -1706,16 +1729,33 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
       if (!plan.ok) {
         return rpcFail(new Error(plan.error));
       }
+      // Everything the restart prints goes to a file. `stdio: "ignore"` used to
+      // send it to the void — including the one line that explains a rollback —
+      // and the successor inherited those dead handles, which is why the
+      // console Windows allocates for it comes up blank.
+      let logFd;
+      let logPath;
+      try {
+        logPath = restartLogPath(resolveProfileDir(profile), profile);
+        mkdirSync(dirname(logPath), { recursive: true });
+        logFd = openSync(logPath, "a");
+        writeSync(logFd, `\n=== ${new Date().toISOString()} restart requested (pid ${process.pid} → guard launch) ===\n`);
+      } catch (error) {
+        // A log we cannot open is not a reason to refuse the restart.
+        console.error(`[dsh-plugin-mall] restart log unavailable (${error.message}); continuing without it`);
+        logFd = undefined;
+      }
       const child = spawn(plan.nodePath, plan.args, {
         shell: false,
         detached: true,
-        stdio: "ignore",
+        stdio: logFd === undefined ? "ignore" : ["ignore", logFd, logFd],
         cwd: process.cwd(),
         windowsHide: true,
       });
       child.unref();
+      if (logFd !== undefined) closeSync(logFd); // the child holds its own duplicate
       setTimeout(() => process.exit(0), 1000);
-      return rpcOk({ restarting: true });
+      return rpcOk({ restarting: true, logPath });
     }
     case "jobCancel": {
       try {
@@ -2555,6 +2595,37 @@ export async function runSelfTests() {
 
     const restartDotPlan = resolveRestartLaunchPlan({ profile: "web.", config: { allowRestart: true }, isWindows: true });
     check("尾随点 profile 重启 plan fail-closed", !restartDotPlan.ok && /dot or space/.test(restartDotPlan.error));
+
+    // 重启 argv 的三条硬约束。真实重启只有完整重启 dsh 才验得到，所以 plan 的
+    // 形状必须在这里钉死：少一条就是那三个现象里的一个回来了。
+    {
+      const argvBefore = process.argv;
+      try {
+        process.argv = [process.execPath, "/x/bin.js", "--profile", "web"];
+        const plan = resolveRestartLaunchPlan({ profile: "web", config: { allowRestart: true } });
+        if (plan.ok) {
+          const dashDash = plan.args.indexOf("--");
+          const dshArgs = plan.args.slice(dashDash + 3); // -- node <dshEntry> …
+          check("重启带 --await-exit 且是本进程 pid", plan.args[plan.args.indexOf("--await-exit") + 1] === String(process.pid) && plan.awaitExitPid === process.pid);
+          check("--await-exit 排在 `--` 之前（是 guard 的参数，不是 dsh 的）", plan.args.indexOf("--await-exit") < dashDash);
+          check("重启给 dsh 补 --no-open", dshArgs.includes("--no-open") && plan.suppressedBrowserOpen === true);
+          check("原始 dsh 参数原样保留", dshArgs.slice(0, 2).join(" ") === "--profile web");
+
+          // 用户自己已经写了 --no-open 时不重复追加。
+          process.argv = [process.execPath, "/x/bin.js", "--profile", "web", "--no-open"];
+          const already = resolveRestartLaunchPlan({ profile: "web", config: { allowRestart: true } });
+          const alreadyArgs = already.ok ? already.args.slice(already.args.indexOf("--") + 3) : [];
+          check("已有 --no-open 则不重复追加", already.ok && alreadyArgs.filter((a) => a === "--no-open").length === 1 && already.suppressedBrowserOpen === false);
+        } else {
+          // 裸检出里解析不到官方 dsh 入口，plan 只能 fail——说清楚，别假装验过。
+          console.log(`  SKIP 重启 argv fixture（${plan.error}）`);
+        }
+      } finally {
+        process.argv = argvBefore;
+      }
+    }
+
+    check("重启日志落在 <home>/guard/ 下", restartLogPath(join("/h", "profiles", "web"), "web").replace(/\\/g, "/").endsWith("/h/guard/restart-web.log"));
 
     // ── 7. Tracker isolation: producer.done rejection handling ───────────────
     let settledOutcome = null;
