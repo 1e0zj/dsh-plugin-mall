@@ -25,17 +25,47 @@ import { JSON_SCHEMA, Type, load } from "js-yaml";
 import { satisfies, validRange } from "semver";
 
 // Official patches (e.g. @deepseek-ai/dsh-base, dsh-web-app) mark raw JS
-// expressions with the scalar tag `!!js`. Construct it as the inert source
-// text — never evaluate it — on top of a safe schema, so every other unknown
-// tag is still rejected as invalid YAML.
+// expressions with the scalar tag `!!js`. Construct the loader's own marker —
+// `{ __jsExpr: source }`, recognised by its `isJsExpr` — and never evaluate
+// it, on top of a safe schema so every other unknown tag is still rejected as
+// invalid YAML. Keeping the tag's identity matters: `!!js process.env.KEY` and
+// the plain string "process.env.KEY" are the same characters but not the same
+// value, and a candidate swapping one for the other changes what runs.
 const JS_SCALAR_TYPE = new Type("tag:yaml.org,2002:js", {
   kind: "scalar",
-  construct: (data) => String(data),
+  construct: (data) => ({ __jsExpr: String(data) }),
 });
+
+/** The loader's own test for an expression node (cordis-plugin-loader). */
+function isJsExpr(value) {
+  return value instanceof Object && "__jsExpr" in value;
+}
 const PATCH_SCHEMA = JSON_SCHEMA.extend([JS_SCALAR_TYPE]);
 
 const PROFILE_FILES = ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "cordis.patch.yml"];
 const HOST_PACKAGE_RE = /^@deepseek-ai\//;
+// Loader rows whose id or package names a protection boundary. Switching one
+// off, or replacing its config wholesale, drops a guarantee every other plugin
+// relies on, so those rows get their own line in the report instead of being
+// counted in with the rest.
+const SECURITY_ROW_RE = /sandbox|approval|permission|policy|credential|landlock/i;
+// Identity the scan gives an id-less row. The loader mints a random one at
+// load time (`ensureId`); this one only has to be unique inside one scan and
+// impossible to confuse with an id somebody actually wrote.
+const SCAN_ID_PREFIX = "\u0000auto:";
+// Past this many of someone else's rows changed, a candidate is not extending
+// the profile any more, it is replacing its composition. Measured against the
+// real thing: dropped on a headless profile, dsh-TUI switches off 23 rows and
+// replaces the config of 6 more, while a plugin that tunes what it needs
+// changes one or two rows.
+const SURFACE_TAKEOVER_MIN = 10;
+// Host packages only another front door peer-depends on. The terminal stack is
+// the load-bearing half: a package built on it, shipping its own `bin` and no
+// browser half, IS a surface — it exists to replace dsh-web-app over dsh-base,
+// not to run beside it. The host runner alone is weaker evidence (host-side
+// tooling legitimately uses it), so it only feeds the advisory warning.
+const TERMINAL_PEER_PACKAGES = ["@deepseek-ai/dsh-terminal", "@deepseek-ai/dsh-terminal-bash"];
+const SURFACE_PEER_PACKAGES = [...TERMINAL_PEER_PACKAGES, "@deepseek-ai/dsh-cordis-host-runner"];
 const NPM_PACKAGE_NAME_RE = /^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/i;
 // Snapshot/pending schema version. v2 makes the original dependency list and
 // the candidate identity MANDATORY: a rollback that cannot name the candidate
@@ -132,39 +162,155 @@ function hostPackageInfo(packageName, anchorDir) {
   }
 }
 
+/** The shape every patch parser returns, so callers can always spread it. */
+function emptyPatchOps() {
+  return { ops: [], rows: [], overrides: [] };
+}
+
+/**
+ * Parse one patch list into the two entry kinds the loader distinguishes
+ * (`applyEntryPatches` in @deepseek-ai/cordis-plugin-include):
+ *
+ *   - `insert:` appends rows — to the profile root, or into the group named by
+ *     the sibling `id`;
+ *   - anything else is id-targeted, and every sibling key REPLACES that key on
+ *     the row already carrying that id: `config` is swapped wholesale (never
+ *     deep merged), `disabled: true` unmounts the row. A sibling `name` is
+ *     only a guard — the loader skips the whole entry when it does not match
+ *     the target row's name, and skips an id-less non-insert entry outright.
+ *
+ * Both kinds have to be parsed. Reading only `insert` was how a candidate that
+ * switches off two dozen of the profile's existing rows still scanned as safe:
+ * overriding rows is the patch layer's main documented use, and it was the one
+ * thing the scan could not see.  `ops` keeps document order because the loader
+ * applies entries in order — a patch can target a row an earlier entry in the
+ * same file inserted.
+ */
+/**
+ * Validate one `insert:` list and return the rows the loader would push, plus
+ * a flat descriptor of every row in it (a group's children included, the way
+ * `buildMap` walks them). The rows stay RAW: a later patch replaces whole
+ * fields on them, including a group's `config`, so the subtree a row owns is
+ * only known once every layer has been applied.
+ */
+function insertRowsOf(list, issues, owner, flat = []) {
+  const raw = [];
+  for (const row of list) {
+    if (row === null || row === undefined) {
+      // buildMap reads `entry.id` on every inserted row, so a null row is a
+      // TypeError at boot, not a row the loader ignores.
+      issues.push(issue("block", "patch-entry-invalid", "补丁 insert 里有空条目", `${owner} 的补丁 insert 列表里有一个 null 条目；loader 索引每一行时会直接抛错，dsh 起不来。`, { package: owner }));
+      continue;
+    }
+    if (typeof row !== "object" || Array.isArray(row)) {
+      issues.push(issue("block", "patch-entry-invalid", "补丁 insert 里有非法条目", `${owner} 的补丁 insert 列表里有一个不是映射的条目（${JSON.stringify(row)}）；它会被原样插进组装树，成为一条挂不起来的行。`, { package: owner }));
+      continue;
+    }
+    raw.push(row);
+    // Exactly as written. The loader compares ids and names with `===` and
+    // only mints an id when the written one is FALSY (`ensureId`), so a
+    // numeric `id: 7` is a real id — trimming it, or demoting it to "no id",
+    // would make the scan resolve targets dsh misses and miss the duplicate
+    // ids dsh refuses to boot with.
+    flat.push({ id: row.id ? row.id : undefined, name: row.name ? row.name : undefined, source: undefined, owner });
+    if (row.group && Array.isArray(row.config)) insertRowsOf(row.config, issues, owner, flat);
+  }
+  return { raw, flat };
+}
+
 function parsePatchDocument(document, source, issues, owner) {
-  if (document === null || document === undefined) return [];
+  if (document === null || document === undefined) return emptyPatchOps();
+  if (rejectCyclicDocument(document, issues, owner)) return emptyPatchOps();
   if (!Array.isArray(document)) {
     issues.push(issue("block", "patch-shape", "插件补丁结构错误", `${owner} 的补丁顶层必须是数组。`, { package: owner }));
-    return [];
+    return emptyPatchOps();
   }
-  const rows = [];
+  const ops = [];
+  const notes = { generated: [] };
   for (const entry of document) {
-    if (!Array.isArray(entry?.insert)) continue;
-    for (const row of entry.insert) {
-      if (row === null || typeof row !== "object") continue;
-      const id = typeof row.id === "string" ? row.id.trim() : "";
-      const name = typeof row.name === "string" ? row.name.trim() : "";
-      if (id.length === 0 || name.length === 0) continue;
-      rows.push({ id, name, source, owner });
+    // The loader destructures every entry (`const { id, insert, name,
+    // ...overrides } = patch`), so a null entry throws at boot. Any other
+    // non-mapping entry destructures to an id-less patch, which the loader
+    // warns about and skips — inert, but never what the author meant.
+    if (entry === null || entry === undefined) {
+      issues.push(issue("block", "patch-entry-invalid", "补丁里有空条目", `${owner} 的补丁里有一个 null 条目；loader 会对每个条目解构，遇到它直接抛错，dsh 起不来。`, { package: owner }));
+      continue;
     }
+    if (typeof entry !== "object" || Array.isArray(entry)) {
+      issues.push(issue("warn", "patch-entry-ignored", "补丁里有无效条目", `${owner} 的补丁里有一个不是映射的条目（${JSON.stringify(entry)}）；它没有 id，loader 只会打一条警告然后跳过——写在那里不起任何作用。`, { package: owner }));
+      continue;
+    }
+    if (entry.insert) { // the loader's own test: `if (insert)`, so 0 and "" fall through
+      if (!Array.isArray(entry.insert)) {
+        issues.push(issue("block", "patch-entry-invalid", "补丁条目结构错误", `${owner} 的补丁里有一条 insert 不是数组；loader 会展开它插进组装树，非可迭代值直接抛错，可迭代值则插入一堆挂不起来的行。`, { package: owner }));
+        continue;
+      }
+      // `insert` with an `id` targets that group; without one it appends to
+      // the profile root.
+      const into = entry.id ? entry.id : undefined;
+      const inserted = insertRowsOf(entry.insert, issues, owner);
+      for (const row of inserted.flat) {
+        row.source = source;
+        if (row.id === undefined) notes.generated.push(row.name ?? "(无 name)");
+      }
+      ops.push({ kind: "insert", into, raw: inserted.raw, rows: inserted.flat });
+      continue;
+    }
+    const { id, name, insert, ...values } = entry;
+    if (!id) {
+      // "patch: id is required for non-insert patches" — one warning, skipped.
+      issues.push(issue("warn", "patch-entry-ignored", "补丁里有无 id 的条目", `${owner} 的补丁里有一个既没有 insert 也没有 id 的条目；loader 只会打一条警告然后跳过——写在那里不起任何作用。`, { package: owner }));
+      continue;
+    }
+    ops.push({
+      kind: "override",
+      id,
+      // The guard is `if (name && name !== target.name)`: a falsy name — 0,
+      // false, "" — does not arm it at all, and the patch applies to whatever
+      // row carries that id. Treating those as "a name that does not match"
+      // silently drops patches the loader applies.
+      name: name ? name : undefined,
+      keys: Object.keys(values),
+      values,
+      source,
+      owner,
+    });
   }
-  return rows;
+  if (notes.generated.length > 0) {
+    issues.push(issue("warn", "patch-row-generated-id", `补丁有 ${notes.generated.length} 条行没写 id`, `${owner} 的 ${notes.generated.join("、")} 没有 id。loader 会当场生成一个随机 id 并照常挂载，但每次读取都换一个——即使文本没变，也会被当成先删后加、重新挂载一遍。`, { package: owner }));
+  }
+  return {
+    ops,
+    rows: ops.filter((op) => op.kind === "insert").flatMap((op) => op.rows),
+    overrides: ops.filter((op) => op.kind === "override"),
+  };
 }
 
 function parsePatch(filePath, source, issues, owner) {
   if (!existsSync(filePath)) {
     issues.push(issue("block", "patch-missing", "插件补丁文件不存在", `${owner} 声明了 ${filePath}，但文件不存在。`, { package: owner }));
-    return [];
+    return emptyPatchOps();
   }
   let document;
   try {
     document = load(readFileSync(filePath, "utf8"), { schema: PATCH_SCHEMA });
   } catch (error) {
     issues.push(issue("block", "patch-invalid", "插件补丁无法解析", `${owner} 的 ${basename(filePath)} 不是有效 YAML：${error.message}`, { package: owner }));
-    return [];
+    return emptyPatchOps();
   }
   return parsePatchDocument(document, source, issues, owner);
+}
+
+/**
+ * Reject a document whose YAML anchors point back into themselves. This runs
+ * BEFORE anything walks the parsed value: a self-referencing `insert` row
+ * would send the row collector into infinite recursion, so the check cannot
+ * live at the end of parsing.
+ */
+function rejectCyclicDocument(document, issues, owner) {
+  if (!hasCycle(document)) return false;
+  issues.push(issue("block", "patch-cyclic-value", "补丁里有自引用的值", `${owner} 的补丁里有一个 YAML 锚点指回自己所在的容器（例如 \`config: &loop\n  self: *loop\`）；这样的配置无法被序列化，也无法写回组装树。`, { package: owner }));
+  return true;
 }
 
 /**
@@ -178,7 +324,7 @@ function parsePatchText(text, source, issues, owner) {
     document = load(String(text), { schema: PATCH_SCHEMA });
   } catch (error) {
     issues.push(issue("block", "patch-invalid", "插件补丁无法解析", `${owner} 的补丁不是有效 YAML：${error.message}`, { package: owner }));
-    return [];
+    return emptyPatchOps();
   }
   return parsePatchDocument(document, source, issues, owner);
 }
@@ -203,10 +349,10 @@ function bundlePatchPath(info, issues, owner) {
   return target;
 }
 
-function rowsForPackage(info, issues, source = "bundle") {
+function patchOpsForPackage(info, issues, source = "bundle") {
   const owner = info.manifest.name ?? basename(info.dir);
   const patchPath = bundlePatchPath(info, issues, owner);
-  if (patchPath === undefined) return [];
+  if (patchPath === undefined) return emptyPatchOps();
   return parsePatch(patchPath, source, issues, owner);
 }
 
@@ -216,33 +362,282 @@ function clientRowId(packageName) {
   return trimmed.length > 0 ? trimmed : last;
 }
 
+/**
+ * Compose an ordered patch stack into the row map it produces, entry by entry,
+ * the way the loader's own `applyEntryPatches` does: a later entry can target
+ * a row an earlier one inserted, repeated writes to one row collapse, and the
+ * last layer to write a key wins. Composing (rather than matching ops against
+ * a static snapshot) is what makes an ordered patch readable at all — a patch
+ * that disables a row and then re-enables it leaves it enabled, and ten writes
+ * to one row are one changed row, not ten.
+ *
+ * @param layers - `{owner, patch}` in application order.
+ * @param trace - owner whose entries are recorded, for the report.
+ * @returns the composed rows, plus which of `trace`'s entries were skipped and
+ *          which rows it wrote (a write a later layer takes back leaves no
+ *          trace in the result, so the caller needs both to explain itself).
+ */
+/** Layer ownership, kept off the row's own keys so it never enters a diff. */
+const ROW_OWNER = Symbol("dsh-plugin-mall.owner");
+
+function stampOwner(rows, owner) {
+  for (const row of rows) {
+    if (row === null || typeof row !== "object" || Array.isArray(row)) continue;
+    Object.defineProperty(row, ROW_OWNER, { value: owner, configurable: true, enumerable: false, writable: true });
+    if (row.group && Array.isArray(row.config)) stampOwner(row.config, owner);
+  }
+}
+
+/** The stricter of two mount states (disabled beats unknown beats enabled). */
+function worstState(left, right) {
+  if (left === "disabled" || right === "disabled") return "disabled";
+  if (left === "unknown" || right === "unknown") return "unknown";
+  return "enabled";
+}
+
+function composeEntries(layers, trace) {
+  // Two structures, because the loader keeps two. `data` is the entry list it
+  // ends up booting — rows nested inside groups included, and a later patch
+  // that replaces a group's `config` replaces that whole subtree. `entryMap`
+  // is what id-targeted patches resolve against: `buildMap` fills it while
+  // rows are INSERTED, so rows that arrive later through a `config` override
+  // are in the tree but not addressable. Projecting mounts off a single flat
+  // map cannot express both.
+  const data = [];
+  const entryMap = new Map();
+  const skipped = [];
+  const touched = [];
+
+  const indexRows = (rows) => {
+    for (const row of rows) {
+      if (row === null || typeof row !== "object" || Array.isArray(row)) continue;
+      if (row.id) entryMap.set(row.id, row);
+      if (row.group && Array.isArray(row.config)) indexRows(row.config);
+    }
+  };
+
+  // The launcher does NOT apply layers one call at a time: it flattens every
+  // layer into a single `applyEntryPatches([], layers.flat())`
+  // (dsh-app-boot's own composeEntries). One call means one lookup map, built
+  // from the rows as they are inserted — so a row that arrives through a
+  // `config` override is in the tree but addressable to nobody, in any layer.
+  for (const { owner, patch } of layers) {
+    for (const op of patch.ops) {
+      if (op.kind === "insert") {
+        // Detached, exactly like the loader's own structuredClone: layers must
+        // not alias each other's values, or a later override would reach back
+        // into the parsed patch of an earlier one.
+        const rows = structuredClone(op.raw);
+        stampOwner(rows, owner);
+        if (op.into !== undefined) {
+          // Inserting into a group: the loader warns and drops the whole list
+          // when the target is missing or is not a group, so those rows never
+          // mount and the patch quietly does nothing.
+          const target = entryMap.get(op.into);
+          if (target === undefined || !target.group) {
+            if (owner === trace) skipped.push({ id: op.into, why: target === undefined ? "profile 里没有这个 id，插不进去" : `id=${op.into} 不是 group，插不进去` });
+            continue;
+          }
+          if (!Array.isArray(target.config)) target.config = [];
+          target.config.push(...rows);
+        } else {
+          data.push(...rows);
+        }
+        indexRows(rows);
+        continue;
+      }
+      const target = entryMap.get(op.id);
+      if (target === undefined) {
+        // The loader prints one stderr warning and boots without the entry.
+        if (owner === trace) skipped.push({ id: op.id, why: "profile 里没有这个 id" });
+        continue;
+      }
+      if (op.name !== undefined && op.name !== target.name) {
+        if (owner === trace) skipped.push({ id: op.id, why: `name 对不上（该行现在是 ${target.name}）` });
+        continue;
+      }
+      // Every sibling key replaces that key on the target — `config` and
+      // `disabled`, but equally `inject`, `intercept`, `isolate`, `group` and
+      // anything a later dsh adds. Applying only the two we grade would leave
+      // the rest invisible, which is the same blind spot in a new place.
+      for (const key of op.keys) {
+        target[key] = structuredClone(op.values[key]);
+        // Rows that arrive this way belong to the layer that wrote them — and
+        // deliberately do NOT enter entryMap, matching the loader.
+        if (key === "config" && Array.isArray(target[key])) stampOwner(target[key], owner);
+      }
+      if (owner === trace && !touched.includes(op.id)) touched.push(op.id);
+    }
+  }
+
+  // The mount projection is read off the FINAL tree, so a group whose config
+  // was replaced contributes its new children and not its old ones.
+  const mounted = [];
+  let generated = 0;
+  const walk = (rows, inherited) => {
+    for (const row of rows) {
+      if (row === null || typeof row !== "object" || Array.isArray(row)) continue;
+      const declaredId = row.id ? row.id : undefined;
+      const name = row.name ? row.name : undefined;
+      const inheritedNext = worstState(inherited, disabledState(row.disabled));
+      mounted.push({
+        // `ensureId` mints one at load time for a row whose id is falsy.
+        id: declaredId === undefined ? `${SCAN_ID_PREFIX}${generated++}` : declaredId,
+        generatedId: declaredId === undefined,
+        name: typeof name === "string" ? name : undefined,
+        // A truthy non-string name is not a module specifier: the loader calls
+        // `name.startsWith(...)` on it and the entry throws at import.
+        unusableName: name !== undefined && typeof name !== "string" ? name : undefined,
+        owner: row[ROW_OWNER],
+        // `_disabled` short-circuits for a group: the group entry itself is
+        // never disabled, only what sits under it is.
+        state: row.group ? "enabled" : inheritedNext,
+        // The row as it ends up in the tree, for the field diff.
+        options: row,
+      });
+      if (row.group && Array.isArray(row.config)) walk(row.config, inheritedNext);
+    }
+  };
+  walk(data, "enabled");
+
+  // Two views, for two questions. `entries` answers "would a patch targeting
+  // this id hit anything?" — that is the lookup map, and nothing else.
+  // `rows` answers "what does the profile end up with?" — read off the final
+  // tree, so a group whose `config` was replaced reports its new children and
+  // its old ones as gone. Diffing the lookup map instead would miss both.
+  const entries = new Map();
+  for (const [id, row] of entryMap) entries.set(id, { id, name: row.name, options: row, insertedBy: row[ROW_OWNER] });
+  const rows = new Map();
+  for (const row of mounted) rows.set(row.id, { ...row, insertedBy: row.owner });
+
+  return { data, entries, rows, skipped, touched, mounted };
+}
+
+/**
+ * Resolve one `dsh.profile.bundles` entry the way the launcher's own
+ * `resolveBundleDir` does: the dsh installation first, the profile directory
+ * second. That order is the contract that in-box bundles always come from the
+ * same installation as the running dsh, never from a profile-local copy — a
+ * scan that reverses it composes a tree the profile will not boot. The
+ * installation anchor is approached through the shared profiles/node_modules
+ * link farm dsh maintains, which is where a profile can see it from.
+ * Resolution never asks the package to export `./package.json`.
+ */
+function bundleInfo(packageName, profileDir) {
+  if (typeof packageName !== "string" || !NPM_PACKAGE_NAME_RE.test(packageName)) return undefined;
+  const parts = packageName.split("/");
+  for (const anchor of [join(dirname(profileDir), "package.json"), join(profileDir, "package.json")]) {
+    let searchPaths;
+    try {
+      searchPaths = createRequire(anchor).resolve.paths(packageName) ?? [];
+    } catch {
+      continue;
+    }
+    for (const searchPath of searchPaths) {
+      const manifestPath = join(searchPath, ...parts, "package.json");
+      if (!existsSync(manifestPath)) continue;
+      try {
+        const manifest = readJson(manifestPath);
+        if (manifest?.name !== packageName) continue;
+        return { manifestPath, dir: dirname(manifestPath), manifest };
+      } catch {
+        continue;
+      }
+    }
+  }
+  return undefined;
+}
+
+/** The home-level patch layer (`<home>/cordis.patch.yml`) for one profile. */
+function homePatchPath(profileDir) {
+  return join(dirname(dirname(profileDir)), "cordis.patch.yml");
+}
+
 function installedProfile(profileDir, issues) {
   const manifestPath = join(profileDir, "package.json");
   const manifest = readJson(manifestPath);
   const dependencies = Object.keys(manifest.dependencies ?? {});
   const bundles = manifest.dsh?.profile?.bundles ?? [];
   const packages = new Map();
-  const rows = [];
+  const infos = new Map();
   for (const name of new Set([...dependencies, ...bundles])) {
-    const info = packageInfo(name, profileDir);
+    // Bundles resolve through the launcher's two anchors; a plain dependency
+    // stays on the strict profile-only lookup, where ancestor-only resolution
+    // is the fingerprint of a crashed install rather than a normal in-box
+    // package. In-box bundles (@deepseek-ai/dsh-base, dsh-web-app, …) live in
+    // neither the profile's node_modules nor its dependency list, and without
+    // resolving them every check here compared a candidate against
+    // third-party rows only — colliding with an official row read as safe.
+    const info = bundles.includes(name) ? bundleInfo(name, profileDir) : packageInfo(name, profileDir);
     if (info === undefined) {
-      // A dependency the manifest declares but node_modules cannot resolve (or
-      // whose package.json cannot be read) is the fingerprint of a crash
-      // mid-install: pnpm updated package.json before materializing the package.
-      // Skipping it would let recoverProfile commit a profile dsh cannot load.
-      // Template bundles appear only in `bundles`, never in `dependencies`, so
-      // they stay silent here (they are in-box, not expected under node_modules).
-      if (dependencies.includes(name)) {
+      // A profile layer that resolves from neither anchor stops dsh at
+      // startup ("cannot resolve profile bundle X"), so it is a blocker even
+      // though in-box bundles are deliberately absent from `dependencies`.
+      // For a plain dependency, the same failure is the fingerprint of a crash
+      // mid-install: pnpm updated package.json before materializing the
+      // package. Either way, skipping it would let recoverProfile commit a
+      // profile dsh cannot load.
+      if (bundles.includes(name)) {
+        issues.push(issue("block", "bundle-unresolved", "profile 层无法解析", `dsh.profile.bundles 里列了 ${name}，但从 dsh 安装目录和 ${profileDir} 都解析不到它；dsh 启动时会直接报错退出。`, { package: name }));
+      } else if (dependencies.includes(name)) {
         issues.push(issue("block", "package-unresolved", "依赖无法解析", `package.json 声明了依赖 ${name}，但 node_modules 中无法解析或读取其 package.json（安装可能未完成）。`, { package: name }));
       }
       continue;
     }
+    infos.set(name, info);
     packages.set(name, info.manifest);
-    if (bundles.includes(name)) rows.push(...rowsForPackage(info, issues, "bundle"));
   }
-  const profilePatch = join(profileDir, "cordis.patch.yml");
-  if (existsSync(profilePatch)) rows.push(...parsePatch(profilePatch, "profile", issues, "profile cordis.patch.yml"));
-  return { manifest, dependencies, bundles, packages, rows };
+  // Layer order decides who wins a row: bundles in `dsh.profile.bundles`
+  // order, then the profile's own patch, then the home-level patch — machine
+  // local preferences that apply to every profile, so they outrank the
+  // per-profile layer (dsh's own composeProfile, in that order).
+  const rows = [];
+  const bundleLayers = [];
+  for (const name of bundles) {
+    const info = infos.get(name);
+    if (info === undefined) continue; // already reported as unresolved
+    if (typeof info.manifest?.dsh?.bundle?.patch !== "string") {
+      // Naming a bundle-less package as a layer is a misconfiguration, not
+      // "no patches": dsh throws "declares no dsh.bundle" and never starts.
+      issues.push(issue("block", "bundle-manifest-missing", "profile 层没有 dsh.bundle 声明", `${name} 被列为 profile 层，但它的 package.json 没有 dsh.bundle.patch；dsh 启动时会直接报错退出。`, { package: name }));
+      continue;
+    }
+    const patch = patchOpsForPackage(info, issues, "bundle");
+    rows.push(...patch.rows);
+    bundleLayers.push({ owner: name, patch });
+  }
+  const userLayers = [];
+  for (const [file, owner] of [[join(profileDir, "cordis.patch.yml"), "profile cordis.patch.yml"], [homePatchPath(profileDir), "home cordis.patch.yml"]]) {
+    if (!existsSync(file)) continue;
+    const patch = parsePatch(file, "profile", issues, owner);
+    rows.push(...patch.rows);
+    userLayers.push({ owner, patch });
+  }
+  // Composed lazily: the rollback validation that runs at every startup needs
+  // the packages and the raw rows, not always the composed tree.
+  let composed;
+  const compose = () => (composed ??= composeEntries([...bundleLayers, ...userLayers]));
+  return {
+    manifest,
+    dependencies,
+    bundles,
+    packages,
+    rows,
+    bundleLayers,
+    userLayers,
+    get entries() {
+      return compose().entries;
+    },
+    // The rows that survive composition: a row an existing bundle inserts into
+    // a group nobody provides is dropped by the loader, so it can neither
+    // collide with a candidate nor be mounted twice.
+    get composedRows() {
+      return compose().mounted;
+    },
+    get composedRowsById() {
+      return compose().rows;
+    },
+  };
 }
 
 function compatibilityIssues(candidate, current, profileDir) {
@@ -274,6 +669,22 @@ function compatibilityIssues(candidate, current, profileDir) {
         { package: candidateName, conflictsWith: hostDeps },
       ));
     }
+  }
+
+  // A package that ships its own command line, peer-depends on the packages
+  // only a front door needs, and brings no `dsh.client` browser half is a
+  // rival surface: it is built to REPLACE dsh-web-app over dsh-base, not to
+  // run inside this profile. Advisory on its own — the rows such a bundle
+  // rewrites are what actually blocks it.
+  const surfacePeers = surfacePeersOf(candidate.manifest);
+  if (surfacePeers.length > 0) {
+    issues.push(issue(
+      "warn",
+      "rival-host-surface",
+      "这更像另一套宿主前端",
+      `${candidateName} 自带命令行入口（bin）、依赖 ${surfacePeers.join("、")}，且没有 dsh.client 浏览器半边；它多半是替代当前前端的另一套门面，装进这个 profile 不会出现在界面上。`,
+      { package: candidateName },
+    ));
   }
 
   const engineRange = candidate.manifest.engines?.node;
@@ -337,29 +748,370 @@ function compatibilityIssues(candidate, current, profileDir) {
   return issues;
 }
 
-function rowConflictIssues(candidateName, candidateRows, existingRows) {
+/**
+ * Whether a row id ends up mounted in the composed tree. A row that is not
+ * there at all (its insert was dropped) or that ends up disabled cannot be
+ * half of a double mount; without this a candidate that switches the old row
+ * off and remounts the same module under a new id reads as mounting it twice.
+ */
+/** One row's own `disabled` value, read the way the loader reads it. */
+function disabledState(value) {
+  // `disabledOf`: an expression is evaluated at load time against the loader
+  // context, everything else goes through Boolean().
+  if (isJsExpr(value)) return "unknown";
+  return value ? "disabled" : "enabled";
+}
+
+/** How a pair of projected rows would mount together. */
+function bothMount(left, right) {
+  const states = [left.state, right.state];
+  if (states.includes("disabled")) return "not-both";
+  return states.includes("unknown") ? "unknown" : "both";
+}
+
+/**
+ * Rows the loader would try to mount without a module specifier. `import(undefined)`
+ * fails the whole startup, so an enabled one is a blocker; a disabled one is
+ * dead weight the author probably did not intend.
+ */
+function namelessRowIssues(rows, subject) {
   const issues = [];
-  for (let index = 0; index < candidateRows.length; index++) {
-    const row = candidateRows[index];
-    for (let otherIndex = index + 1; otherIndex < candidateRows.length; otherIndex++) {
-      const other = candidateRows[otherIndex];
-      if (row.id === other.id && row.name !== other.name) {
-        issues.push(issue("block", "candidate-duplicate-id", "插件内部存在重复加载 ID", `${candidateName} 在同一补丁中用 id=${row.id} 加载 ${row.name} 和 ${other.name}。`, { package: candidateName }));
-      }
-      if (!HOST_PACKAGE_RE.test(candidateName) && row.name === other.name && row.id !== other.id) {
-        issues.push(issue("block", "candidate-double-mount", "插件内部会重复挂载模块", `${row.name} 同时使用 id=${row.id} 和 id=${other.id}。`, { package: candidateName }));
-      }
+  const ids = (list) => list.map((row) => (row.generatedId ? "(无 id 的行)" : String(row.id))).join("、");
+  const report = (list, code, what) => {
+    if (list.length === 0) return;
+    const live = list.filter((row) => row.state !== "disabled");
+    if (live.length > 0) {
+      issues.push(issue("block", code, `有 ${live.length} 条启用的行${what.title}`, `${subject} 的 ${ids(live)} ${what.detail}这些行是启用状态，dsh 起不来。`, { package: subject }));
+      return;
     }
-    for (const existing of existingRows) {
-      // Updating a package naturally compares against its currently mounted
-      // row.  The same id+name is an update, not a collision.
-      if (existing.owner === candidateName && existing.id === row.id && existing.name === row.name) continue;
-      if (existing.id === row.id && existing.name !== row.name) {
-        issues.push(issue("block", "loader-id-collision", "加载 ID 已被其他插件占用", `候选插件要用 id=${row.id} 加载 ${row.name}，但 ${existing.owner} 已用它加载 ${existing.name}。`, { package: candidateName, conflictsWith: [existing.owner] }));
-      } else if (existing.name === row.name && existing.id !== row.id) {
-        issues.push(issue("block", "double-mount", "同一模块会被挂载两次", `${row.name} 已由 ${existing.owner} 以 id=${existing.id} 挂载，候选插件还会以 id=${row.id} 再挂一次。`, { package: candidateName, conflictsWith: [existing.owner] }));
-      }
+    issues.push(issue("warn", code, `有 ${list.length} 条行${what.title}`, `${subject} 的 ${ids(list)} ${what.detail}它们当前是停用状态，所以还不会让 dsh 起不来——一旦被启用就会。`, { package: subject }));
+  };
+  report(rows.filter((row) => row.name === undefined && row.unusableName === undefined), "patch-row-no-name", {
+    title: "没有 name",
+    detail: "没有 name，loader 会拿 undefined 去 import；",
+  });
+  report(rows.filter((row) => row.unusableName !== undefined), "patch-row-name-invalid", {
+    title: "的 name 不是字符串",
+    detail: "的 name 不是字符串（模块名必须是字符串，loader 会对它调用 name.startsWith）；",
+  });
+  return issues;
+}
+
+/**
+ * The conflicts the candidate ADDS. Both trees are scanned whole and the
+ * before-set is subtracted, because a conflict is a property of the composed
+ * tree, not of who owns which row: flipping one existing row back on can put
+ * two rows nobody in this install owns into conflict, and an update that
+ * leaves a pre-existing conflict untouched should not be blamed for it.
+ */
+function newConflictIssues(candidateName, beforeRows, afterRows) {
+  const identity = (entry) => `${entry.code}|${entry.title}|${entry.detail}`;
+  const existing = new Set(detectRowConflicts(beforeRows).map(identity));
+  return detectRowConflicts(afterRows)
+    .filter((entry) => !existing.has(identity(entry)))
+    .map((entry) => ({ ...entry, package: candidateName }));
+}
+
+/** Keys the current config carries that the replacement does not restate. */
+function droppedConfigKeys(current, next) {
+  if (current === null || typeof current !== "object" || Array.isArray(current)) return [];
+  if (next === null || typeof next !== "object" || Array.isArray(next)) return Object.keys(current);
+  return Object.keys(current).filter((key) => !(key in next));
+}
+
+/** `id (package)` list for a report line, clipped so a 23-row patch stays readable. */
+function listRows(rows, limit = 6) {
+  const shown = rows.slice(0, limit).map((row) => `${row.id}（${row.name}）`).join("、");
+  return rows.length > limit ? `${shown} 等 ${rows.length} 条` : shown;
+}
+
+/** Front-door peers a candidate declares, empty unless it looks like a surface. */
+function surfacePeersOf(manifest) {
+  if (manifest?.bin === undefined || manifest?.dsh?.client !== undefined) return [];
+  return Object.keys(manifest?.peerDependencies ?? {}).filter((name) => SURFACE_PEER_PACKAGES.includes(name));
+}
+
+/** A surface built on the terminal stack: it replaces the front door, never joins it. */
+function isRivalFrontDoor(manifest) {
+  return surfacePeersOf(manifest).some((name) => TERMINAL_PEER_PACKAGES.includes(name));
+}
+
+/**
+ * Whether two `disabled` values leave the row in the same state. Literals are
+ * compared the way the loader reads them (`Boolean(options.disabled)`, so
+ * absent and `false` are one state); an expression on either side is compared
+ * by source, because what it evaluates to is only known at load time.
+ */
+function sameDisabledState(left, right) {
+  if (isJsExpr(left) || isJsExpr(right)) return stableJson(left) === stableJson(right);
+  return Boolean(left) === Boolean(right);
+}
+
+/** The row option keys whose value differs between two composed states. */
+function changedRowKeys(prev, next) {
+  const left = prev?.options ?? {};
+  const right = next?.options ?? {};
+  // `id` and `name` are the row's identity, not fields a patch can rewrite:
+  // the loader destructures both out before applying the rest, and a row that
+  // arrived under an id somebody else owns is an id collision, reported as
+  // one — not as "this plugin rewrote a field".
+  return [...new Set([...Object.keys(left), ...Object.keys(right)])].filter((key) => key !== "id" && key !== "name").filter((key) => (key === "disabled"
+    ? !sameDisabledState(left.disabled, right.disabled)
+    : stableJson(left[key]) !== stableJson(right[key])));
+}
+
+/**
+ * Key-order-independent value identity, for "did this row's field change?".
+ * `undefined` (the key is absent) and `null` (the key is set to null) are
+ * different values to the loader, so they must not share a rendering.
+ */
+function stableJson(value, seen = new Set()) {
+  if (value === undefined) return "\u0000absent";
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  // A YAML anchor can point at its own container. The parse-time check below
+  // rejects those, but this stays cycle-safe so no caller can be crashed by a
+  // value that reached it another way.
+  if (seen.has(value)) return "\u0000cycle";
+  seen.add(value);
+  const rendered = Array.isArray(value)
+    ? `[${value.map((item) => stableJson(item, seen)).join(",")}]`
+    : `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key], seen)}`).join(",")}}`;
+  seen.delete(value);
+  return rendered;
+}
+
+/** Whether a parsed value contains a cycle (`config: &loop { self: *loop }`). */
+function hasCycle(value, seen = new Set()) {
+  if (value === null || typeof value !== "object") return false;
+  if (seen.has(value)) return true;
+  seen.add(value);
+  const found = Object.values(value).some((item) => hasCycle(item, seen));
+  seen.delete(value);
+  return found;
+}
+
+/**
+ * Grade what a candidate's patch does to the rows the profile already
+ * composes, by composing the profile twice — with and without the candidate's
+ * layer in the position dsh would apply it (an update keeps its place in
+ * `dsh.profile.bundles`, a fresh install lands after every other bundle) — and
+ * diffing the two row maps. Simulating rather than reading the patch entry by
+ * entry is what keeps the verdict honest: an entry that targets a row the same
+ * patch inserted is not "missing", ten writes to one row are one changed row,
+ * a disable followed by an enable is not a disable, and a write the profile's
+ * own patch layer takes back afterwards changes nothing at all. It also means
+ * an update is judged on what it would newly do, not waved through because the
+ * installed version already owns those rows.
+ *
+ * Overriding an existing row is a documented, legitimate bundle technique —
+ * dsh-web-app configures dsh-base's rows exactly that way, and the docs tell
+ * bundle authors to — so severity comes from scale and from what changes,
+ * never from the act itself:
+ *
+ *   - disabling, re-enabling or reconfiguring someone else's rows is a warning
+ *     that names them, so the user confirms a change they can actually see;
+ *   - past SURFACE_TAKEOVER_MIN rows it blocks: a patch that size is a rival
+ *     composition rather than an addition, and installing it leaves the
+ *     current surface without rows it needs;
+ *   - an entry that ends up doing nothing — unknown id, a `name` guard that
+ *     does not match, or a write a later layer takes back — is reported as
+ *     inert, because that plugin's customization silently will not apply here.
+ */
+/**
+ * Compose the profile as it would stand with the candidate's layer applied.
+ * The layer replaces the installed one in place when this is an update (a
+ * bundle keeps its position in `dsh.profile.bundles`) and lands after every
+ * other bundle when it is a fresh install. The baseline is the profile as it
+ * stands today, so an update is judged on what it would newly change — not on
+ * the footprint its own installed version already has.
+ */
+function simulateCandidateLayer(candidateName, patch, current) {
+  const candidateLayer = { owner: candidateName, patch };
+  const installedAt = current.bundleLayers.findIndex((layer) => layer.owner === candidateName);
+  const withCandidate = installedAt === -1
+    ? [...current.bundleLayers, candidateLayer]
+    : current.bundleLayers.map((layer, index) => (index === installedAt ? candidateLayer : layer));
+  const simulated = composeEntries([...withCandidate, ...current.userLayers], candidateName);
+  return { before: current.composedRowsById, withCandidate, isUpdate: installedAt !== -1, ...simulated };
+}
+
+function patchTargetIssues(candidateName, manifest, patch, current, simulated) {
+  // An update is diffed even with an empty patch: dropping the layer removes
+  // whatever it used to provide, which is exactly the change worth reporting.
+  if (patch.ops.length === 0 && !simulated.isUpdate) return [];
+  const issues = [];
+  const { before, withCandidate } = simulated;
+
+  // Walk the UNION of before and after, over the FINAL trees: a row can also
+  // disappear — when an update stops providing the group other layers were
+  // inserting into, or when a `config` override replaces a group's children.
+  const changes = [];
+  const changed = new Set();
+  for (const id of new Set([...before.keys(), ...simulated.rows.keys()])) {
+    const prev = before.get(id);
+    if (prev === undefined) continue; // a row the candidate inserts, not an override
+    const row = { id, name: prev.name, owner: prev.insertedBy };
+    const next = simulated.rows.get(id);
+    if (next === undefined) {
+      changed.add(id);
+      changes.push({ ...row, keys: [], kind: "removed", structural: true });
+      continue;
     }
+    const keys = changedRowKeys(prev, next);
+    if (keys.length === 0) continue;
+    changed.add(id);
+    const from = prev.options.disabled;
+    const to = next.options.disabled;
+    // Structure is any field but a config value: whether the row runs, what it
+    // waits for, where it runs. A row can change config AND structure, so the
+    // bucket it gets reported in must not decide whether the structural half
+    // counts — that is graded on its own below.
+    const structural = keys.some((key) => key !== "config");
+    let kind = "fields";
+    if (keys.includes("disabled") && (isJsExpr(from) || isJsExpr(to))) kind = "rewired";
+    else if (keys.includes("disabled") && Boolean(to)) kind = "disabled";
+    else if (keys.includes("disabled") && Boolean(from)) kind = "enabled";
+    else if (keys.includes("config")) kind = "replaced";
+    changes.push(kind === "replaced"
+      ? { ...row, keys, kind, structural, dropped: droppedConfigKeys(prev.options.config, next.options.config) }
+      : { ...row, keys, kind, structural });
+  }
+  const ofKind = (kind) => changes.filter((row) => row.kind === kind);
+  const disabled = ofKind("disabled");
+  const enabled = ofKind("enabled");
+  const rewired = ofKind("rewired");
+  const replaced = ofKind("replaced");
+  const fields = ofKind("fields");
+  const removed = ofKind("removed");
+  // Rows the candidate brings itself are its own business: configuring one it
+  // just inserted is not a write that "did nothing to the profile".
+  const ownIds = new Set(patch.rows.map((row) => row.id));
+  const inert = [...simulated.skipped];
+  const unchanged = simulated.touched.filter((id) => !changed.has(id) && !ownIds.has(id));
+  if (unchanged.length > 0) {
+    // A write that lands nowhere is only worth reporting when a LATER layer
+    // takes it back. Compare the bundle stack on its own: a row that moves
+    // there but not in the full composition is one the profile's or home's
+    // patch layer outranks, while a row that does not move either way is the
+    // candidate restating a value that already holds (every update does that).
+    const bundlesBefore = composeEntries(current.bundleLayers).rows;
+    const bundlesAfter = composeEntries(withCandidate).rows;
+    for (const id of unchanged) {
+      if (changedRowKeys(bundlesBefore.get(id), bundlesAfter.get(id)).length === 0) continue;
+      inert.push({ id, why: "写了，但被 profile 或 home 的 patch 层盖住了——那两层排在所有 bundle 之后" });
+    }
+  }
+
+  const touched = changes;
+  const owners = [...new Set(touched.map((row) => row.owner))];
+  const security = touched.filter((row) => SECURITY_ROW_RE.test(`${row.id} ${row.name}`));
+  const structural = touched.filter((row) => row.structural);
+  // The front-door fingerprint is corroborating evidence, never the whole
+  // case: it blocks only together with a structural change — switching rows on
+  // or off, trading a load-time condition for a constant, rewiring
+  // `inject`/`isolate`, or rewriting a protection row. Tuning one ordinary
+  // config row is what a CLI helper legitimately does, and stays a warning
+  // whatever the manifest looks like.
+  const rivalSeverity = new Set([...structural, ...security].map((row) => row.id)).size;
+  if (rivalSeverity > 0 && isRivalFrontDoor(manifest)) {
+    // Two front doors over one profile is the exclusive-slot conflict in its
+    // purest form: whichever surface the user actually boots, these rows now
+    // carry the other one's values.
+    issues.push(issue(
+      "block",
+      "rival-surface-rewrite",
+      "另一套门面，却要改写当前组合的行",
+      `${candidateName} 是建立在终端栈上的另一套门面（自带 bin、无 dsh.client），它的补丁会改写当前 profile 的 ${touched.length} 条行（${listRows(touched)}）。这个 profile 已经有自己的前端，装它不会多出一个界面，只会让这些行改用另一套门面的取值。`,
+      { package: candidateName, conflictsWith: owners },
+    ));
+  } else if (touched.length >= SURFACE_TAKEOVER_MIN) {
+    issues.push(issue(
+      "block",
+      "surface-takeover",
+      "插件会重写这个 profile 的整套组合",
+      `${candidateName} 的补丁会改写 ${touched.length} 条已有加载行：停用 ${disabled.length} 条、启用 ${enabled.length} 条、改 disabled 条件 ${rewired.length} 条、换整块 config ${replaced.length} 条、改其他字段 ${fields.length} 条（${listRows(touched)}）。这是另一套完整组合，不是叠加在当前 profile 上的插件——装进来会让当前界面失去它依赖的行。`,
+      { package: candidateName, conflictsWith: owners },
+    ));
+  } else {
+    if (disabled.length > 0) {
+      issues.push(issue(
+        "warn",
+        "patch-disables-rows",
+        `插件会停用 ${disabled.length} 条已加载的行`,
+        `${candidateName} 的补丁把 ${listRows(disabled)} 设为 disabled: true，这些插件会被卸载（配置项保留，改回来即可恢复）。`,
+        { package: candidateName, conflictsWith: [...new Set(disabled.map((row) => row.owner))] },
+      ));
+    }
+    if (enabled.length > 0) {
+      issues.push(issue(
+        "warn",
+        "patch-enables-rows",
+        `插件会启用 ${enabled.length} 条当前被停用的行`,
+        `${candidateName} 的补丁把 ${listRows(enabled)} 从 disabled 改回启用——这些行是当前组合里被有意关掉的（例如 web 关掉了 hmr），重新打开等于替它做了决定。`,
+        { package: candidateName, conflictsWith: [...new Set(enabled.map((row) => row.owner))] },
+      ));
+    }
+    if (removed.length > 0) {
+      const others = removed.filter((row) => row.owner !== candidateName);
+      issues.push(issue(
+        "warn",
+        "patch-removes-rows",
+        `装上之后有 ${removed.length} 条行不再存在`,
+        `${listRows(removed)} 会从组装树里消失。`
+          + (others.length > 0
+            ? `其中 ${listRows(others)} 是别人插入的行——多半是它们要插进的 group 没了，loader 会连整段 insert 一起丢掉。`
+            : "这些是候选包自己此前提供的行；依赖它们的插件会跟着失效。"),
+        { package: candidateName, conflictsWith: [...new Set(removed.map((row) => row.owner))] },
+      ));
+    }
+    if (rewired.length > 0) {
+      issues.push(issue(
+        "warn",
+        "patch-replaces-condition",
+        `插件会改掉 ${rewired.length} 条行的 disabled 条件`,
+        `${candidateName} 的补丁把 ${listRows(rewired)} 的 disabled 在表达式和定值之间对换。\`!!js\` 表达式是加载时求值的条件（例如按平台开关），换成定值等于把那个条件永久压成一个结果，而且不会有任何提示。`,
+        { package: candidateName, conflictsWith: [...new Set(rewired.map((row) => row.owner))] },
+      ));
+    }
+    if (fields.length > 0) {
+      issues.push(issue(
+        "warn",
+        "patch-rewrites-fields",
+        `插件会改写 ${fields.length} 条已有行的其他字段`,
+        `${candidateName} 的补丁改的是 ${fields.map((row) => `${row.id}（${row.keys.join("、")}）`).join("、")}。inject / isolate / group 这些字段决定这行注入什么服务、落在哪个隔离域，改动同样是整键替换。`,
+        { package: candidateName, conflictsWith: [...new Set(fields.map((row) => row.owner))] },
+      ));
+    }
+    if (replaced.length > 0) {
+      const lossy = replaced.filter((row) => row.dropped.length > 0);
+      issues.push(issue(
+        "warn",
+        "patch-replaces-config",
+        `插件会替换 ${replaced.length} 条已有行的整块 config`,
+        `${candidateName} 的补丁按 id 覆盖 ${listRows(replaced)}；patch 替换整块 config、不做深度合并。`
+          + (lossy.length > 0 ? `其中 ${lossy.map((row) => `${row.id} 会丢掉 ${row.dropped.join("、")}`).join("；")}。` : ""),
+        { package: candidateName, conflictsWith: [...new Set(replaced.map((row) => row.owner))] },
+      ));
+    }
+  }
+
+  if (security.length > 0) {
+    issues.push(issue(
+      "warn",
+      "patch-touches-security-row",
+      "插件会改动安全相关的加载行",
+      `${candidateName} 的补丁动了 ${listRows(security)}——沙箱、审批、权限这类行一旦被停用或换掉配置，影响的是所有插件和所有工具调用，不只是它自己。`,
+      { package: candidateName },
+    ));
+  }
+  if (inert.length > 0) {
+    issues.push(issue(
+      "warn",
+      "patch-target-missing",
+      `插件有 ${inert.length} 条补丁在这个 profile 上不生效`,
+      `${inert.map((row) => `${row.id}：${row.why}`).join("；")}。dsh 对打不中的 patch 只打一条 stderr 警告然后照常启动，所以这些定制会静默失效——通常说明这个插件是给另一种 profile 写的。`,
+      { package: candidateName },
+    ));
   }
   return issues;
 }
@@ -371,10 +1123,21 @@ function detectRowConflicts(rows) {
     const row = rows[index];
     for (let otherIndex = index + 1; otherIndex < rows.length; otherIndex++) {
       const other = rows[otherIndex];
-      if (row.id === other.id && row.name !== other.name) {
-        issues.push(issue("block", "loader-id-collision", "加载 ID 被重复占用", `${row.owner} 用 id=${row.id} 加载 ${row.name}，而 ${other.owner} 也用它加载 ${other.name}。`, { conflictsWith: [row.owner, other.owner] }));
-      } else if (row.owner !== other.owner && row.name === other.name && row.id !== other.id) {
-        issues.push(issue("block", "double-mount", "同一模块被挂载两次", `${row.name} 同时被 ${row.owner}（id=${row.id}）和 ${other.owner}（id=${other.id}）挂载。`, { conflictsWith: [row.owner, other.owner] }));
+      if (row.id === other.id) {
+        issues.push(issue("block", "loader-id-collision", "加载 ID 被重复占用", row.name === other.name
+          ? `${row.owner} 和 ${other.owner} 都用 id=${row.id} 加载 ${row.name}；loader 见到重复 id 直接抛错。`
+          : `${row.owner} 用 id=${row.id} 加载 ${row.name}，而 ${other.owner} 也用它加载 ${other.name}。`, { conflictsWith: [row.owner, other.owner] }));
+      } else if (row.name !== undefined && row.name === other.name && row.id !== other.id
+        // Mounting one module twice on purpose is something the in-box
+        // bundles do (dsh-base mounts dsh-tool-subagent under two ids); from
+        // anyone else, in one layer or across two, it is a defect.
+        && (row.owner !== other.owner || !HOST_PACKAGE_RE.test(String(row.owner ?? "")))) {
+        const together = bothMount(row, other);
+        if (together === "both") {
+          issues.push(issue("block", "double-mount", "同一模块被挂载两次", `${row.name} 同时被 ${row.owner}（id=${row.id}）和 ${other.owner}（id=${other.id}）挂载。`, { conflictsWith: [row.owner, other.owner] }));
+        } else if (together === "unknown") {
+          issues.push(issue("warn", "double-mount-conditional", "是否重复挂载取决于加载时的条件", `${row.name} 会被 ${row.owner}（id=${row.id}）和 ${other.owner}（id=${other.id}）各挂一次，其中至少一条的 disabled 是 \`!!js\` 表达式——真正挂几份要到加载时求值才知道。`, { conflictsWith: [row.owner, other.owner] }));
+        }
       }
     }
   }
@@ -411,7 +1174,8 @@ export function validateInstalledProfile(profileDir) {
       issues.push(issue("block", "host-module-shadow", "插件复制了 DSH 宿主模块", `${name} 把 ${hostDeps.join(", ")} 放在 dependencies 中，会产生双模块实例并破坏工具调度。`, { package: name, conflictsWith: hostDeps }));
     }
   }
-  issues.push(...detectRowConflicts(current.rows));
+  issues.push(...detectRowConflicts(current.composedRows));
+  issues.push(...namelessRowIssues(current.composedRows, "profile"));
   const blockers = issues.filter((entry) => entry.severity === "block");
   const warnings = issues.filter((entry) => entry.severity === "warn");
   const verdict = blockers.length > 0 ? "blocked" : warnings.length > 0 ? "warning" : "safe";
@@ -477,18 +1241,26 @@ export function inspectCandidate({ profileDir, candidateManifestPath, spec }) {
   issues.push(...currentIssues.map((entry) => ({ ...entry, severity: "warn", code: `existing-${entry.code}` })));
   issues.push(...compatibilityIssues(candidate, current, profileDir));
 
-  let rows = rowsForPackage(candidate, issues, "candidate");
+  const patch = patchOpsForPackage(candidate, issues, "candidate");
+  let rows = patch.rows;
+  let clientPatch;
   const kind = typeof candidate.manifest.dsh?.bundle?.patch === "string"
     ? "bundle"
     : candidate.manifest.dsh?.client !== undefined ? "client" : "plain";
   if (kind === "client" && candidateName.length > 0) {
     rows = [{ id: clientRowId(candidateName), name: candidateName, source: "candidate-client", owner: candidateName }];
+    clientPatch = { ops: [{ kind: "insert", into: undefined, raw: [{ id: clientRowId(candidateName), name: candidateName }], rows }], rows, overrides: [] };
   }
   if (kind === "plain") {
     issues.push(issue("warn", "not-a-plugin", "该包没有声明 DSH 插件入口", `${candidateName || spec} 没有 dsh.bundle.patch 或 dsh.client，安装后只是普通依赖。`, { package: candidateName || undefined }));
   }
-  const existingRows = current.rows.filter((row) => row.owner !== candidateName);
-  issues.push(...rowConflictIssues(candidateName, rows, existingRows));
+  // One simulation feeds both checks: what mounts after the candidate's layer
+  // decides whether a "double mount" is really two live rows, and the same
+  // composition is what the row-change grading diffs against.
+  const simulated = simulateCandidateLayer(candidateName, clientPatch ?? patch, current);
+  issues.push(...namelessRowIssues(simulated.mounted.filter((row) => row.owner === candidateName), candidateName || spec));
+  issues.push(...newConflictIssues(candidateName, current.composedRows, simulated.mounted));
+  issues.push(...patchTargetIssues(candidateName, candidate.manifest, patch, current, simulated));
 
   // UI replacements historically predate exclusiveGroups.  Keep the
   // heuristic advisory-only to avoid blocking legitimate sidebar extensions.
@@ -541,22 +1313,37 @@ export function inspectRemoteCandidate({ profileDir, manifest, patchText, spec }
   const kind = typeof manifest?.dsh?.bundle?.patch === "string"
     ? "bundle"
     : manifest?.dsh?.client !== undefined ? "client" : "plain";
-  let rows = [];
+  let patch = emptyPatchOps();
+  // "Not fetched" is not "empty": treating an unfetched patch as `[]` would
+  // simulate an update that withdraws every row the installed version
+  // provides, and report that invented removal as a takeover.
+  let patchKnown = kind !== "bundle";
   if (kind === "bundle") {
     if (patchText === undefined) {
       issues.push(issue("warn", "patch-unverified", "补丁未获取，加载冲突未检查", `${candidateName || spec} 声明了 ${manifest.dsh.bundle.patch}，但浏览时未能获取该文件；加载 ID 冲突要在安装预检时才会验证。`, { package: candidateName || undefined }));
     } else {
-      rows = parsePatchText(patchText, "candidate", issues, candidateName || spec);
+      patch = parsePatchText(patchText, "candidate", issues, candidateName || spec);
+      patchKnown = true;
     }
   }
+  let rows = patch.rows;
+  let clientPatch;
   if (kind === "client" && candidateName.length > 0) {
+    // A browser-half package has no bundle patch; the client module system
+    // mounts it. Model that as the one row it effectively contributes, so it
+    // goes through the same composition as everything else.
     rows = [{ id: clientRowId(candidateName), name: candidateName, source: "candidate-client", owner: candidateName }];
+    clientPatch = { ops: [{ kind: "insert", into: undefined, raw: [{ id: clientRowId(candidateName), name: candidateName }], rows }], rows, overrides: [] };
   }
   if (kind === "plain") {
     issues.push(issue("warn", "not-a-plugin", "该包没有声明 DSH 插件入口", `${candidateName || spec} 没有 dsh.bundle.patch 或 dsh.client，安装后只是普通依赖。`, { package: candidateName || undefined }));
   }
-  const existingRows = current.rows.filter((row) => row.owner !== candidateName);
-  issues.push(...rowConflictIssues(candidateName, rows, existingRows));
+  const simulated = patchKnown ? simulateCandidateLayer(candidateName, clientPatch ?? patch, current) : undefined;
+  if (simulated !== undefined) {
+    issues.push(...namelessRowIssues(simulated.mounted.filter((row) => row.owner === candidateName), candidateName || spec));
+    issues.push(...newConflictIssues(candidateName, current.composedRows, simulated.mounted));
+    issues.push(...patchTargetIssues(candidateName, manifest, patch, current, simulated));
+  }
 
   if (/sidebar/i.test(candidateName) && current.dependencies.some((name) => name !== candidateName && /sidebar/i.test(name))) {
     const other = current.dependencies.find((name) => name !== candidateName && /sidebar/i.test(name));
@@ -1532,7 +2319,7 @@ export function validateRemoveCompletion(profileDir, candidateName) {
   const profilePatch = join(profileDir, "cordis.patch.yml");
   if (!existsSync(profilePatch)) return { ok: issues.length === 0, issues };
   const patchIssues = [];
-  const rows = parsePatch(profilePatch, "profile", patchIssues, "profile cordis.patch.yml");
+  const { rows } = parsePatch(profilePatch, "profile", patchIssues, "profile cordis.patch.yml");
   issues.push(...patchIssues.filter((entry) => entry.severity === "block"));
   if (rows.some((row) => row.name === candidateName)) {
     issues.push(issue("block", "remove-incomplete", "Plugin removal is incomplete", `${candidateName} is still mounted by a profile cordis.patch.yml row.`));
@@ -1804,6 +2591,527 @@ async function selfTest() {
       if (malformed.verdict !== "blocked" || !malformed.issues.some((entry) => entry.code === "patch-invalid")) throw new Error("remote malformed patch fixture failed");
     }
 
+    // ── differential: our composition vs the loader's own applyEntryPatches ──
+    //
+    // Every check in this file rests on one claim — that the tree we compose
+    // is the tree dsh boots. Example fixtures can only show that the cases we
+    // thought of agree. This feeds the SAME layers to the official
+    // `applyEntryPatches` and to `composeEntries`, on hand-written shapes and
+    // on randomly generated ones, and compares the resulting trees. When the
+    // include package is not resolvable (a bare checkout with no fixture
+    // tree), it says so and skips rather than pretending to have run.
+    {
+      let applyEntryPatches;
+      try {
+        ({ applyEntryPatches } = await import("@deepseek-ai/cordis-plugin-include"));
+      } catch {
+        console.log("SKIP differential vs applyEntryPatches (@deepseek-ai/cordis-plugin-include not resolvable)");
+      }
+      if (applyEntryPatches !== undefined) {
+        const composeOurs = (documents) => composeEntries(documents.map((document, index) => ({
+          owner: `L${index}`,
+          patch: parsePatchDocument(structuredClone(document), "diff", [], `L${index}`),
+        }))).data;
+        // The launcher's own call, verbatim: every layer flattened, applied
+        // once over an empty root.
+        const composeTheirs = (documents) => applyEntryPatches([], structuredClone(documents.flat()), () => {});
+        const compare = (documents, label) => {
+          shapes += 1;
+          const ours = JSON.stringify(composeOurs(documents));
+          const theirs = JSON.stringify(composeTheirs(documents));
+          if (ours !== theirs) {
+            throw new Error(`differential mismatch (${label})\n  patches: ${JSON.stringify(documents)}\n  ours:    ${ours}\n  loader:  ${theirs}`);
+          }
+        };
+
+        // Hand-written shapes, each one a semantic an earlier model got wrong.
+        let shapes = 0;
+        compare([[{ insert: [{ id: "a", name: "mod-a" }] }], [{ id: "a", config: { x: 1 } }]], "override after insert");
+        compare([[{ insert: [{ id: "g", name: "grp", group: true, config: [{ id: "c", name: "mod-c" }] }] }], [{ id: "g", config: [{ id: "d", name: "mod-d" }] }]], "group config replaced");
+        compare([[{ insert: [{ id: "g", name: "grp", group: true, config: [] }] }], [{ id: "g", insert: [{ id: "c", name: "mod-c" }] }]], "insert into group");
+        compare([[{ insert: [{ id: "g", name: "grp", group: true, config: [] }] }], [{ id: "nope", insert: [{ id: "c", name: "mod-c" }] }]], "insert into missing group");
+        compare([[{ insert: [{ id: "a", name: "mod-a" }] }], [{ id: "a", name: "other", config: { x: 1 } }]], "name guard mismatch");
+        compare([[{ insert: [{ id: "a", name: "mod-a" }] }], [{ config: { x: 1 } }]], "id-less non-insert entry");
+        compare([[{ insert: [{ name: "mod-a" }] }], [{ id: "a", config: { x: 1 } }]], "id-less inserted row");
+        compare([[{ insert: [{ id: "g", name: "grp", group: true, config: [{ id: "c", name: "mod-c" }] }] }], [{ id: "c", disabled: true }]], "target a nested row");
+        // Non-string values: `ensureId` only mints an id when the written one
+        // is falsy, and every comparison is `===`.
+        compare([[{ insert: [{ id: 7, name: "mod-a" }] }], [{ id: 7, config: { x: 1 } }]], "numeric id targeted by a numeric patch");
+        compare([[{ insert: [{ id: 7, name: "mod-a" }] }], [{ id: "7", config: { x: 1 } }]], "numeric id is not its string spelling");
+        compare([[{ insert: [{ id: "a", name: "mod-a" }] }], [{ id: "a", name: 7, config: { x: 1 } }]], "numeric name guard");
+        // `if (name && ...)`: a falsy name arms no guard at all.
+        for (const falsy of [0, false, ""]) {
+          compare([[{ insert: [{ id: "a", name: "mod-a" }] }], [{ id: "a", name: falsy, config: { x: 1 } }]], `falsy name guard ${JSON.stringify(falsy)}`);
+        }
+        compare([[{ insert: [{ id: 0, name: "mod-a" }, { id: false, name: "mod-b" }] }], [{ id: "a", config: { x: 1 } }]], "falsy ids get minted, not matched");
+        compare(
+          [[{ insert: [{ id: "g", name: "grp", group: true, config: [] }] }], [{ id: "g", config: [{ id: "late", name: "mod-late" }] }], [{ id: "late", config: { y: 2 } }]],
+          "a row added by a config override is addressable to nobody",
+        );
+
+        const fixedShapes = shapes;
+        // Generated shapes: same alphabet, random order. A seeded PRNG so a
+        // failure names the seed that reproduces it.
+        const ids = ["a", "b", "g", "h", "c", 7, 0];
+        const names = ["mod-a", "mod-b", "grp"];
+        for (let seed = 1; seed <= 300; seed++) {
+          let state = seed * 2654435761 % 4294967296;
+          const next = () => {
+            state = (state * 1664525 + 1013904223) % 4294967296;
+            return state / 4294967296;
+          };
+          const pick = (list) => list[Math.floor(next() * list.length)];
+          const row = (depth) => {
+            const isGroup = depth < 2 && next() < 0.3;
+            const entry = {};
+            // 7 and 0 are in the alphabet on purpose: one is a truthy
+            // non-string id, the other is falsy and gets minted.
+            if (next() < 0.85) entry.id = pick(ids);
+            entry.name = isGroup ? "grp" : pick(names);
+            if (isGroup) {
+              entry.group = true;
+              entry.config = Array.from({ length: Math.floor(next() * 3) }, () => row(depth + 1));
+            } else if (next() < 0.5) {
+              entry.config = { value: Math.floor(next() * 5) };
+            }
+            if (next() < 0.3) entry.disabled = next() < 0.5 ? true : { __jsExpr: "process.platform === 'win32'" };
+            return entry;
+          };
+          const documents = Array.from({ length: 1 + Math.floor(next() * 3) }, () => (
+            Array.from({ length: 1 + Math.floor(next() * 4) }, () => {
+              const roll = next();
+              if (roll < 0.45) return { insert: Array.from({ length: 1 + Math.floor(next() * 2) }, () => row(0)) };
+              if (roll < 0.6) return { id: pick(ids), insert: [row(1)] };
+              const patch = { id: pick(ids) };
+              if (next() < 0.3) patch.name = next() < 0.25 ? pick([0, false, ""]) : pick(names);
+              if (next() < 0.5) patch.config = { value: Math.floor(next() * 5) };
+              if (next() < 0.4) patch.disabled = next() < 0.5;
+              if (next() < 0.3) patch.inject = ["loader"];
+              return patch;
+            })
+          ));
+          compare(documents, `seed ${seed}`);
+        }
+        console.log(`PASS differential vs applyEntryPatches (${fixedShapes} shapes + ${shapes - fixedShapes} generated)`);
+      }
+    }
+
+    // In-box bundles live in the shared profiles/node_modules, one level above
+    // the profile, so they must resolve the way Node does rather than through
+    // the strict profile-only lookup. Without that every row dsh-base
+    // contributes is invisible and a candidate colliding with one reads safe.
+    {
+      const p = join(root, "profiles", "inbox");
+      mkdirSync(join(p, "node_modules"), { recursive: true });
+      writeFileSync(join(p, "package.json"), JSON.stringify({
+        dependencies: {},
+        dsh: { profile: { bundles: ["@deepseek-ai/fake-base-fixture"] } },
+      }));
+      writeFileSync(join(p, "cordis.patch.yml"), "[]\n");
+      const baseDir = join(root, "profiles", "node_modules", "@deepseek-ai", "fake-base-fixture");
+      mkdirSync(baseDir, { recursive: true });
+      writeFileSync(join(baseDir, "package.json"), JSON.stringify({
+        name: "@deepseek-ai/fake-base-fixture", version: "1.0.0", dsh: { bundle: { patch: "./cordis.patch.yml" } },
+      }));
+      writeFileSync(join(baseDir, "cordis.patch.yml"), "- insert:\n    - id: tools\n      name: '@deepseek-ai/fake-tools'\n");
+      // …and a profile-local copy of the same bundle mounting something else.
+      // The launcher resolves bundles installation-anchor first, profile
+      // second, so this copy is NOT what boots; a scan that picked it up would
+      // compose a tree the profile never loads.
+      const shadowDir = join(p, "node_modules", "@deepseek-ai", "fake-base-fixture");
+      mkdirSync(shadowDir, { recursive: true });
+      writeFileSync(join(shadowDir, "package.json"), JSON.stringify({
+        name: "@deepseek-ai/fake-base-fixture", version: "9.9.9", dsh: { bundle: { patch: "./cordis.patch.yml" } },
+      }));
+      writeFileSync(join(shadowDir, "cordis.patch.yml"), "- insert:\n    - id: shadow-only\n      name: '@deepseek-ai/fake-shadow'\n");
+      const takes = (id) => inspectRemoteCandidate({
+        profileDir: p,
+        manifest: { name: "takes-tools", version: "1.0.0", dsh: { bundle: { patch: "./cordis.patch.yml" } } },
+        patchText: `- insert:\n    - id: ${id}\n      name: takes-tools\n`,
+        spec: "github:owner/takes-tools",
+      });
+      const collision = takes("tools");
+      if (collision.verdict !== "blocked" || !collision.issues.some((entry) => entry.code === "loader-id-collision")) throw new Error("in-box bundle rows must take part in the scan");
+      // Same id AND same module is a duplicate id all the same: the loader
+      // refuses the whole tree ("duplicate loader entry id"), so this is a
+      // profile that will not start, not a harmless restatement.
+      const sameModule = inspectRemoteCandidate({
+        profileDir: p,
+        manifest: { name: "takes-tools", version: "1.0.0", dsh: { bundle: { patch: "./cordis.patch.yml" } } },
+        patchText: "- insert:\n    - id: tools\n      name: '@deepseek-ai/fake-tools'\n",
+        spec: "github:owner/takes-tools",
+      });
+      if (sameModule.verdict !== "blocked" || !sameModule.issues.some((entry) => entry.code === "loader-id-collision")) throw new Error("re-inserting an existing id with the same module must block too");
+      if (takes("shadow-only").verdict !== "safe") throw new Error("a profile-local shadow of an in-box bundle must not be the composed one");
+    }
+
+    // Patch entries that are NOT inserts: the candidate reaches into rows the
+    // profile already composes. This is the hole the browsing badge had — a
+    // bundle rewriting two dozen existing rows scanned as "safe, zero issues".
+    {
+      const p = join(root, "profiles", "override");
+      mkdirSync(join(p, "node_modules", "host-bundle"), { recursive: true });
+      writeFileSync(join(p, "package.json"), JSON.stringify({
+        dependencies: { "host-bundle": "1.0.0" },
+        dsh: { profile: { bundles: ["host-bundle"] } },
+      }));
+      writeFileSync(join(p, "cordis.patch.yml"), "[]\n");
+      writeFileSync(join(p, "node_modules", "host-bundle", "package.json"), JSON.stringify({
+        name: "host-bundle", version: "1.0.0", dsh: { bundle: { patch: "./cordis.patch.yml" } },
+      }));
+      // Twelve rows: past the takeover threshold, one of them a security row.
+      const ids = ["approval", "tool-a", "tool-b", "tool-c", "tool-d", "tool-e", "tool-f", "tool-g", "tool-h", "tool-i", "tool-j", "tool-k"];
+      writeFileSync(
+        join(p, "node_modules", "host-bundle", "cordis.patch.yml"),
+        `- insert:\n${ids.map((id) => `    - id: ${id}\n      name: host-${id}\n      config:\n        keep: 1\n        also: 2\n`).join("")}`,
+      );
+      const scan = (patchText, name = "candidate-bundle") => inspectRemoteCandidate({
+        profileDir: p,
+        manifest: { name, version: "1.0.0", dsh: { bundle: { patch: "./cordis.patch.yml" } } },
+        patchText,
+        spec: `github:owner/${name}`,
+      });
+
+      const replaces = scan("- id: tool-a\n  config:\n    keep: 9\n");
+      if (replaces.verdict !== "warning") throw new Error("overriding an existing row must not scan as safe");
+      const replaced = replaces.issues.find((entry) => entry.code === "patch-replaces-config");
+      if (replaced === undefined) throw new Error("config replacement fixture failed");
+      if (!replaced.detail.includes("also")) throw new Error("config replacement must name the keys it drops");
+
+      if (!scan("- id: tool-a\n  disabled: true\n").issues.some((entry) => entry.code === "patch-disables-rows")) throw new Error("row disable fixture failed");
+      if (!scan("- id: approval\n  disabled: true\n").issues.some((entry) => entry.code === "patch-touches-security-row")) throw new Error("security row fixture failed");
+
+      const takeover = scan(ids.map((id) => `- id: ${id}\n  disabled: true\n`).join(""));
+      if (takeover.verdict !== "blocked" || !takeover.issues.some((entry) => entry.code === "surface-takeover")) throw new Error("surface takeover fixture failed");
+
+      // Entries that hit nothing: an unknown id, and a `name` guard the loader
+      // would reject. Neither changes the profile, both are reported as inert.
+      const inert = scan("- id: not-here\n  config:\n    x: 1\n- id: tool-b\n  name: someone-else\n  disabled: true\n");
+      if (!inert.issues.some((entry) => entry.code === "patch-target-missing")) throw new Error("inert patch fixture failed");
+      if (inert.issues.some((entry) => entry.code === "patch-disables-rows")) throw new Error("a name-guard mismatch must not count as a disable");
+
+      // The candidate's layer is composed, not read entry by entry, so the
+      // loader's own ordering holds: a row this patch inserted is a valid
+      // target, repeated writes to one row are ONE changed row, and a disable
+      // the same patch takes back is not a disable.
+      const ownRow = scan("- insert:\n    - id: mine\n      name: candidate-bundle\n- id: mine\n  config:\n    a: 1\n");
+      if (ownRow.verdict !== "safe") throw new Error(`overriding a row the same patch inserted must stay safe: ${ownRow.summary}`);
+      const repeated = scan(Array.from({ length: SURFACE_TAKEOVER_MIN }, (_, index) => `- id: tool-a\n  config:\n    keep: ${index}\n`).join(""));
+      if (repeated.issues.some((entry) => entry.code === "surface-takeover")) throw new Error("repeated writes to one row must count as one row");
+      const rollback = scan("- id: tool-a\n  disabled: true\n- id: tool-a\n  disabled: false\n");
+      if (rollback.issues.some((entry) => entry.code === "patch-disables-rows")) throw new Error("a disable the same patch reverts must not be reported");
+
+      // The profile's own patch layer, and the home-level layer above it, are
+      // applied after every bundle: a candidate writing the same key loses.
+      for (const [file, label] of [[join(p, "cordis.patch.yml"), "profile"], [join(root, "cordis.patch.yml"), "home"]]) {
+        writeFileSync(file, "- id: tool-c\n  config:\n    keep: 5\n");
+        const outranked = scan("- id: tool-c\n  config:\n    keep: 9\n");
+        if (outranked.issues.some((entry) => entry.code === "patch-replaces-config")) throw new Error(`the ${label} patch layer must outrank a candidate bundle`);
+        if (!outranked.issues.some((entry) => entry.code === "patch-target-missing")) throw new Error(`a key the ${label} layer sets afterwards is inert`);
+        rmSync(file, { force: true });
+      }
+      writeFileSync(join(p, "cordis.patch.yml"), "[]\n");
+
+      // A rival front door: own command line, terminal peer, no browser half.
+      const rival = inspectRemoteCandidate({
+        profileDir: p,
+        manifest: {
+          name: "rival-tui",
+          version: "1.0.0",
+          bin: { "rival-tui": "./bin.js" },
+          peerDependencies: { "@deepseek-ai/dsh-terminal": "*" },
+          dsh: { bundle: { patch: "./cordis.patch.yml" } },
+        },
+        patchText: "- insert:\n    - id: rival-row\n      name: rival-tui\n",
+        spec: "github:owner/rival-tui",
+      });
+      if (!rival.issues.some((entry) => entry.code === "rival-host-surface")) throw new Error("rival surface fingerprint fixture failed");
+      if (rival.verdict !== "warning") throw new Error("a rival surface that only inserts its own rows stays advisory");
+
+      // …and the fingerprint alone never escalates an ordinary config tweak:
+      // shipping a CLI beside a plugin is legitimate, so only the behaviour
+      // that makes two surfaces incompatible — switching rows off, or
+      // rewriting a protection row — turns it into a conflict.
+      const asRival = (patchText) => inspectRemoteCandidate({
+        profileDir: p,
+        manifest: {
+          name: "rival-tui",
+          version: "1.0.0",
+          bin: { "rival-tui": "./bin.js" },
+          peerDependencies: { "@deepseek-ai/dsh-terminal": "*" },
+          dsh: { bundle: { patch: "./cordis.patch.yml" } },
+        },
+        patchText,
+        spec: "github:owner/rival-tui",
+      });
+      const tweak = asRival("- insert:\n    - id: rival-row\n      name: rival-tui\n- id: tool-a\n  config:\n    keep: 9\n");
+      if (tweak.verdict !== "warning" || tweak.issues.some((entry) => entry.code === "rival-surface-rewrite")) throw new Error("a CLI-shipping bundle tuning one ordinary row must not be blocked by the fingerprint");
+      // …but a row that changes config AND structure counts as structural: the
+      // bucket it gets reported in must not decide the severity.
+      const both = asRival("- id: tool-a\n  config:\n    keep: 9\n  inject:\n    loader: true\n");
+      if (both.verdict !== "blocked" || !both.issues.some((entry) => entry.code === "rival-surface-rewrite")) throw new Error("a config change alongside an inject rewrite is still structural");
+      for (const patchText of ["- id: tool-a\n  disabled: true\n", "- id: approval\n  config:\n    strict: false\n"]) {
+        const takeover = asRival(patchText);
+        if (takeover.verdict !== "blocked" || !takeover.issues.some((entry) => entry.code === "rival-surface-rewrite")) throw new Error(`rival surface must block on ${patchText.trim()}`);
+      }
+
+      // A candidate that switches the old row off and remounts the same module
+      // under a new id mounts it ONCE. Comparing raw insert rows called that a
+      // double mount; the composed state is what decides.
+      const remount = scan("- id: tool-a\n  disabled: true\n- insert:\n    - id: tool-a-next\n      name: host-tool-a\n");
+      if (remount.issues.some((entry) => entry.code === "double-mount")) throw new Error("a disabled row cannot be half of a double mount");
+      if (!remount.issues.some((entry) => entry.code === "patch-disables-rows")) throw new Error("the disable itself is still reported");
+
+      // What the loader THROWS on must never pass as installable: it
+      // destructures every entry (so a null entry is a TypeError) and spreads
+      // every `insert` (so a non-list one is too, or fills the tree with
+      // junk). A null row inside an `insert` list is the same crash one level
+      // down — buildMap reads `.id` on it.
+      for (const broken of ["- null\n", "- insert: 5\n", "- insert:\n    - null\n"]) {
+        const malformed = scan(broken);
+        if (malformed.verdict !== "blocked" || !malformed.issues.some((entry) => entry.code === "patch-entry-invalid")) throw new Error(`malformed patch entry must block: ${JSON.stringify(broken)}`);
+      }
+      // What the loader merely WARNS about is inert, not fatal: a scalar or
+      // list entry destructures to an id-less patch, which it skips.
+      for (const ignored of ["- 42\n", "- - nested\n"]) {
+        const inertEntry = scan(ignored);
+        if (inertEntry.verdict !== "warning" || !inertEntry.issues.some((entry) => entry.code === "patch-entry-ignored")) throw new Error(`an id-less patch entry is inert, not fatal: ${JSON.stringify(ignored)}`);
+      }
+
+      // Inserting into a group that does not exist (or is not a group) drops
+      // the whole list, so nothing mounts and a later entry targeting those
+      // rows finds nothing either.
+      const orphan = scan("- id: no-such-group\n  insert:\n    - id: child\n      name: cand-child\n- id: child\n  config:\n    x: 1\n");
+      if (orphan.verdict !== "warning" || !orphan.issues.some((entry) => entry.code === "patch-target-missing")) throw new Error("insert into a missing group must be reported as inert");
+      // …and a row that never lands cannot collide with anything either.
+      const orphanCollision = scan("- id: no-such-group\n  insert:\n    - id: tool-a\n      name: someone-else\n");
+      if (orphanCollision.issues.some((entry) => entry.code === "loader-id-collision")) throw new Error("a dropped insert must not be reported as a loader-id collision");
+
+      // `insert` and `group` are read as plain truthiness by the loader, so a
+      // falsy one takes the other branch — an `insert: 0` entry is an id-less
+      // patch it warns about, not an insert to validate.
+      const falsyInsert = scan("- insert: 0\n");
+      if (falsyInsert.verdict !== "warning" || !falsyInsert.issues.some((entry) => entry.code === "patch-entry-ignored")) throw new Error("a falsy insert is an id-less patch entry, not a broken insert");
+
+      // A row whose `disabled` is truthy-but-not-`true` is still off: the
+      // loader reads it through Boolean(), so `yes` disables the row.
+      writeFileSync(join(p, "node_modules", "host-bundle", "cordis.patch.yml"),
+        `- insert:\n${ids.map((id) => `    - id: ${id}\n      name: host-${id}\n      config:\n        keep: 1\n        also: 2\n`).join("")}    - id: truthy-off\n      name: shared-module\n      disabled: yes\n`);
+      const remountTruthy = scan("- insert:\n    - id: truthy-on\n      name: shared-module\n");
+      if (remountTruthy.issues.some((entry) => entry.code === "double-mount")) throw new Error("a row disabled by a truthy value is not mounted");
+
+      // Every top-level field of a row is replaced, not just config/disabled:
+      // `inject` decides what services the row waits for.
+      const rewire = scan("- id: tool-a\n  inject:\n    loader: true\n");
+      if (rewire.verdict !== "warning" || !rewire.issues.some((entry) => entry.code === "patch-rewrites-fields")) throw new Error("rewriting inject/isolate/group must be reported");
+
+      // A `!!js` condition traded for a constant is neither an enable nor a
+      // disable — the row simply stops being conditional.
+      writeFileSync(join(p, "node_modules", "host-bundle", "cordis.patch.yml"),
+        `- insert:\n${ids.map((id) => `    - id: ${id}\n      name: host-${id}\n      config:\n        keep: 1\n        also: 2\n`).join("")}    - id: conditional\n      name: host-conditional\n      disabled: !!js process.platform === 'win32'\n`);
+      const constant = scan("- id: conditional\n  disabled: false\n");
+      if (!constant.issues.some((entry) => entry.code === "patch-replaces-condition")) throw new Error("replacing a !!js condition with a constant must be reported");
+      if (constant.issues.some((entry) => entry.code === "patch-enables-rows")) throw new Error("a condition swap is not an enable");
+    }
+
+    // Mount state is read the way the loader reads it — through the parent
+    // chain, with `!!js` as a third state — and a row the loader would give a
+    // generated id to is still a row.
+    {
+      const p = join(root, "profiles", "mount-state");
+      const bundle = (pkg, patchText) => {
+        mkdirSync(join(p, "node_modules", pkg), { recursive: true });
+        writeFileSync(join(p, "node_modules", pkg, "package.json"), JSON.stringify({
+          name: pkg, version: "1.0.0", dsh: { bundle: { patch: "./cordis.patch.yml" } },
+        }));
+        writeFileSync(join(p, "node_modules", pkg, "cordis.patch.yml"), patchText);
+      };
+      mkdirSync(join(p, "node_modules"), { recursive: true });
+      writeFileSync(join(p, "cordis.patch.yml"), "[]\n");
+      const scanWith = (bundles, patchText) => {
+        writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: {}, dsh: { profile: { bundles } } }));
+        return inspectRemoteCandidate({
+          profileDir: p,
+          manifest: { name: "cand", version: "1.0.0", dsh: { bundle: { patch: "./cordis.patch.yml" } } },
+          patchText,
+          spec: "cand",
+        });
+      };
+
+      // `ensureId` mints an id for an id-less row and mounts it anyway.
+      bundle("plain-host", "- insert:\n    - id: old\n      name: shared-module\n");
+      const idless = scanWith(["plain-host"], "- insert:\n    - name: shared-module\n");
+      if (idless.candidate.rows.length !== 1) throw new Error("an id-less row is still a row");
+      if (!idless.issues.some((entry) => entry.code === "double-mount")) throw new Error("an id-less row can still double-mount an existing module");
+      if (!idless.issues.some((entry) => entry.code === "patch-row-generated-id")) throw new Error("an id-less row deserves its own diagnosis");
+      if (!scanWith(["plain-host"], "- insert:\n    - id: nameless\n      config: {}\n").issues.some((entry) => entry.code === "patch-row-no-name")) throw new Error("a row without a name deserves its own diagnosis");
+
+      // An expression decides at load time: neither "mounts" nor "does not".
+      bundle("expr-host", "- insert:\n    - id: old\n      name: shared-module\n      disabled: !!js false\n");
+      const conditional = scanWith(["expr-host"], "- insert:\n    - id: new\n      name: shared-module\n");
+      if (conditional.issues.some((entry) => entry.code === "double-mount")) throw new Error("an expression-gated row must not be treated as a certain mount");
+      if (!conditional.issues.some((entry) => entry.code === "double-mount-conditional")) throw new Error("an expression-gated row must not pass as silently safe either");
+
+      // A nested row inherits its parent group's disabled (loader `_disabled`).
+      bundle("group-host", "- insert:\n    - id: shelf\n      name: host-shelf\n      group: true\n      disabled: true\n      config:\n        - id: child\n          name: shared-module\n");
+      if (scanWith(["group-host"], "- insert:\n    - id: new\n      name: shared-module\n").verdict !== "safe") throw new Error("a row under a disabled group is not mounted");
+
+      // A self-referencing anchor is rejected, not walked into a stack
+      // overflow — including one nested inside an `insert` subtree, which the
+      // row collector would recurse into before any later check could run.
+      for (const cyclicPatch of [
+        "- id: old\n  config: &loop\n    self: *loop\n",
+        "- insert:\n    - &loop\n      id: shelf\n      name: group-host\n      group: true\n      config:\n        - *loop\n",
+      ]) {
+        const cyclic = scanWith(["plain-host"], cyclicPatch);
+        if (cyclic.verdict !== "blocked" || !cyclic.issues.some((entry) => entry.code === "patch-cyclic-value")) throw new Error("a cyclic patch value must be rejected");
+      }
+
+      // A row with no module specifier stays in the tree; whether it stops dsh
+      // from starting depends on its effective mount state.
+      const blank = scanWith(["plain-host"], "- insert:\n    - id: blank\n      config: {}\n");
+      if (blank.verdict !== "blocked" || !blank.issues.some((entry) => entry.code === "patch-row-no-name")) throw new Error("an enabled row without a name stops dsh from starting");
+      const blankOff = scanWith(["plain-host"], "- insert:\n    - id: blank\n      disabled: true\n      config: {}\n");
+      if (blankOff.verdict !== "warning" || !blankOff.issues.some((entry) => entry.code === "patch-row-no-name")) throw new Error("a disabled row without a name is a warning, not a blocker");
+
+      // Overriding a group's `config` replaces its whole subtree, so the mount
+      // projection has to be recomputed from the final tree — in both
+      // directions: rows leaving, and rows arriving.
+      bundle("shelf-host", "- insert:\n    - id: shelf\n      name: host-shelf\n      group: true\n      config:\n        - id: child\n          name: shared-module\n");
+      const emptied = scanWith(["shelf-host"], "- id: shelf\n  config: []\n- insert:\n    - id: mine\n      name: shared-module\n");
+      if (emptied.issues.some((entry) => entry.code === "double-mount")) throw new Error("a child removed by a config override is not mounted any more");
+      bundle("shelf-empty", "- insert:\n    - id: shelf\n      name: host-shelf\n      group: true\n      config: []\n    - id: root-row\n      name: shared-module\n");
+      const filled = scanWith(["shelf-empty"], "- id: shelf\n  config:\n    - id: added\n      name: shared-module\n");
+      if (!filled.issues.some((entry) => entry.code === "double-mount")) throw new Error("a child added by a config override is mounted");
+
+      // Emptying a group removes its children from the final tree — the
+      // lookup map still holds them, which is why the change diff has to read
+      // the tree instead.
+      const children = Array.from({ length: SURFACE_TAKEOVER_MIN + 1 }, (_, index) => `        - id: c${index}\n          name: mod-${index}\n`).join("");
+      bundle("shelf-full", `- insert:\n    - id: shelf\n      name: host-shelf\n      group: true\n      config:\n${children}`);
+      const emptiedGroup = scanWith(["shelf-full"], "- id: shelf\n  config: []\n");
+      if (emptiedGroup.verdict !== "blocked" || !emptiedGroup.issues.some((entry) => entry.code === "surface-takeover")) throw new Error("emptying a group withdraws every row under it");
+
+      // A conflict is a property of the composed tree, not of who owns a row:
+      // re-enabling one of two same-module rows creates a double mount even
+      // though the candidate owns neither of them.
+      bundle("twins", "- insert:\n    - id: on\n      name: shared-module\n    - id: off\n      name: shared-module\n      disabled: true\n");
+      const reEnabled = scanWith(["twins"], "- id: off\n  disabled: false\n");
+      if (reEnabled.verdict !== "blocked" || !reEnabled.issues.some((entry) => entry.code === "double-mount")) throw new Error("a conflict the candidate creates between someone else's rows is still its doing");
+      // …while a conflict that was already there is not the candidate's fault.
+      bundle("already", "- insert:\n    - id: one\n      name: shared-module\n    - id: two\n      name: shared-module\n");
+      const preExisting = scanWith(["already"], "- insert:\n    - id: mine\n      name: unrelated-module\n");
+      if (preExisting.issues.some((entry) => entry.code === "double-mount")) throw new Error("a pre-existing conflict must not be charged to the candidate");
+
+      // A falsy `name` does not arm the guard, so these overrides land — and
+      // ten landed disables are a takeover, not a "patch that hits nothing".
+      const tenIds = Array.from({ length: SURFACE_TAKEOVER_MIN }, (_, index) => `row-${index}`);
+      bundle("guard-host", `- insert:\n${tenIds.map((id) => `    - id: ${id}\n      name: host-${id}\n`).join("")}`);
+      for (const falsy of ["0", "false", "\"\""]) {
+        const landed = scanWith(["guard-host"], tenIds.map((id) => `- id: ${id}\n  name: ${falsy}\n  disabled: true\n`).join(""));
+        if (landed.verdict !== "blocked" || !landed.issues.some((entry) => entry.code === "surface-takeover")) throw new Error(`a falsy name guard must not disarm the patch: ${falsy}`);
+      }
+      // …while a truthy one that does not match still skips the entry.
+      const guarded = scanWith(["guard-host"], "- id: row-0\n  name: someone-else\n  disabled: true\n");
+      if (!guarded.issues.some((entry) => entry.code === "patch-target-missing")) throw new Error("a truthy name guard that misses is inert");
+
+      // A truthy non-string id is a real id — not "no id". Two rows carrying
+      // the same one is the duplicate the loader refuses to boot with, so it
+      // cannot be reported as a mintable-id warning.
+      bundle("numeric-host", "- insert:\n    - id: 7\n      name: host-seven\n");
+      const numericDuplicate = scanWith(["numeric-host"], "- insert:\n    - id: 7\n      name: cand-seven\n");
+      if (numericDuplicate.verdict !== "blocked" || !numericDuplicate.issues.some((entry) => entry.code === "loader-id-collision")) throw new Error("a duplicate numeric id must block");
+      if (numericDuplicate.issues.some((entry) => entry.code === "patch-row-generated-id")) throw new Error("a numeric id is not a generated id");
+      // …and a numeric target resolves to it, while its string spelling does not.
+      if (scanWith(["numeric-host"], "- id: 7\n  config:\n    x: 1\n").issues.some((entry) => entry.code === "patch-target-missing")) throw new Error("a numeric target resolves");
+      if (!scanWith(["numeric-host"], "- id: \"7\"\n  config:\n    x: 1\n").issues.some((entry) => entry.code === "patch-target-missing")) throw new Error("a numeric id is not its string spelling");
+      // A truthy non-string NAME is not a module specifier at all.
+      const badName = scanWith(["numeric-host"], "- insert:\n    - id: bad\n      name: 42\n");
+      if (badName.verdict !== "blocked" || !badName.issues.some((entry) => entry.code === "patch-row-name-invalid")) throw new Error("a non-string name stops dsh from starting");
+
+      // Ids are compared exactly: a padded id is a different id, and an
+      // override carrying one hits nothing.
+      bundle("exact-host", "- insert:\n    - id: target\n      name: host-target\n");
+      if (scanWith(["exact-host"], "- insert:\n    - id: \" target \"\n      name: cand-target\n").verdict !== "safe") throw new Error("a padded id is a different id, not a collision");
+      if (!scanWith(["exact-host"], "- id: \" target \"\n  config:\n    x: 1\n").issues.some((entry) => entry.code === "patch-target-missing")) throw new Error("an override with a padded id hits nothing");
+    }
+
+    // Updating an installed plugin is judged on what its NEW layer would do,
+    // with the installed layer taken out of the stack first. Matching by
+    // package name instead let an update disable every row its own previous
+    // version had merely configured, and still report zero issues.
+    {
+      const p = join(root, "profiles", "update");
+      const ids = Array.from({ length: SURFACE_TAKEOVER_MIN }, (_, index) => `host-row-${index}`);
+      mkdirSync(join(p, "node_modules", "host-bundle"), { recursive: true });
+      mkdirSync(join(p, "node_modules", "plug"), { recursive: true });
+      writeFileSync(join(p, "package.json"), JSON.stringify({
+        dependencies: { "host-bundle": "1.0.0", plug: "1.0.0" },
+        dsh: { profile: { bundles: ["host-bundle", "plug"] } },
+      }));
+      writeFileSync(join(p, "cordis.patch.yml"), "[]\n");
+      for (const [pkg, patchText] of [
+        ["host-bundle", `- insert:\n${ids.map((id) => `    - id: ${id}\n      name: host-${id}\n      config:\n        keep: 1\n`).join("")}`],
+        ["plug", ids.map((id) => `- id: ${id}\n  config:\n    keep: 2\n`).join("")],
+      ]) {
+        writeFileSync(join(p, "node_modules", pkg, "package.json"), JSON.stringify({
+          name: pkg, version: "1.0.0", dsh: { bundle: { patch: "./cordis.patch.yml" } },
+        }));
+        writeFileSync(join(p, "node_modules", pkg, "cordis.patch.yml"), patchText);
+      }
+      const update = (patchText) => inspectRemoteCandidate({
+        profileDir: p,
+        manifest: { name: "plug", version: "2.0.0", dsh: { bundle: { patch: "./cordis.patch.yml" } } },
+        patchText,
+        spec: "plug",
+      });
+      if (update(readFileSync(join(p, "node_modules", "plug", "cordis.patch.yml"), "utf8")).verdict !== "safe") throw new Error("an update that changes nothing must stay quiet");
+      const regressed = update(ids.map((id) => `- id: ${id}\n  disabled: true\n`).join(""));
+      if (regressed.verdict !== "blocked" || !regressed.issues.some((entry) => entry.code === "surface-takeover")) throw new Error("an update that switches off rows it used to configure must not be waved through");
+
+      // An update can also take rows AWAY — including rows another bundle
+      // inserted into a group this one used to provide. Diffing only the rows
+      // that still exist after the update cannot see that at all, and an
+      // update whose patch is empty would not even be diffed.
+      const shelf = join(root, "profiles", "shelf");
+      mkdirSync(join(shelf, "node_modules", "shelf-owner"), { recursive: true });
+      mkdirSync(join(shelf, "node_modules", "shelf-user"), { recursive: true });
+      writeFileSync(join(shelf, "package.json"), JSON.stringify({
+        dependencies: {}, dsh: { profile: { bundles: ["shelf-owner", "shelf-user"] } },
+      }));
+      writeFileSync(join(shelf, "cordis.patch.yml"), "[]\n");
+      for (const [pkg, patchText] of [
+        ["shelf-owner", "- insert:\n    - id: shelf\n      name: owner-shelf\n      group: true\n      config: []\n"],
+        ["shelf-user", "- id: shelf\n  insert:\n    - id: on-shelf\n      name: user-row\n"],
+      ]) {
+        writeFileSync(join(shelf, "node_modules", pkg, "package.json"), JSON.stringify({
+          name: pkg, version: "1.0.0", dsh: { bundle: { patch: "./cordis.patch.yml" } },
+        }));
+        writeFileSync(join(shelf, "node_modules", pkg, "cordis.patch.yml"), patchText);
+      }
+      for (const patchText of ["- insert:\n    - id: other\n      name: owner-other\n", "[]\n"]) {
+        const dropped = inspectRemoteCandidate({
+          profileDir: shelf,
+          manifest: { name: "shelf-owner", version: "2.0.0", dsh: { bundle: { patch: "./cordis.patch.yml" } } },
+          patchText,
+          spec: "shelf-owner",
+        });
+        const removal = dropped.issues.find((entry) => entry.code === "patch-removes-rows");
+        if (removal === undefined) throw new Error("an update that removes rows must be reported");
+        if (!removal.detail.includes("on-shelf")) throw new Error("the downstream row that disappears with the group must be named");
+      }
+      // …but a patch that could not be FETCHED is unknown, not empty: browsing
+      // must not invent a withdrawal of everything the installed layer holds.
+      const unfetched = inspectRemoteCandidate({
+        profileDir: shelf,
+        manifest: { name: "shelf-owner", version: "2.0.0", dsh: { bundle: { patch: "./cordis.patch.yml" } } },
+        patchText: undefined,
+        spec: "shelf-owner",
+      });
+      if (unfetched.verdict !== "warning" || !unfetched.issues.some((entry) => entry.code === "patch-unverified")) throw new Error("an unfetched patch is reported as unverified");
+      if (unfetched.issues.some((entry) => entry.code === "patch-removes-rows" || entry.code === "surface-takeover")) throw new Error("an unfetched patch must not be simulated as an empty one");
+    }
+
     // Peer version checks resolve host packages through Node's upward lookup:
     // the host lives in the shared profiles/node_modules (the profile's own
     // node_modules has no @deepseek-ai/*), and missing that used to emit a
@@ -1900,12 +3208,36 @@ async function selfTest() {
       writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: {} }));
       writeFileSync(join(p, "cordis.patch.yml"), "- insert:\n    - id: js-scalar\n      name: js-scalar\n      value: !!js globalThis.__dshGuardJsTagExecuted = true\n");
       const issues = [];
-      const rows = parsePatch(join(p, "cordis.patch.yml"), "profile", issues, "js-tag fixture");
+      const { rows } = parsePatch(join(p, "cordis.patch.yml"), "profile", issues, "js-tag fixture");
       if (issues.length !== 0) throw new Error("!!js scalar fixture should parse without patch warnings");
       if (rows.length !== 1 || rows[0].id !== "js-scalar" || rows[0].name !== "js-scalar") throw new Error("!!js scalar fixture should still yield insert rows");
       if (globalThis.__dshGuardJsTagExecuted !== undefined) throw new Error("!!js scalar must never be executed");
       const v = validateInstalledProfile(p);
       if (v.ok !== true) throw new Error("profile with a !!js scalar patch should validate clean");
+
+      // The tag's identity survives parsing: an expression and a plain string
+      // of the same characters are different values at runtime, so swapping
+      // one for the other is a config change like any other.
+      mkdirSync(join(p, "node_modules", "js-host"), { recursive: true });
+      writeFileSync(join(p, "node_modules", "js-host", "package.json"), JSON.stringify({
+        name: "js-host", version: "1.0.0", dsh: { bundle: { patch: "./cordis.patch.yml" } },
+      }));
+      writeFileSync(join(p, "node_modules", "js-host", "cordis.patch.yml"), "- insert:\n    - id: js-row\n      name: js-host\n      config:\n        value: !!js process.env.SECRET\n");
+      writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: { "js-host": "1.0.0" }, dsh: { profile: { bundles: ["js-host"] } } }));
+      const literalSwap = inspectRemoteCandidate({
+        profileDir: p,
+        manifest: { name: "js-cand", version: "1.0.0", dsh: { bundle: { patch: "./cordis.patch.yml" } } },
+        patchText: "- id: js-row\n  config:\n    value: process.env.SECRET\n",
+        spec: "js-cand",
+      });
+      if (!literalSwap.issues.some((entry) => entry.code === "patch-replaces-config")) throw new Error("replacing a !!js expression with a literal string of the same text is a change");
+      const sameExpression = inspectRemoteCandidate({
+        profileDir: p,
+        manifest: { name: "js-cand", version: "1.0.0", dsh: { bundle: { patch: "./cordis.patch.yml" } } },
+        patchText: "- id: js-row\n  config:\n    value: !!js process.env.SECRET\n",
+        spec: "js-cand",
+      });
+      if (sameExpression.issues.some((entry) => entry.code === "patch-replaces-config")) throw new Error("restating the same !!js expression changes nothing");
       writeFileSync(join(p, "cordis.patch.yml"), "- insert:\n    - id: evil\n      name: evil\n      value: !unknown-tag still-rejected\n");
       const rejected = [];
       parsePatch(join(p, "cordis.patch.yml"), "profile", rejected, "js-tag fixture");
@@ -2116,10 +3448,11 @@ async function selfTest() {
     }
 
     // Interrupted remove recovery: pnpm deleted dependencies/node_modules but
-    // dsh crashed before removing the bundle/profile row. Generic validation
-    // considers this loadable, so the remove-specific completion check must
-    // force rollback. A temp PATH stub models the real offline lockfile
-    // reconcile and restores the deleted direct package.
+    // dsh crashed before removing the bundle/profile row. Both signals must
+    // force rollback — the leftover bundle entry no longer resolves, which is
+    // itself a startup failure, and the remove-specific completion check is
+    // what names the real cause. A temp PATH stub models the real offline
+    // lockfile reconcile and restores the deleted direct package.
     {
       const p = join(root, "profiles", "remove-partial");
       mkdirSync(join(p, "node_modules", "victim"), { recursive: true });
@@ -2138,7 +3471,8 @@ async function selfTest() {
         dsh: { profile: { bundles: ["victim"] } },
       }));
       rmSync(join(p, "node_modules", "victim"), { recursive: true, force: true });
-      if (!validateInstalledProfile(p).ok) throw new Error("partial remove fixture must reproduce the generic-validation false safe");
+      const partial = validateInstalledProfile(p);
+      if (partial.ok || !partial.issues.some((entry) => entry.code === "bundle-unresolved")) throw new Error("a bundle left listed after its package is gone must fail validation");
 
       const binDir = join(root, "remove-partial-bin");
       mkdirSync(binDir);
@@ -2321,8 +3655,9 @@ async function selfTest() {
 
     // validateInstalledProfile blocks a dependency the manifest declares but
     // node_modules cannot resolve — the crash-mid-install fingerprint that must
-    // never be committed as healthy. A template bundle (bundle-only, never a
-    // dependency) is in-box and stays silent.
+    // never be committed as healthy — and equally a profile layer that resolves
+    // from neither anchor, which stops dsh at startup with "cannot resolve
+    // profile bundle". Only a layer that really is in-box stays silent.
     {
       const p = join(root, "profiles", "unresolved");
       mkdirSync(p, { recursive: true });
@@ -2333,10 +3668,25 @@ async function selfTest() {
         throw new Error("validateInstalledProfile should block a declared-but-unresolved dependency");
       }
       const q = join(root, "profiles", "template-bundle");
-      mkdirSync(q, { recursive: true });
-      writeFileSync(join(q, "package.json"), JSON.stringify({ dependencies: {}, dsh: { profile: { bundles: ["inbox-ui"] } } }));
+      mkdirSync(join(q, "node_modules", "bundleless"), { recursive: true });
       writeFileSync(join(q, "cordis.patch.yml"), "[]\n");
-      if (validateInstalledProfile(q).ok !== true) throw new Error("a template bundle is in-box and must not be flagged as unresolved");
+      writeFileSync(join(q, "package.json"), JSON.stringify({ dependencies: {}, dsh: { profile: { bundles: ["inbox-ui"] } } }));
+      const missingBundle = validateInstalledProfile(q);
+      if (missingBundle.ok !== false || !missingBundle.issues.some((entry) => entry.code === "bundle-unresolved")) {
+        throw new Error("a listed bundle that resolves from neither anchor must block");
+      }
+      // A package that resolves but declares no dsh.bundle is the other half
+      // of the same startup failure ("declares no dsh.bundle").
+      writeFileSync(join(q, "node_modules", "bundleless", "package.json"), JSON.stringify({ name: "bundleless", version: "1.0.0" }));
+      writeFileSync(join(q, "package.json"), JSON.stringify({ dependencies: {}, dsh: { profile: { bundles: ["bundleless"] } } }));
+      const bundleless = validateInstalledProfile(q);
+      if (bundleless.ok !== false || !bundleless.issues.some((entry) => entry.code === "bundle-manifest-missing")) {
+        throw new Error("a profile layer without dsh.bundle must block");
+      }
+      // …while a layer that really is in-box (resolved through the shared
+      // installation link farm, see the two-anchor fixture above) stays silent.
+      writeFileSync(join(q, "package.json"), JSON.stringify({ dependencies: {}, dsh: { profile: { bundles: ["@deepseek-ai/fake-base-fixture"] } } }));
+      if (validateInstalledProfile(q).ok !== true) throw new Error("an in-box bundle resolved from the installation anchor must stay silent");
     }
 
     // dsh.bundle.patch paths are clamped to the package directory: an escaping

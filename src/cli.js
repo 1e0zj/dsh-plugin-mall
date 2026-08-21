@@ -1333,9 +1333,11 @@ async function selfTest() {
       if (!refused || !rolledBack) throw new Error("cmdRemove partial dsh reconcile must roll back despite generic validation passing");
     }
 
-    // Startup must apply the same remove-completion check before probation;
-    // otherwise a long-running app would commit a crash-partial remove after
-    // the grace period merely because generic validation says "loadable".
+    // Startup must apply the remove-completion check before probation, so a
+    // long-running app cannot commit a crash-partial remove once the grace
+    // period elapses. The leftover bundle entry fails generic validation too
+    // (a layer without a dsh.bundle manifest stops dsh at startup); the
+    // remove-specific check is what names the actual cause.
     {
       const launchHome = join(root, "remove-launch-home");
       const launchProfile = join(launchHome, "profiles", "web");
@@ -1353,7 +1355,7 @@ async function selfTest() {
         dependencies: {},
         dsh: { profile: { bundles: ["victim"] } },
       }));
-      if (!validateInstalledProfile(launchProfile).ok) throw new Error("launch partial-remove fixture must reproduce generic false-safe validation");
+      if (validateInstalledProfile(launchProfile).ok) throw new Error("launch partial-remove fixture must fail validation before probation");
       const exitCode = await cmdLaunch({
         profile: "web",
         home: launchHome,
