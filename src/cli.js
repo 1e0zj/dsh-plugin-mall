@@ -637,6 +637,42 @@ function resolveWindowsCommand(command) {
   return command;
 }
 
+/** How long `--await-exit` waits for the outgoing host before giving up. */
+const AWAIT_EXIT_TIMEOUT_MS = 30000;
+/** Settle time after the pid is gone, before the successor binds the port. */
+const PORT_SETTLE_MS = 400;
+
+const delay = (ms) => new Promise((resolvePromise) => { setTimeout(resolvePromise, ms); });
+
+/**
+ * Poll until `pid` is gone, or the timeout elapses.
+ *
+ * `kill(pid, 0)` is the portable liveness probe: it delivers no signal and
+ * throws ESRCH once the process is gone. EPERM means it exists under another
+ * owner — still alive, so keep waiting rather than racing it.
+ *
+ * A pid is only meaningful because the caller is the process that spawned us
+ * and named itself. It can still be recycled in principle; the bounded wait
+ * and the refusal on timeout keep that from turning into a hang.
+ *
+ * @returns true when the process is gone, false on timeout.
+ */
+async function waitForProcessExit(pid, timeoutMs, pollMs = 100) {
+  const target = Number(pid);
+  if (!Number.isInteger(target) || target <= 0) return true; // nothing to wait for
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      process.kill(target, 0);
+    } catch (error) {
+      if (error?.code === "ESRCH") return true;
+      if (error?.code !== "EPERM") return true; // unprobeable: do not block the restart on it
+    }
+    if (Date.now() >= deadline) return false;
+    await delay(pollMs);
+  }
+}
+
 /**
  * Spawn the command after `--` with inherited stdio. POSIX uses shell:false so
  * the argv reaches execvp untouched. On Windows a bare name is first resolved
@@ -644,8 +680,25 @@ function resolveWindowsCommand(command) {
  * so they go through %ComSpec% with every token strictly quoted; .exe/.com and
  * explicit paths spawn directly with shell:false.
  */
+/**
+ * Whether to stop Windows conjuring a console for the child.
+ *
+ * Inherit the console we have; never create one we do not. Run from a terminal
+ * our stdio IS that terminal, the child attaches to it, and hiding would cost
+ * the interactive session its Ctrl+C. Run from the detached restart our stdio
+ * is the log file and we hold no console at all, so the child would be handed
+ * a brand-new window — blank, since its output goes to the log — which is the
+ * stray console a restart used to leave on screen. Every subprocess this
+ * package spawns already passes `windowsHide` (installer.js, six call sites),
+ * so nothing downstream depends on inheriting a visible console.
+ */
+function hideChildConsole() {
+  return process.platform === "win32" && process.stdout.isTTY !== true;
+}
+
 function spawnCommand(command, args) {
   const resolved = process.platform === "win32" ? resolveWindowsCommand(command) : command;
+  const windowsHide = hideChildConsole();
   if (process.platform === "win32" && /\.(?:cmd|bat)$/i.test(resolved)) {
     const comspec = process.env.ComSpec ?? "cmd.exe";
     const line = [resolved, ...args].map(quoteCmdArg).join(" ");
@@ -654,9 +707,9 @@ function spawnCommand(command, args) {
     // windowsVerbatimArguments passes the line to CreateProcess exactly as
     // built — otherwise libuv would re-quote it for CommandLineToArgvW and the
     // escaped quotes would break cmd's /s stripping.
-    return spawn(comspec, ["/d", "/s", "/c", `"${line}"`], { shell: false, stdio: "inherit", env: process.env, windowsVerbatimArguments: true });
+    return spawn(comspec, ["/d", "/s", "/c", `"${line}"`], { shell: false, stdio: "inherit", env: process.env, windowsVerbatimArguments: true, windowsHide });
   }
-  return spawn(resolved, args, { shell: false, stdio: "inherit", env: process.env });
+  return spawn(resolved, args, { shell: false, stdio: "inherit", env: process.env, windowsHide });
 }
 
 /** Forward SIGINT/SIGTERM to the child where the platform delivers them to us. */
@@ -831,10 +884,26 @@ function markerLooksValid(marker, profileDir, home) {
  * A corrupt or legacy (pre-v2) marker, or a failed static-recovery step, fails
  * closed: the command is NOT launched and no unvalidated path is deleted.
  */
-async function cmdLaunch({ profile, home, graceMs, commandArgv }) {
+async function cmdLaunch({ profile, home, graceMs, commandArgv, awaitExitPid, _waitForExit = waitForProcessExit }) {
   const profileDir = profileDirOf(home, profile);
   const grace = graceMs ?? DEFAULT_GRACE_MS;
   const [command, ...args] = commandArgv;
+
+  // A restart hands us the pid of the host that is on its way out. Starting
+  // the successor while it still holds the listening port is not a race worth
+  // taking: the bind fails, the probation below reads that as "the pending
+  // install crashed dsh", and it rolls back an install that was fine. Wait for
+  // the process to be gone, then let the port settle.
+  //
+  // Refuse rather than start anyway if it outlives the timeout. Starting is
+  // the outcome that costs the user their install; not starting leaves the old
+  // host running and the marker pending, which the next launch resolves.
+  if (awaitExitPid !== undefined) {
+    if (!await _waitForExit(awaitExitPid, AWAIT_EXIT_TIMEOUT_MS)) {
+      throw new Error(`process ${awaitExitPid} was still running after ${AWAIT_EXIT_TIMEOUT_MS}ms — refusing to start a second host that would collide with it on the listening port (the old one is still up; nothing was changed)`);
+    }
+    await delay(PORT_SETTLE_MS);
+  }
   // Mirrors guard.js pendingPath(): <home>/guard/pending-<profile>.json.
   const markerPath = join(home, "guard", `pending-${profile}.json`);
 
@@ -915,7 +984,7 @@ Usage:
   node src/cli.js guard list [--home <dir>]
   node src/cli.js guard add <spec> --profile <name> [--home <dir>] [--accept-warnings]
   node src/cli.js guard remove <package> --profile <name> [--home <dir>]
-  node src/cli.js guard launch --profile <name> [--home <dir>] [--grace-ms <ms>] -- <command> [args...]
+  node src/cli.js guard launch --profile <name> [--home <dir>] [--grace-ms <ms>] [--await-exit <pid>] -- <command> [args...]
   node src/cli.js guard self-test
 
 Commands:
@@ -956,7 +1025,7 @@ function parseArgs(argv) {
   if (args[0] === "guard") args.shift(); // `node cli.js guard recover` / `node cli.js recover`
   let command = args.shift() ?? "help";
   if (command === "--help" || command === "-h") command = "help"; // `cli.js --help`
-  const opts = { home: undefined, profile: undefined, graceMs: undefined, acceptWarnings: false, positionals: [], commandArgv: [] };
+  const opts = { home: undefined, profile: undefined, graceMs: undefined, awaitExit: undefined, acceptWarnings: false, positionals: [], commandArgv: [] };
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
     if (arg === "--") { opts.commandArgv = args.slice(index + 1); break; } // launch: the wrapped command, verbatim
@@ -968,6 +1037,8 @@ function parseArgs(argv) {
     if (arg.startsWith("--profile=")) { opts.profile = arg.slice("--profile=".length); continue; }
     if (arg === "--grace-ms") { opts.graceMs = args[++index]; continue; }
     if (arg.startsWith("--grace-ms=")) { opts.graceMs = arg.slice("--grace-ms=".length); continue; }
+    if (arg === "--await-exit") { opts.awaitExit = args[++index]; continue; }
+    if (arg.startsWith("--await-exit=")) { opts.awaitExit = arg.slice("--await-exit=".length); continue; }
     if (arg === "--all") { opts.all = true; continue; }
     if (arg.startsWith("-")) throw new Error(`unknown option ${JSON.stringify(arg)}`);
     opts.positionals.push(arg);
@@ -1038,7 +1109,12 @@ async function main(argv) {
           graceMs = Number(parsed.graceMs);
           if (!Number.isFinite(graceMs) || graceMs < 0) throw usageError(`--grace-ms must be a non-negative number, got ${JSON.stringify(parsed.graceMs)}`);
         }
-        process.exitCode = await cmdLaunch({ profile: parsed.profile, home, graceMs, commandArgv: parsed.commandArgv });
+        let awaitExitPid;
+        if (parsed.awaitExit !== undefined) {
+          awaitExitPid = Number(parsed.awaitExit);
+          if (!Number.isInteger(awaitExitPid) || awaitExitPid <= 0) throw usageError(`--await-exit must be a positive process id, got ${JSON.stringify(parsed.awaitExit)}`);
+        }
+        process.exitCode = await cmdLaunch({ profile: parsed.profile, home, graceMs, commandArgv: parsed.commandArgv, awaitExitPid });
         return;
       }
       case "self-test": {
@@ -1101,6 +1177,78 @@ async function selfTest() {
       if (p2.graceMs !== "0" || p2.commandArgv[0] !== "dsh.cmd" || p2.commandArgv.length !== 2) throw new Error("parseArgs launch =fixture failed");
       const p3 = parseArgs(["launch", "--profile", "web", "--", "--weird-but-verbatim"]);
       if (p3.commandArgv[0] !== "--weird-but-verbatim") throw new Error("parseArgs should pass post-`--` args through verbatim");
+      const p4 = parseArgs(["launch", "--profile", "web", "--await-exit", "4321", "--", "dsh"]);
+      if (p4.awaitExit !== "4321") throw new Error("parseArgs --await-exit fixture failed");
+      const p5 = parseArgs(["launch", "--profile=web", "--await-exit=99", "--", "dsh"]);
+      if (p5.awaitExit !== "99") throw new Error("parseArgs --await-exit= fixture failed");
+      // A pid after `--` belongs to the wrapped command, not to us.
+      const p6 = parseArgs(["launch", "--profile", "web", "--", "dsh", "--await-exit", "7"]);
+      if (p6.awaitExit !== undefined || p6.commandArgv.join(" ") !== "dsh --await-exit 7") throw new Error("--await-exit after `--` must stay with the wrapped command");
+    }
+
+    // `--await-exit`: the successor must not start while the outgoing host is
+    // still holding the port. A pid that never goes away is refused outright —
+    // starting anyway is what costs the user their install, because the failed
+    // bind reads as "the pending plugin crashed dsh" and rolls it back.
+    {
+      const p = join(root, "profiles", "await-exit");
+      mkdirSync(p, { recursive: true });
+      writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: {} }));
+      writeFileSync(join(p, "cordis.patch.yml"), "[]\n");
+      const home = root;
+
+      let launched = false;
+      const neverExits = async () => false;
+      let refused = false;
+      try {
+        await cmdLaunch({
+          profile: "await-exit",
+          home,
+          commandArgv: [process.execPath, "-e", "launched=1"],
+          awaitExitPid: 999999,
+          _waitForExit: neverExits,
+        });
+      } catch (error) {
+        refused = /still running after/.test(error.message);
+      }
+      if (!refused) throw new Error("a pid that outlives the timeout must refuse the launch, not race it");
+
+      // …and a pid that does go away lets the command through.
+      const exitsPromptly = async () => true;
+      const code = await cmdLaunch({
+        profile: "await-exit",
+        home,
+        commandArgv: [process.execPath, "-e", "process.exit(0)"],
+        awaitExitPid: 999999,
+        _waitForExit: exitsPromptly,
+      });
+      launched = code === 0;
+      if (!launched) throw new Error("once the outgoing pid is gone the command must run");
+
+      // waitForProcessExit itself: this process is alive, a pid that cannot
+      // exist is gone, and a nonsense pid is not something to wait on.
+      if (await waitForProcessExit(process.pid, 120, 20)) throw new Error("waitForProcessExit must not report a live process as gone");
+      if (!await waitForProcessExit(0x7ffffff0, 500, 20)) throw new Error("waitForProcessExit must report an absent pid as gone");
+      if (!await waitForProcessExit(undefined, 500, 20)) throw new Error("waitForProcessExit must not block on a missing pid");
+    }
+
+    // hideChildConsole: inherit the console we have, never create one we do
+    // not. Getting this backwards is visible either way — a stray blank window
+    // after every restart, or an interactive `guard launch` that has lost its
+    // Ctrl+C. Windows-only by construction; asserted on both platforms so the
+    // Linux CI still pins the POSIX half.
+    {
+      const realIsTty = process.stdout.isTTY;
+      try {
+        Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+        if (hideChildConsole()) throw new Error("a child of an interactive terminal must inherit its console, not be hidden from it");
+        Object.defineProperty(process.stdout, "isTTY", { value: undefined, configurable: true });
+        if (hideChildConsole() !== (process.platform === "win32")) {
+          throw new Error("with no console of our own the child must not be given a new window on Windows (and the flag is meaningless elsewhere)");
+        }
+      } finally {
+        Object.defineProperty(process.stdout, "isTTY", { value: realIsTty, configurable: true });
+      }
     }
 
     // quoteCmdArg: strict MSVCRT/CommandLineToArgvW quoting; cmd metacharacters
