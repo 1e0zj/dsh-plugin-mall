@@ -15,7 +15,9 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -524,23 +526,39 @@ function composeEntries(layers, trace) {
  * Resolution never asks the package to export `./package.json`.
  */
 /**
- * Whether the shared `profiles/node_modules` link farm — this scan's stand-in
- * for the launcher's installation anchor — has actually been built. dsh
- * rebuilds it from the app's whole dependency closure on every start
- * (`healProfilesModuleFallback`), so in a booted home it is always there; an
- * absent one means the FIRST anchor cannot resolve anything, and "the bundle
- * is missing" becomes indistinguishable from "we cannot see the installation
- * from here". The scope is what the check looks for: every in-box bundle, and
- * the app package itself, live under it.
+ * Recover the launcher's REAL installation anchor from the shared fallback.
+ * `healProfilesModuleFallback` always links the dsh app package itself before
+ * walking the rest of its dependency closure, so that link is the one piece
+ * of the farm that can prove where the running installation lives. Following
+ * it also makes a half-built farm harmless: resolution runs from the actual
+ * app package, not from whichever sibling links happened to be created first.
+ *
+ * A plain directory under the farm is not evidence. It can be an empty/partial
+ * scaffold left by an interrupted heal (or a test/profile copy), and treating
+ * its mere existence as a complete installation used to turn "cannot verify"
+ * into a blocker capable of rolling back a healthy profile.
  */
-function installAnchorUsable(profileDir) {
-  return existsSync(join(dirname(profileDir), "node_modules", "@deepseek-ai"));
+function dshInstallAnchor(profileDir) {
+  const modulesDir = join(dirname(profileDir), "node_modules");
+  const visibleAnchor = join(modulesDir, "@deepseek-ai", "dsh", "package.json");
+  try {
+    const realAnchor = realpathSync(visibleAnchor);
+    const rel = relative(modulesDir, realAnchor);
+    if (rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))) return undefined;
+    if (readJson(realAnchor)?.name !== "@deepseek-ai/dsh") return undefined;
+    return realAnchor;
+  } catch {
+    return undefined;
+  }
 }
 
-function bundleInfo(packageName, profileDir) {
+function bundleInfo(packageName, profileDir, installAnchor) {
   if (typeof packageName !== "string" || !NPM_PACKAGE_NAME_RE.test(packageName)) return undefined;
   const parts = packageName.split("/");
-  for (const anchor of [join(dirname(profileDir), "package.json"), join(profileDir, "package.json")]) {
+  const anchors = installAnchor === undefined
+    ? [join(profileDir, "package.json")]
+    : [installAnchor, join(profileDir, "package.json")];
+  for (const anchor of anchors) {
     let searchPaths;
     try {
       searchPaths = createRequire(anchor).resolve.paths(packageName) ?? [];
@@ -572,6 +590,7 @@ function installedProfile(profileDir, issues) {
   const manifest = readJson(manifestPath);
   const dependencies = Object.keys(manifest.dependencies ?? {});
   const bundles = manifest.dsh?.profile?.bundles ?? [];
+  const installAnchor = dshInstallAnchor(profileDir);
   const packages = new Map();
   const infos = new Map();
   for (const name of new Set([...dependencies, ...bundles])) {
@@ -582,7 +601,7 @@ function installedProfile(profileDir, issues) {
     // neither the profile's node_modules nor its dependency list, and without
     // resolving them every check here compared a candidate against
     // third-party rows only — colliding with an official row read as safe.
-    const info = bundles.includes(name) ? bundleInfo(name, profileDir) : packageInfo(name, profileDir);
+    const info = bundles.includes(name) ? bundleInfo(name, profileDir, installAnchor) : packageInfo(name, profileDir);
     if (info === undefined) {
       // A profile layer that resolves from neither anchor stops dsh at
       // startup ("cannot resolve profile bundle X"), so it is a blocker even
@@ -608,9 +627,9 @@ function installedProfile(profileDir, issues) {
       if (dependencies.includes(name)) {
         issues.push(issue("block", "package-unresolved", "依赖无法解析", `package.json 声明了依赖 ${name}，但 node_modules 中无法解析或读取其 package.json（安装可能未完成）。`, { package: name }));
       } else if (bundles.includes(name)) {
-        issues.push(installAnchorUsable(profileDir)
+        issues.push(installAnchor !== undefined
           ? issue("block", "bundle-unresolved", "profile 层无法解析", `dsh.profile.bundles 里列了 ${name}，但从 dsh 安装目录和 ${profileDir} 都解析不到它；dsh 启动时会直接报错退出。`, { package: name })
-          : issue("warn", "bundle-unverified", "无法确认 profile 层能否解析", `dsh.profile.bundles 里列了 ${name}，本次扫描解析不到它——但 ${join(dirname(profileDir), "node_modules")} 这个共享软链目录也不在，扫描本就够不到 dsh 安装目录。dsh 启动时会自己重建该目录并按真正的安装锚点解析，所以这里不作判断。`, { package: name }));
+          : issue("warn", "bundle-unverified", "无法确认 profile 层能否解析", `dsh.profile.bundles 里列了 ${name}，本次扫描解析不到它——但 ${join(dirname(profileDir), "node_modules")} 里也没有一个能指回真实安装的 @deepseek-ai/dsh 软链，扫描够不到 dsh 的安装锚点。dsh 启动时会重建共享软链并按真正的安装锚点解析，所以这里不作判断。`, { package: name }));
       }
       continue;
     }
@@ -2749,7 +2768,17 @@ async function selfTest() {
         dsh: { profile: { bundles: ["@deepseek-ai/fake-base-fixture"] } },
       }));
       writeFileSync(join(p, "cordis.patch.yml"), "[]\n");
-      const baseDir = join(root, "profiles", "node_modules", "@deepseek-ai", "fake-base-fixture");
+      // The real fallback contains links, not copied directories. Recovering
+      // the dsh link's target must take us to the same install anchor the
+      // launcher uses, even when the rest of the farm is only half-built.
+      const installScope = join(root, "fake-dsh-install", "node_modules", "@deepseek-ai");
+      const appDir = join(installScope, "dsh");
+      mkdirSync(appDir, { recursive: true });
+      writeFileSync(join(appDir, "package.json"), JSON.stringify({ name: "@deepseek-ai/dsh", version: "1.0.0" }));
+      const farmAppDir = join(root, "profiles", "node_modules", "@deepseek-ai", "dsh");
+      mkdirSync(dirname(farmAppDir), { recursive: true });
+      symlinkSync(appDir, farmAppDir, process.platform === "win32" ? "junction" : "dir");
+      const baseDir = join(installScope, "fake-base-fixture");
       mkdirSync(baseDir, { recursive: true });
       writeFileSync(join(baseDir, "package.json"), JSON.stringify({
         name: "@deepseek-ai/fake-base-fixture", version: "1.0.0", dsh: { bundle: { patch: "./cordis.patch.yml" } },
@@ -3746,11 +3775,55 @@ async function selfTest() {
         throw new Error("without the link farm an unresolvable layer is unverified, not a blocker");
       }
       if (unverified.issues.some((entry) => entry.code === "bundle-unresolved")) throw new Error("an unreachable installation anchor must not read as a missing bundle");
-      // Build the farm and the same profile becomes a real verdict again.
-      mkdirSync(join(root, "bare-home", "profiles", "node_modules", "@deepseek-ai"), { recursive: true });
-      const withFarm = validateInstalledProfile(bare);
-      if (withFarm.ok !== false || !withFarm.issues.some((entry) => entry.code === "bundle-unresolved")) {
-        throw new Error("with the farm present an unresolvable layer blocks as before");
+      // An empty scope, one unrelated package, and even a copied dsh manifest
+      // are all incomplete scaffolds — none proves that the real installation
+      // was searched, so all three must stay unverified instead of blocking.
+      const bareScope = join(root, "bare-home", "profiles", "node_modules", "@deepseek-ai");
+      mkdirSync(bareScope, { recursive: true });
+      for (const [label, prepare] of [
+        ["empty scope", () => {}],
+        ["partial farm", () => {
+          const partial = join(bareScope, "some-other-package");
+          mkdirSync(partial, { recursive: true });
+          writeFileSync(join(partial, "package.json"), JSON.stringify({ name: "@deepseek-ai/some-other-package" }));
+        }],
+        ["copied app directory", () => {
+          const copied = join(bareScope, "dsh");
+          mkdirSync(copied, { recursive: true });
+          writeFileSync(join(copied, "package.json"), JSON.stringify({ name: "@deepseek-ai/dsh" }));
+        }],
+        // The one that actually happens: dsh is reinstalled somewhere else and
+        // the old link is left pointing at a directory that no longer exists.
+        // This is also the only case that reaches the anchor lookup's throw
+        // path rather than one of its value checks.
+        ["dangling app link", () => {
+          rmSync(join(bareScope, "dsh"), { recursive: true, force: true });
+          const removed = join(root, "bare-install-gone", "node_modules", "@deepseek-ai", "dsh");
+          mkdirSync(removed, { recursive: true });
+          writeFileSync(join(removed, "package.json"), JSON.stringify({ name: "@deepseek-ai/dsh" }));
+          symlinkSync(removed, join(bareScope, "dsh"), process.platform === "win32" ? "junction" : "dir");
+          rmSync(join(root, "bare-install-gone"), { recursive: true, force: true });
+        }],
+      ]) {
+        prepare();
+        const incomplete = validateInstalledProfile(bare);
+        if (incomplete.ok !== true || !incomplete.issues.some((entry) => entry.code === "bundle-unverified")
+          || incomplete.issues.some((entry) => entry.code === "bundle-unresolved")) {
+          throw new Error(`${label} must not masquerade as a complete installation anchor`);
+        }
+      }
+
+      // Once the fallback contains a genuine dsh link, follow it to the real
+      // install. A bundle absent from BOTH that anchor and the profile is now a
+      // trustworthy launcher failure and blocks as before.
+      rmSync(join(bareScope, "dsh"), { recursive: true, force: true });
+      const bareInstallApp = join(root, "bare-install", "node_modules", "@deepseek-ai", "dsh");
+      mkdirSync(bareInstallApp, { recursive: true });
+      writeFileSync(join(bareInstallApp, "package.json"), JSON.stringify({ name: "@deepseek-ai/dsh" }));
+      symlinkSync(bareInstallApp, join(bareScope, "dsh"), process.platform === "win32" ? "junction" : "dir");
+      const withAnchor = validateInstalledProfile(bare);
+      if (withAnchor.ok !== false || !withAnchor.issues.some((entry) => entry.code === "bundle-unresolved")) {
+        throw new Error("a real installation anchor must make an unresolvable layer block");
       }
 
       // A name that is BOTH a layer and a dependency is judged as a
