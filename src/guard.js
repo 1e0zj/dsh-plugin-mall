@@ -523,6 +523,20 @@ function composeEntries(layers, trace) {
  * link farm dsh maintains, which is where a profile can see it from.
  * Resolution never asks the package to export `./package.json`.
  */
+/**
+ * Whether the shared `profiles/node_modules` link farm — this scan's stand-in
+ * for the launcher's installation anchor — has actually been built. dsh
+ * rebuilds it from the app's whole dependency closure on every start
+ * (`healProfilesModuleFallback`), so in a booted home it is always there; an
+ * absent one means the FIRST anchor cannot resolve anything, and "the bundle
+ * is missing" becomes indistinguishable from "we cannot see the installation
+ * from here". The scope is what the check looks for: every in-box bundle, and
+ * the app package itself, live under it.
+ */
+function installAnchorUsable(profileDir) {
+  return existsSync(join(dirname(profileDir), "node_modules", "@deepseek-ai"));
+}
+
 function bundleInfo(packageName, profileDir) {
   if (typeof packageName !== "string" || !NPM_PACKAGE_NAME_RE.test(packageName)) return undefined;
   const parts = packageName.split("/");
@@ -577,10 +591,26 @@ function installedProfile(profileDir, issues) {
       // mid-install: pnpm updated package.json before materializing the
       // package. Either way, skipping it would let recoverProfile commit a
       // profile dsh cannot load.
-      if (bundles.includes(name)) {
-        issues.push(issue("block", "bundle-unresolved", "profile 层无法解析", `dsh.profile.bundles 里列了 ${name}，但从 dsh 安装目录和 ${profileDir} 都解析不到它；dsh 启动时会直接报错退出。`, { package: name }));
-      } else if (dependencies.includes(name)) {
+      //
+      // Unless the first anchor is the thing that is missing. The bundle check
+      // sits on the rollback path, so it must never turn "the scan cannot see
+      // the dsh installation from here" into a verdict that discards a healthy
+      // profile: without the link farm the launcher would still resolve the
+      // bundle through its real installation anchor, which we have no way to
+      // reach. Say what is unverified and let dsh be the judge.
+      //
+      // The dependency check comes FIRST and is never softened: a name can be
+      // both a layer and a dependency, and for that one no anchor is in doubt
+      // — pnpm owes it a directory in the profile's own node_modules, and its
+      // absence is the crash-mid-install fingerprint whatever the link farm
+      // looks like. `bundleInfo` already searched everywhere `packageInfo`
+      // would, so reaching here means that lookup failed too.
+      if (dependencies.includes(name)) {
         issues.push(issue("block", "package-unresolved", "依赖无法解析", `package.json 声明了依赖 ${name}，但 node_modules 中无法解析或读取其 package.json（安装可能未完成）。`, { package: name }));
+      } else if (bundles.includes(name)) {
+        issues.push(installAnchorUsable(profileDir)
+          ? issue("block", "bundle-unresolved", "profile 层无法解析", `dsh.profile.bundles 里列了 ${name}，但从 dsh 安装目录和 ${profileDir} 都解析不到它；dsh 启动时会直接报错退出。`, { package: name })
+          : issue("warn", "bundle-unverified", "无法确认 profile 层能否解析", `dsh.profile.bundles 里列了 ${name}，本次扫描解析不到它——但 ${join(dirname(profileDir), "node_modules")} 这个共享软链目录也不在，扫描本就够不到 dsh 安装目录。dsh 启动时会自己重建该目录并按真正的安装锚点解析，所以这里不作判断。`, { package: name }));
       }
       continue;
     }
@@ -3698,6 +3728,42 @@ async function selfTest() {
       // installation link farm, see the two-anchor fixture above) stays silent.
       writeFileSync(join(q, "package.json"), JSON.stringify({ dependencies: {}, dsh: { profile: { bundles: ["@deepseek-ai/fake-base-fixture"] } } }));
       if (validateInstalledProfile(q).ok !== true) throw new Error("an in-box bundle resolved from the installation anchor must stay silent");
+    }
+
+    // …but "unresolved" is only a verdict when this scan can see what the
+    // launcher sees. The installation anchor is reached through the shared
+    // profiles/node_modules link farm; where that farm does not exist, an
+    // unresolvable layer says nothing about the profile — dsh rebuilds the
+    // farm on every start and then resolves through its real anchor. Blocking
+    // here would roll back a healthy profile, so it reports as unverified.
+    {
+      const bare = join(root, "bare-home", "profiles", "no-farm");
+      mkdirSync(bare, { recursive: true });
+      writeFileSync(join(bare, "cordis.patch.yml"), "[]\n");
+      writeFileSync(join(bare, "package.json"), JSON.stringify({ dependencies: {}, dsh: { profile: { bundles: ["@deepseek-ai/dsh-base"] } } }));
+      const unverified = validateInstalledProfile(bare);
+      if (unverified.ok !== true || !unverified.issues.some((entry) => entry.code === "bundle-unverified")) {
+        throw new Error("without the link farm an unresolvable layer is unverified, not a blocker");
+      }
+      if (unverified.issues.some((entry) => entry.code === "bundle-unresolved")) throw new Error("an unreachable installation anchor must not read as a missing bundle");
+      // Build the farm and the same profile becomes a real verdict again.
+      mkdirSync(join(root, "bare-home", "profiles", "node_modules", "@deepseek-ai"), { recursive: true });
+      const withFarm = validateInstalledProfile(bare);
+      if (withFarm.ok !== false || !withFarm.issues.some((entry) => entry.code === "bundle-unresolved")) {
+        throw new Error("with the farm present an unresolvable layer blocks as before");
+      }
+
+      // A name that is BOTH a layer and a dependency is judged as a
+      // dependency: pnpm owes it a directory in the profile's own
+      // node_modules, and no anchor is in doubt for that lookup. Softening it
+      // with the bundle branch would let a crash-mid-install commit — an
+      // exit-zero remove that leaves the package.json half-written is exactly
+      // the post-state the rollback check exists to catch.
+      writeFileSync(join(bare, "package.json"), JSON.stringify({ dependencies: { missing: "1.0.0" }, dsh: { profile: { bundles: ["missing"] } } }));
+      const both = validateInstalledProfile(bare);
+      if (both.ok !== false || !both.issues.some((entry) => entry.code === "package-unresolved")) {
+        throw new Error("a dependency that is also a layer must still block as an unresolved dependency");
+      }
     }
 
     // dsh.bundle.patch paths are clamped to the package directory: an escaping
