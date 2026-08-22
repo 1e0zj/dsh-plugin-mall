@@ -811,6 +811,75 @@ function disabledState(value) {
   return value ? "disabled" : "enabled";
 }
 
+/**
+ * Rows that would BRICK startup: an MCP client entry, fatal on failure, whose
+ * entry file does not exist in the candidate (issue #14).
+ *
+ * The shape is deliberately the provable minimum — every condition must hold
+ * exactly, and anything short of it is left alone:
+ *
+ *   - name is exactly @deepseek-ai/dsh-mcp-client, transport stdio,
+ *     failOnStartupError is the literal true, command the literal "node";
+ *   - the row's FINAL state is enabled (checked on the composed tree, so a
+ *     user patch that disables it, retargets args, or drops the fatal flag
+ *     exempts it — and a candidate that overrides an EXISTING mcp row into
+ *     this shape is caught just the same);
+ *   - the arg is EXACTLY `!!js dshHomePath('<literal>')` — no concatenation,
+ *     no ternary, nothing that needs evaluation;
+ *   - the literal points INSIDE `profiles/<this profile>/node_modules/<the
+ *     candidate's own package>/…` — other profiles and other packages are out
+ *     of scope (the probe tree cannot verify them), and the remainder is
+ *     clamped: no `..`, no backslash, no drive/absolute form.
+ *
+ * Only then is the mapped file looked up in the isolated probe tree — where it
+ * is already absent for an unbuilt source install — and a miss is a block:
+ * that candidate, installed, makes dsh exit during loader assembly. The
+ * browsing-time scan cannot run this (no file tree); this is install-preflight
+ * only.
+ */
+const DSH_MCP_CLIENT_MODULE = "@deepseek-ai/dsh-mcp-client";
+// dshHomePath 只有作为 !!js 表达式才被 loader 求值成路径；!!js 在内存里是
+// { __jsExpr: source }。只认「恰好一个单字面量实参的调用」，其余形态
+// （拼接、三元、嵌套）求值前无从判断，一律不碰。
+const DSH_HOME_PATH_EXACT = /^dshHomePath\(\s*(['"])([^'"\\]*)\1\s*\)$/;
+
+function mcpStartupFileIssues(mountedRows, candidateName, candidateDir, profileDir) {
+  if (candidateName.length === 0 || typeof candidateDir !== "string") return [];
+  const profileName = basename(profileDir);
+  const modulesPrefix = `profiles/${profileName}/node_modules/`;
+  const candidatePrefix = `${candidateName}/`;
+  const issues = [];
+  for (const row of mountedRows) {
+    if (row.name !== DSH_MCP_CLIENT_MODULE || row.state !== "enabled") continue;
+    const config = row.options?.config;
+    if (config === null || typeof config !== "object" || Array.isArray(config)) continue;
+    if (config.transport !== "stdio" || config.failOnStartupError !== true || config.command !== "node") continue;
+    const args = Array.isArray(config.args) ? config.args : [];
+    for (const arg of args) {
+      if (!isJsExpr(arg)) continue;
+      const call = DSH_HOME_PATH_EXACT.exec(String(arg.__jsExpr ?? ""));
+      if (call === null) continue; // 不是精确的单字面量调用：求值前无从判断
+      const rel = call[2];
+      if (!rel.startsWith(modulesPrefix)) continue; // 指向别的 profile：越界不管
+      const underModules = rel.slice(modulesPrefix.length);
+      if (!underModules.startsWith(candidatePrefix)) continue; // 指向别的包：探针树里没有，判不了
+      const fileRel = underModules.slice(candidatePrefix.length);
+      const segments = fileRel.split("/");
+      if (segments.length === 0 || segments.some((part) => part.length === 0 || part === "." || part === "..")) continue;
+      if (!existsSync(join(candidateDir, ...segments))) {
+        issues.push(issue(
+          "block",
+          "mcp-entry-missing",
+          "安装会使 dsh 无法启动",
+          `行 ${row.id}（${DSH_MCP_CLIENT_MODULE}，stdio）设置了 failOnStartupError: true，并以 node 启动候选包内的 ${segments.join("/")}，但候选包里没有这个文件（未构建的源码安装的典型形态）。安装后 dsh 会在装配阶段因该行失败而直接退出。`,
+          { row: row.id, file: segments.join("/") },
+        ));
+      }
+    }
+  }
+  return issues;
+}
+
 /** How a pair of projected rows would mount together. */
 function bothMount(left, right) {
   const states = [left.state, right.state];
@@ -1310,6 +1379,9 @@ export function inspectCandidate({ profileDir, candidateManifestPath, spec }) {
   issues.push(...namelessRowIssues(simulated.mounted.filter((row) => row.owner === candidateName), candidateName || spec));
   issues.push(...newConflictIssues(candidateName, current.composedRows, simulated.mounted));
   issues.push(...patchTargetIssues(candidateName, candidate.manifest, patch, current, simulated));
+  // 落盘后的文件树检查只能在这里做：探针树里候选包已实体化，MCP 入口存不
+  // 存在是可判定的。浏览期扫描（inspectRemoteCandidate）没有文件树，不参与。
+  issues.push(...mcpStartupFileIssues(simulated.mounted, candidateName, candidate.dir, profileDir));
 
   // UI replacements historically predate exclusiveGroups.  Keep the
   // heuristic advisory-only to avoid blocking legitimate sidebar extensions.
@@ -3366,6 +3438,155 @@ async function selfTest() {
       const conflict = rep.issues.find((entry) => entry.code === "declared-conflict");
       if (rep.verdict !== "blocked" || conflict === undefined || conflict.conflictsWith?.[0] !== "@scope/other") throw new Error("scoped conflict fixture failed");
       if (validateInstalledProfile(p).ok !== true) throw new Error("healthy profile should validate clean");
+    }
+
+    // ── MCP failOnStartupError 指向缺失文件（issue #14）────────────────────
+    //
+    // 事故形态（2026-08-22，managed-agents）：候选从 github: 源装下来没有
+    // dist/，insert 的 MCP 行 failOnStartupError: true 指向不存在的入口，
+    // 装上即砖、dsh 装配阶段退出。判定只认可证形状，扫的是**最终组合行**：
+    // 用户 patch 停用或改参可豁免，候选改坏既有 MCP 行同样抓得到。
+    {
+      const p = join(root, "profiles", "mcpcheck");
+      mkdirSync(p, { recursive: true });
+      const resetProfile = (userPatch) => {
+        writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: {} }));
+        writeFileSync(join(p, "cordis.patch.yml"), userPatch ?? "[]\n");
+      };
+      const mcpInsert = (file, extra = {}) => `
+- insert:
+    - id: mcp-x
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: x
+        transport: stdio
+        command: node
+        args:
+          - !!js dshHomePath('profiles/mcpcheck/node_modules/mcp-brick/${file}')
+        failOnStartupError: true
+`.replace("failOnStartupError: true", `failOnStartupError: ${extra.fatal ?? true}`)
+        + (extra.append ?? "");
+      const candidate = (label, pkgName, patchText) => {
+        const dir = join(root, `cand-${label}`);
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, "package.json"), JSON.stringify({ name: pkgName, version: "1.0.0", dsh: { bundle: { patch: "./cordis.patch.yml" } } }));
+        writeFileSync(join(dir, "cordis.patch.yml"), patchText);
+        return dir;
+      };
+      const inspect = (dir, name, userPatch) => {
+        resetProfile(userPatch);
+        return inspectCandidate({ profileDir: p, candidateManifestPath: join(dir, "package.json"), spec: name });
+      };
+
+      // 1) 入口缺失 → block（事故原样：无 dist 的源码树）。
+      const missing = inspect(candidate("missing", "mcp-brick", mcpInsert("dist/mcp/index.js")), "mcp-brick");
+      if (missing.verdict !== "blocked" || !missing.issues.some((e) => e.code === "mcp-entry-missing")) {
+        throw new Error(`MCP 入口缺失必须 block，实得 ${missing.verdict}: ${JSON.stringify(missing.issues.map((e) => e.code))}`);
+      }
+      console.log("PASS MCP 入口：缺失 + failOnStartupError → block");
+
+      // 2) 入口存在 → 放行。
+      const presentDir = candidate("present", "mcp-brick", mcpInsert("dist/mcp/index.js"));
+      mkdirSync(join(presentDir, "dist", "mcp"), { recursive: true });
+      writeFileSync(join(presentDir, "dist", "mcp", "index.js"), "");
+      const present = inspect(presentDir, "mcp-brick");
+      if (present.issues.some((e) => e.code === "mcp-entry-missing")) throw new Error("入口存在时不得报 mcp-entry-missing");
+      console.log("PASS MCP 入口：文件存在 → 放行");
+
+      // 3) failOnStartupError: false → 不判（失败不致命，装上也不会砖）。
+      const lenient = inspect(candidate("lenient", "mcp-brick", mcpInsert("dist/none.js", { fatal: false })), "mcp-brick");
+      if (lenient.issues.some((e) => e.code === "mcp-entry-missing")) throw new Error("failOnStartupError:false 不得判入口");
+      console.log("PASS MCP 入口：failOnStartupError:false → 放行");
+
+      // 4) 用户 patch 停用该行 → 最终行不运行，不判。
+      const disabledRow = inspect(candidate("disabled", "mcp-brick", mcpInsert("dist/none.js")), "mcp-brick", "- id: mcp-x\n  disabled: true\n");
+      if (disabledRow.issues.some((e) => e.code === "mcp-entry-missing")) throw new Error("用户停用的行不得判入口");
+      console.log("PASS MCP 入口：用户 patch 停用 → 放行");
+
+      // 5) 用户 patch 修正 args 指向存在的文件 → 放行。
+      const fixDir = candidate("fixed", "mcp-brick", mcpInsert("dist/none.js"));
+      mkdirSync(join(fixDir, "dist"), { recursive: true });
+      writeFileSync(join(fixDir, "dist", "fixed.js"), "");
+      const fixed = inspect(fixDir, "mcp-brick", `
+- id: mcp-x
+  config:
+    serverName: x
+    transport: stdio
+    command: node
+    args:
+      - !!js dshHomePath('profiles/mcpcheck/node_modules/mcp-brick/dist/fixed.js')
+    failOnStartupError: true
+`);
+      if (fixed.issues.some((e) => e.code === "mcp-entry-missing")) throw new Error("用户已把 args 修到存在的文件，不得再判");
+      console.log("PASS MCP 入口：用户 patch 修正 args → 放行");
+
+      // 6) 非精确 !!js 表达式（拼接）→ 求值前无从判断，不判。
+      const inexact = inspect(candidate("inexact", "mcp-brick", `
+- insert:
+    - id: mcp-x
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        command: node
+        args:
+          - !!js dshHomePath('profiles/mcpcheck/node_modules/' + 'mcp-brick/dist/none.js')
+        failOnStartupError: true
+`), "mcp-brick");
+      if (inexact.issues.some((e) => e.code === "mcp-entry-missing")) throw new Error("拼接表达式不得判入口");
+      console.log("PASS MCP 入口：非精确 !!js 表达式 → 不误判");
+
+      // 7) 候选改坏既有 MCP 行（override）→ 同样检出。行是 existing-host
+      //    插的、原本不致命；候选把 config 整个换成指向自己包内缺失文件
+      //    且 failOnStartupError: true —— 只看 insert 会漏掉这一种。
+      resetProfile();
+      // 真实形态：已装插件同时在 dependencies 和 dsh.profile.bundles 里
+      // （bundleLayers 只从 bundles 列表构建，光有依赖不成层）。
+      writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: { "existing-host": "1.0.0" }, dsh: { profile: { bundles: ["existing-host"] } } }));
+      mkdirSync(join(p, "node_modules", "existing-host"), { recursive: true });
+      writeFileSync(join(p, "node_modules", "existing-host", "package.json"), JSON.stringify({ name: "existing-host", version: "1.0.0", dsh: { bundle: { patch: "./cordis.patch.yml" } } }));
+      writeFileSync(join(p, "node_modules", "existing-host", "cordis.patch.yml"), `
+- insert:
+    - id: mcp-existing
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        command: node
+        args:
+          - !!js dshHomePath('profiles/mcpcheck/node_modules/existing-host/dist/mcp.js')
+        failOnStartupError: false
+`);
+      const breaker = inspectCandidate({ profileDir: p, candidateManifestPath: join(candidate("breaker", "mcp-brick", `
+- id: mcp-existing
+  config:
+    transport: stdio
+    command: node
+    args:
+      - !!js dshHomePath('profiles/mcpcheck/node_modules/mcp-brick/dist/none.js')
+    failOnStartupError: true
+`), "package.json"), spec: "mcp-brick" });
+      if (!breaker.issues.some((e) => e.code === "mcp-entry-missing")) {
+        throw new Error(`候选 override 既有 MCP 行改坏必须检出，实得 ${JSON.stringify(breaker.issues.map((e) => e.code))}`);
+      }
+      console.log("PASS MCP 入口：候选 override 既有行改坏 → 检出");
+
+      // 8) scoped 候选包：路径前缀含 scope 段，同样判得到。
+      const scopedDir = candidate("scoped", "@scope/mcp-pkg", `
+- insert:
+    - id: mcp-x
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        command: node
+        args:
+          - !!js dshHomePath('profiles/mcpcheck/node_modules/@scope/mcp-pkg/dist/none.js')
+        failOnStartupError: true
+`);
+      resetProfile();
+      const scopedRep = inspectCandidate({ profileDir: p, candidateManifestPath: join(scopedDir, "package.json"), spec: "@scope/mcp-pkg" });
+      if (!scopedRep.issues.some((e) => e.code === "mcp-entry-missing")) throw new Error("scoped 候选的缺失入口必须检出");
+      console.log("PASS MCP 入口：scoped 包路径 → 检出");
+
+      resetProfile();
     }
 
     // validateInstalledProfile detects a loader-id collision between two
