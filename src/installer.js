@@ -1356,8 +1356,13 @@ export function assertSafeSpec(spec) {
  * Try to provision pnpm once via `corepack enable pnpm` (corepack ships with
  * Node). Output lands in the caller's job log; returns whether a retry of the
  * pnpm spawn is worth attempting.
+ *
+ * `onProc` hands the child to the caller so job_kill can reach it. Without it
+ * this was a hole in cancellation: `current` still pointed at the pnpm spawn
+ * that had just failed with ENOENT, so cancel() killed nothing while corepack
+ * ran on, and the caller then started a full install anyway.
  */
-async function enablePnpmViaCorepack(push) {
+async function enablePnpmViaCorepack(push, onProc) {
   push("\n[dsh-plugin-mall] pnpm not found on PATH — trying `corepack enable pnpm` once\n");
   return await new Promise((resolve) => {
     let proc;
@@ -1372,6 +1377,9 @@ async function enablePnpmViaCorepack(push) {
       resolve(false);
       return;
     }
+    // shell:true on Windows means the real corepack is a grandchild of cmd.exe,
+    // so the same tree-kill rule as pnpm applies.
+    onProc?.({ proc, treeKill: process.platform === "win32" });
     proc.on("error", () => resolve(false));
     proc.stdout?.on("data", (data) => push(data.toString()));
     proc.stderr?.on("data", (data) => push(data.toString()));
@@ -1518,9 +1526,18 @@ function endedByCancel(outcome, cancelRequested) {
   return cancelRequested === true || outcome.exitCode === null;
 }
 
-/** How a cancelled run describes itself — exit codes are noise once cancelled. */
+/**
+ * How a cancelled run describes itself — exit codes are noise once cancelled.
+ *
+ * It says what happened to the PROCESS and stops there. What happened to the
+ * profile is the rollback's verdict to give, and the rollback has not run yet
+ * when this is called: promising "the profile was restored" here would print
+ * that even when the rollback later fails, which is the one moment the user
+ * must be told to go look. rollbackRemove() already models this correctly with
+ * three distinct endings; the callers below append theirs the same way.
+ */
 function cancelDetail(outcome, cancelRequested) {
-  if (cancelRequested === true) return "cancelled — pnpm was terminated and the profile was restored";
+  if (cancelRequested === true) return "cancelled — pnpm was terminated";
   return outcome.signal ? `signal: ${outcome.signal}` : "killed before exit";
 }
 
@@ -1621,17 +1638,17 @@ function liveAddEnv(base = process.env) {
   };
 }
 
-export function runInstall({ profile, spec, allowBuildScripts, approvedProof, preflight, _profileDir, _spawn, _describe, _restoreWorkspace }) {
+export function runInstall({ profile, spec, allowBuildScripts, approvedProof, preflight, _profileDir, _spawn, _describe, _restoreWorkspace, _corepack }) {
   // Serialized with every other add/remove targeting the same profile (see
   // serializedProducer). Underscored arguments are self-test seams; production
   // callers never pass them. `_restoreWorkspace` exists specifically so the
   // fail-closed restoration path can be attacked without relying on flaky OS
   // permission tricks.
   return serializedProducer(_profileDir ?? profileLockKey(profile), () =>
-    runInstallInner({ profile, spec, allowBuildScripts, approvedProof, preflight, _profileDir, _spawn, _describe, _restoreWorkspace }));
+    runInstallInner({ profile, spec, allowBuildScripts, approvedProof, preflight, _profileDir, _spawn, _describe, _restoreWorkspace, _corepack }));
 }
 
-function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, preflight, _profileDir, _spawn, _describe, _restoreWorkspace }) {
+function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, preflight, _profileDir, _spawn, _describe, _restoreWorkspace, _corepack = enablePnpmViaCorepack }) {
   const profileDir = _profileDir ?? ensureProfile(profile);
   try {
     assertNoManifestBuildBypass(profileDir);
@@ -1829,7 +1846,13 @@ function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, pref
     if (outcome.spawnError !== undefined) {
       if (outcome.spawnError.code === "ENOENT" && !pnpmSelfHealed) {
         pnpmSelfHealed = true;
-        const healed = await enablePnpmViaCorepack(push);
+        const healed = await _corepack(push, (child) => { current = child; });
+        // 取消要在 retry 之前判。corepack 可能已经被杀、也可能刚好装完，
+        // 无论哪种，用户按过 kill 之后就绝不能再去动 profile。
+        if (cancelRequested) {
+          restoreOriginalWorkspace();
+          return { status: "killed", detail: cancelDetail(outcome, cancelRequested) };
+        }
         if (healed) {
           const retry = spawnAdd();
           current = retry;
@@ -2001,11 +2024,37 @@ function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, pref
         }
         push("\n[dsh-plugin-mall] install paused for build-script approval — the candidate stays installed with its scripts blocked; approve in the UI to finish, or restart dsh / run `dsh-plugin-guard guard recover` to roll back\n");
       } else {
+        // 回滚的结局必须进 detail，不能只进日志流。detail 是模型和面板唯一
+        // 一定会读到的东西；把「没能还原」只写进日志，等于让一个状态未知的
+        // profile 以一句 killed/failed 悄悄收场。
+        //
+        // 三种结局分开说，和 rollbackRemove 同一套口径：
+        //   还原了 / 没有还原目标（marker 不见了）/ 回滚自己也失败了。
+        // 后两种一律 failed —— 取消如果没还原成，那就不是一次干净的取消。
         try {
-          rollbackPendingSnapshot(profileDir);
-          push("\n[dsh-plugin-mall] install did not complete — restored profile files to their pre-install state and cleared the pending marker\n");
+          const rolled = rollbackPendingSnapshot(profileDir);
+          if (rolled === undefined) {
+            // 返回 undefined 不抛：marker 不见了，没有还原目标。此前这里
+            // 照样打印「已还原」，是一句彻底的谎话。
+            push("\n[dsh-plugin-mall] WARNING: no pending marker was found, so the profile could NOT be restored automatically\n");
+            result = {
+              ...result,
+              status: "failed",
+              detail: `${result.detail ?? ""}; no pending marker was found, so the profile could NOT be restored automatically — check it before the next start (\`dsh-plugin-guard guard validate --profile ${profile}\`)`,
+            };
+          } else {
+            push("\n[dsh-plugin-mall] install did not complete — restored profile files to their pre-install state and cleared the pending marker\n");
+            if (result.status === "killed") {
+              result = { ...result, detail: `${result.detail ?? ""}; the profile was restored to its pre-install state` };
+            }
+          }
         } catch (error) {
           push(`\n[dsh-plugin-mall] WARNING: could not roll back the pending snapshot: ${error.message}\n`);
+          result = {
+            ...result,
+            status: "failed",
+            detail: `${result.detail ?? ""}; rollback also failed and the pending marker was kept for recovery: ${error.message}. Check the profile before the next start (restart dsh, or run \`dsh-plugin-guard guard recover\`)`,
+          };
         }
       }
       return result;
@@ -2052,14 +2101,14 @@ function failedNow(detail, { staleOnRestart = false } = {}) {
  * `dsh.profile.bundles` (the removed dependency's bundle entry drops out) and
  * deletes the client loader row `ensureClientRow` had registered for it.
  */
-export function runRemove({ profile, packageName, _profileDir, _spawn }) {
+export function runRemove({ profile, packageName, _profileDir, _spawn, _corepack }) {
   // Same per-profile queue as runInstall — a remove must never run
   // concurrently with an install (or another remove) in the same profile.
   return serializedProducer(_profileDir ?? profileLockKey(profile), () =>
-    runRemoveInner({ profile, packageName, _profileDir, _spawn }, false));
+    runRemoveInner({ profile, packageName, _profileDir, _spawn, _corepack }, false));
 }
 
-function runRemoveInner({ profile, packageName, _profileDir, _spawn }, selfHealed) {
+function runRemoveInner({ profile, packageName, _profileDir, _spawn, _corepack = enablePnpmViaCorepack }, selfHealed) {
   let profileDir;
   if (_profileDir !== undefined) {
     profileDir = _profileDir;
@@ -2126,21 +2175,29 @@ function runRemoveInner({ profile, packageName, _profileDir, _spawn }, selfHeale
     return failedNow(`cannot register the remove pending marker for ${packageName}: ${error.message} — refusing to touch the profile`);
   }
 
-  /** Restore the pre-remove bytes and settle the marker; never throws. */
+  /**
+   * Restore the pre-remove bytes and settle the marker; never throws.
+   *
+   * `rolledBack` says whether the profile is actually back to its pre-remove
+   * state. Only the caller that cancelled may upgrade this to `killed`, and
+   * only when it is true: a cancel whose rollback did not happen is not a
+   * clean stop, it is a profile in an unknown state, and it has to keep the
+   * `failed` status so nothing downstream reads it as "nothing to see here".
+   */
   const rollbackRemove = (reason) => {
     try {
       const rolled = rollbackPendingSnapshot(profileDir);
       if (rolled === undefined) {
         // marker 不见了（外部删除、或本轮压根没登记成功）——没有还原目标，
         // 就绝不能声称已还原。说实话比说好听重要：用户据此决定要不要手工检查。
-        return { status: "failed", detail: `${reason}; no pending marker was found, so the profile could NOT be restored automatically — check it before the next start (\`dsh-plugin-guard guard validate --profile ${profile}\`)` };
+        return { status: "failed", rolledBack: false, detail: `${reason}; no pending marker was found, so the profile could NOT be restored automatically — check it before the next start (\`dsh-plugin-guard guard validate --profile ${profile}\`)` };
       }
       const rebuild = describeRollbackRebuild(rolled.rebuild);
-      return { status: "failed", detail: `${reason}; the profile was restored to its pre-remove state${rebuild === undefined ? "" : ` (node_modules rebuild — ${rebuild})`}` };
+      return { status: "failed", rolledBack: true, detail: `${reason}; the profile was restored to its pre-remove state${rebuild === undefined ? "" : ` (node_modules rebuild — ${rebuild})`}` };
     } catch (rollbackError) {
       // 回滚失败时**保留 marker**：磁盘状态未知，交给启动恢复/`guard recover`，
       // 绝不能声称已还原。
-      return { status: "failed", detail: `${reason}; rollback also failed and the pending marker was kept for recovery: ${rollbackError.message}` };
+      return { status: "failed", rolledBack: false, detail: `${reason}; rollback also failed and the pending marker was kept for recovery: ${rollbackError.message}` };
     }
   };
 
@@ -2171,7 +2228,13 @@ function runRemoveInner({ profile, packageName, _profileDir, _spawn }, selfHeale
       // producer——若走 runRemove 重新排队会死锁——且必须返回它的 done
       // outcome，返回 producer 本体会让 tracker 把成功任务记成 failed）。
       if (outcome.spawnError.code === "ENOENT" && selfHealed !== true) {
-        const healed = await enablePnpmViaCorepack(push);
+        const healed = await _corepack(push, (child) => { current = child; });
+        // 取消要在重试之前判，理由同 install 侧：用户按过 kill 之后就不能再
+        // 去动 profile。这一轮 pnpm 从未启动，所以没有东西需要回滚。
+        if (cancelRequested) {
+          const rolled = rollbackRemove(cancelDetail(outcome, cancelRequested));
+          return rolled.rolledBack === true ? { ...rolled, status: "killed" } : rolled;
+        }
         // 重试前先把本轮的事务状态收掉——否则重试那一轮会被自己的 marker 挡住。
         // 收不掉就不许重试：递归只会撞上自己的 marker 并返回笼统的「有未了结
         // 事务」，把真正的回滚错因盖掉，而那正是用户需要看到的东西。
@@ -2181,7 +2244,7 @@ function runRemoveInner({ profile, packageName, _profileDir, _spawn }, selfHeale
           } catch (rollbackError) {
             return { status: "failed", detail: `pnpm was missing and corepack enabled it, but clearing this remove's pending marker failed, so the retry was not attempted: ${rollbackError.message}. The marker was kept for recovery (restart dsh, or run \`dsh-plugin-guard guard recover\`).` };
           }
-          return await runRemoveInner({ profile, packageName, _profileDir, _spawn }, true).done;
+          return await runRemoveInner({ profile, packageName, _profileDir, _spawn, _corepack }, true).done;
         }
       }
       const hint = outcome.spawnError.code === "ENOENT"
@@ -2191,8 +2254,10 @@ function runRemoveInner({ profile, packageName, _profileDir, _spawn }, selfHeale
     }
     if (endedByCancel(outcome, cancelRequested)) {
       // 取消也要还原：pnpm 可能已经删掉了 node_modules 里的目录。
-      const killed = rollbackRemove(cancelDetail(outcome, cancelRequested));
-      return { ...killed, status: "killed" };
+      const rolled = rollbackRemove(cancelDetail(outcome, cancelRequested));
+      // 还原成功才算干净取消。没还原成功就维持 failed——磁盘状态未知、marker
+      // 还在，报成 killed 会让上层（和模型）当作「什么都没发生」。
+      return rolled.rolledBack === true ? { ...rolled, status: "killed" } : rolled;
     }
     if (outcome.exitCode !== 0) {
       return rollbackRemove(`pnpm remove ${packageName} failed (exit code ${outcome.exitCode}). See job output.`);
@@ -3391,6 +3456,45 @@ async function runTransactionFixtures() {
         !/exit code/.test(outcome.detail ?? ""),
         `detail=${outcome.detail}`,
       );
+      check(
+        `取消在途 remove（${killAs}）→ 回滚成功才说已还原`,
+        /the profile was restored to its pre-remove state/.test(outcome.detail ?? ""),
+        `detail=${outcome.detail}`,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+
+  // 3b-6b. 卸载侧的同一格：取消了但没有还原目标。`{...rolled, status:"killed"}`
+  // 曾经无条件把 rollbackRemove 判定的 failed 覆盖成 killed，等于把它三种
+  // 结局里的两种失败结论抹平成一句「已取消」。
+  {
+    const { profileDir, cleanup } = makeTempProfile("remove-cancel-rollback-fails", { "pkg-g": "1.0.0" });
+    try {
+      materializeFakePackage(profileDir, "pkg-g", "1.0.0");
+      const { spawnFn } = blockingSpawn("win32");
+      const producer = runRemove({ profile: "p", packageName: "pkg-g", _profileDir: profileDir, _spawn: spawnFn });
+      await flush();
+      rmSync(pendingMarkerPath(profileDir), { force: true }); // 抽掉还原目标
+      producer.cancel();
+      const outcome = await producer.done;
+      const detail = outcome.detail ?? "";
+      check(
+        "取消 + 回滚失败（remove）→ 退回 failed，不报 killed",
+        outcome.status === "failed",
+        `status=${outcome.status} detail=${detail}`,
+      );
+      check(
+        "取消 + 回滚失败（remove）→ 绝不声称已还原",
+        !/was restored/.test(detail),
+        `detail=${detail}`,
+      );
+      check(
+        "取消 + 回滚失败（remove）→ 指名 marker 与排查手段",
+        /marker/.test(detail) && /guard validate|guard recover|before the next start/.test(detail),
+        `detail=${detail}`,
+      );
     } finally {
       cleanup();
     }
@@ -3550,6 +3654,92 @@ async function runTransactionFixtures() {
         `取消在途 install（${killAs}）→ detail 不谎称 pnpm 失败`,
         !/exit code/.test(outcome.detail ?? ""),
         `detail=${outcome.detail}`,
+      );
+      check(
+        `取消在途 install（${killAs}）→ 回滚成功才说已还原`,
+        /the profile was restored to its pre-install state/.test(outcome.detail ?? ""),
+        `detail=${outcome.detail}`,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+
+  // 4b-2. 取消了，但回滚做不成。marker 被外部删掉（外部清理、磁盘故障、
+  // 或本轮压根没登记上），rollbackPendingSnapshot 返回 undefined 而不抛。
+  //
+  // 这是最不能撒谎的一格：profile 停在 pnpm 动过一半的状态，没有还原目标，
+  // 而用户看到的如果是「killed，已还原」，他就不会去查——正是他必须去查的
+  // 那一次。所以结局必须退回 failed，并且指名 marker 和排查手段。
+  {
+    const { profileDir, cleanup } = makeTempProfile("cancel-rollback-fails");
+    try {
+      materializeFakePackage(profileDir, "pkg-a", "1.0.0");
+      const { spawnFn } = blockingSpawn("win32");
+      const install = runInstall({ profile: "p", spec: "pkg-a", preflight: preflightStub("pkg-a"), _profileDir: profileDir, _spawn: spawnFn });
+      await flush();
+      rmSync(pendingMarkerPath(profileDir), { force: true }); // 抽掉还原目标
+      install.cancel();
+      const outcome = await install.done;
+      const detail = outcome.detail ?? "";
+      check(
+        "取消 + 回滚失败（install）→ 退回 failed，不报 killed",
+        outcome.status === "failed",
+        `status=${outcome.status} detail=${detail}`,
+      );
+      check(
+        "取消 + 回滚失败（install）→ 绝不声称已还原",
+        !/was restored/.test(detail),
+        `detail=${detail}`,
+      );
+      check(
+        "取消 + 回滚失败（install）→ 指名 marker 与排查手段",
+        /marker/.test(detail) && /guard validate|guard recover|before the next start/.test(detail),
+        `detail=${detail}`,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+
+  // 4b-3. pnpm 缺失 → corepack 自愈期间取消。此前 current 还指着那个 ENOENT
+  // 失败的 pnpm，cancel() 什么也杀不到，corepack 跑完还会照常开装——按了
+  // job_kill 之后仍然会改 profile。retry 的 spawn 次数必须是 0。
+  {
+    const { profileDir, cleanup } = makeTempProfile("corepack-cancel");
+    try {
+      materializeFakePackage(profileDir, "pkg-a", "1.0.0");
+      let spawnCount = 0;
+      const spawnFn = () => {
+        spawnCount++;
+        const proc = new FakeProc("win32");
+        queueMicrotask(() => proc.emit("error", Object.assign(new Error("spawn pnpm ENOENT"), { code: "ENOENT" })));
+        return proc;
+      };
+      let releaseCorepack;
+      const corepackRunning = new Promise((resolveGate) => { releaseCorepack = resolveGate; });
+      const install = runInstall({
+        profile: "p",
+        spec: "pkg-a",
+        preflight: preflightStub("pkg-a"),
+        _profileDir: profileDir,
+        _spawn: spawnFn,
+        _corepack: async () => { await corepackRunning; return true; }, // 自愈"成功"
+      });
+      await flush();
+      const spawnsBeforeCancel = spawnCount;
+      install.cancel(); // corepack 还在跑
+      releaseCorepack(); // 然后它成功返回——这一步之后绝不能再开装
+      const outcome = await install.done;
+      check(
+        "corepack 自愈期间取消 → retry spawn 次数为 0",
+        spawnCount === spawnsBeforeCancel && spawnCount === 1,
+        `spawnCount=${spawnCount} beforeCancel=${spawnsBeforeCancel}`,
+      );
+      check(
+        "corepack 自愈期间取消 → 结局是 killed",
+        outcome.status === "killed",
+        `status=${outcome.status} detail=${outcome.detail}`,
       );
     } finally {
       cleanup();
