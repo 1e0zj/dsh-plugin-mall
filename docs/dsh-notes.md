@@ -98,6 +98,21 @@ jobs、RPC cancellation、Cordis lifecycle，以及 `module-graph` / `config-cat
   > `createInstallJobProducer`（index.js），`market_install` 立即返回 job id，
   > 预检输出进 job 日志，`job_kill` 经 AbortController/tree-kill 可取消；
   > blocker 以 job failed outcome 送达。浏览器 RPC 侧仍是缺口（见 issue #7）。
+
+  > ⚠️ 上面那句「浏览器路径已经采用后一种做法」只对了一半，别照它下判断。
+  > 浏览器把**预检**做进了 job（`rpcDispatch` 的 `preflight` 分支用
+  > `tracker.startCustom`，日志实时流），但用户在风险卡片上点「继续安装」之后，
+  > `install` 分支照旧在 `tracker.start()` **之前** await registry 查询、防抢注、
+  > 宿主遮蔽检查和 `runPreflight`——和 agent 路径改之前一模一样。
+  >
+  > 用户可见的后果（2026-08-22 实测，装 `dsh-better-sidebar`）：确认后风险框
+  > 立刻消失，任务条目却仍停在「预检完成」，几十秒后才切进安装。三件事叠加：
+  > ① jobId 要等整个 RPC 返回，前端没有东西可切；
+  > ② `PREFLIGHT_TTL` 只有 30 秒而 `pinPreflight` 要到安装真正开始才打，
+  >    用户读完警告再决策基本必然超时，隔离探装整个重跑一遍；
+  > ③ 前端 `setPreflight(null)` 在 RPC 之前执行，而 `installing[spec]` 唯一的
+  >    显示位置就是那张卡片的「安装中…」，卡片一拆就没有任何反馈了。
+  > 只修 ① 三件会一起好转——重跑一旦进了 job，那几十秒就从黑箱变成实时日志。
 - Connection/RPC 与 `api-gateway.zh.md` 明确把 carrier `AbortSignal` 作为取消边界。
   当前 `/market` handler 收到了 `signal`，但 `rpcDispatch()` 不接收也不向搜索、验证、
   registry 查询或预检传递；浏览器关闭/切换/主动取消请求后，Host 仍会继续网络与 pnpm
