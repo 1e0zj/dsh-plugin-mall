@@ -93,6 +93,11 @@ jobs、RPC cancellation、Cordis lifecycle，以及 `module-graph` / `config-cat
   和隔离预检，因此“ALWAYS runs as a background job / returns immediately”并不成立；这段
   工作也不出现在 job 日志中，用户无法用 `job_kill` 取消。应把整个预检链移入 producer，
   或先注册一个 preflight job，再由结果驱动安装（浏览器路径已经采用后一种做法）。
+
+  > ✅ agent 侧已修（issue #8，2026-08-21）：预检链整体移入
+  > `createInstallJobProducer`（index.js），`market_install` 立即返回 job id，
+  > 预检输出进 job 日志，`job_kill` 经 AbortController/tree-kill 可取消；
+  > blocker 以 job failed outcome 送达。浏览器 RPC 侧仍是缺口（见 issue #7）。
 - Connection/RPC 与 `api-gateway.zh.md` 明确把 carrier `AbortSignal` 作为取消边界。
   当前 `/market` handler 收到了 `signal`，但 `rpcDispatch()` 不接收也不向搜索、验证、
   registry 查询或预检传递；浏览器关闭/切换/主动取消请求后，Host 仍会继续网络与 pnpm
