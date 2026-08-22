@@ -1328,7 +1328,16 @@ function enforcePreflight(report, acceptWarnings, label) {
  * work appeared in no job log, and `job_kill` had nothing to kill. The tool's
  * own description promised the opposite ("ALWAYS runs as a background job:
  * the call returns a job id immediately"). Moving the chain in here makes that
- * promise true and, as a side effect, gives every slow phase a kill handle.
+ * promise true and, as a side effect, gives the slow phases a kill handle.
+ *
+ * One phase is deliberately NOT cancellable: the registry lookup. `resolveRegistry`
+ * caches a PROMISE per profile, so threading the signal into it would leave a
+ * permanently rejected promise in that cache after one cancel — every later
+ * registry query for the profile would fail, and unlike the npmPackageInfo cache
+ * it never expires. That is the same cache-poisoning bug this change set exists
+ * to remove, traded for at most the few seconds `pnpm config get registry` takes
+ * on a cold profile. So cancellation there lands on the throwIfAborted() right
+ * after it instead.
  *
  * Two invariants this shape has to keep:
  *  - `done` NEVER rejects. It is the single settlement path the jobs runtime
@@ -1350,6 +1359,7 @@ function createInstallJobProducer({
   agentOwner,
   npmRegistry = "",
   rawSources = [],
+  profileExisted = true,
   _registryFor = registryFor,
   _preferNpmSpec = preferNpmSpec,
   _assertSafeToInstall = assertSafeToInstall,
@@ -1458,8 +1468,16 @@ function createInstallJobProducer({
     return outcome;
   })().catch((error) => {
     if (isAbortError(error)) {
-      // 取消发生在预检阶段：profile 一个字节都没被动过（探装在临时目录里）。
-      return { status: "killed", detail: `install of ${requestedSpec} was cancelled during preflight — the profile was never modified` };
+      // 取消发生在预检阶段：探装全在临时目录里，正式 profile 没被装进任何东西。
+      // 唯一的例外是 profile 本来就不存在——预检会先 ensureProfile() 把它建出来
+      // （package.json / cordis.patch.yml / pnpm-workspace.yaml 真的落盘）。
+      // 那种情况下「从未被修改」是假的，如实说建了什么。
+      return {
+        status: "killed",
+        detail: profileExisted === false
+          ? `install of ${requestedSpec} was cancelled during preflight — no packages were installed, but the profile did not exist and was initialized before the probe started`
+          : `install of ${requestedSpec} was cancelled during preflight — the profile was never modified`,
+      };
     }
     return { status: "failed", detail: `install of ${requestedSpec} hit an error: ${error?.message ?? String(error)}` };
   });
@@ -2181,8 +2199,13 @@ export function apply(ctx, config = {}) {
       const profile = String(args.profile ?? defaultProfile).trim();
       // profile 名非法要当场报错，而不是变成一个注定失败的后台 job——
       // 与 market_uninstall 一致。
+      let profileExisted;
       try {
-        resolveProfileDir(profile);
+        // 顺便记下 profile 本来存不存在：预检会给尚未初始化的 profile 调
+        // ensureProfile()（真的落盘 package.json 等文件），所以取消时那句
+        // 「profile 从未被修改」对新建的 profile 并不成立。这里是唯一还能
+        // 看到「动手之前」状态的位置。
+        profileExisted = existsSync(join(resolveProfileDir(profile), "package.json"));
       } catch (error) {
         throw new Error(`market_install: invalid profile: ${error.message}`);
       }
@@ -2215,6 +2238,7 @@ export function apply(ctx, config = {}) {
           agentOwner,
           npmRegistry,
           rawSources,
+          profileExisted,
         }),
       });
       return { kind: "background", jobId };
@@ -3337,6 +3361,37 @@ export async function runSelfTests() {
       check("进行中取消 → 结算为 killed", cancelOutcome?.status === "killed");
       check("进行中取消 → 明说 profile 未被改动", /never modified/.test(cancelOutcome?.detail ?? ""));
       check("进行中取消 → 不进入 pnpm 阶段", cancelInstalls.calls === 0);
+
+      // 13c2. profile 本来就不存在的情况。runPreflight 会先 ensureProfile()，
+      // 那是真的落盘（package.json / cordis.patch.yml / pnpm-workspace.yaml），
+      // 所以「the profile was never modified」对它是假话——用户会照着这句
+      // 认定磁盘上什么都没多出来。
+      const freshInstalls = { calls: 0 };
+      const freshProducer = createInstallJobProducer({
+        profile: "web",
+        spec: "slow-pkg",
+        agentOwner: "agent-selftest",
+        profileExisted: false,
+        ...seams({
+          _runPreflight: ({ signal }) => new Promise((_resolve, rejectPreflight) => {
+            signal.addEventListener("abort", () => {
+              const error = new Error("preflight cancelled");
+              error.name = "AbortError";
+              rejectPreflight(error);
+            }, { once: true });
+          }),
+          _runInstall: neverInstall(freshInstalls),
+        }),
+      });
+      await new Promise((resolveTick) => setImmediate(resolveTick));
+      freshProducer.cancel();
+      const freshOutcome = await settleWithin(freshProducer.done, 5000, "未初始化 profile 的取消");
+      check("未初始化 profile 取消 → 仍结算为 killed", freshOutcome?.status === "killed");
+      check("未初始化 profile 取消 → 不谎称「从未修改」",
+        !/never modified/.test(freshOutcome?.detail ?? ""));
+      check("未初始化 profile 取消 → 如实说明 profile 已被初始化",
+        /was initialized before the probe started/.test(freshOutcome?.detail ?? ""));
+      check("未初始化 profile 取消 → 仍然不进入 pnpm 阶段", freshInstalls.calls === 0);
 
       // 13d. 审批 token 签发失败（这里用缺失的 proof 触发）。以前这段跑在
       // .then 里，一抛就把 done 变成 rejected —— 违反「done 必须不 reject」，
