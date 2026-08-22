@@ -1308,12 +1308,47 @@ function preflightVerdictLog(report) {
  * preflight refused this candidate" is not an internal error but the job's
  * legitimate outcome, so it has to travel as text on a `failed` outcome.
  */
-function preflightRefusal(report, acceptWarnings, label) {
+/**
+ * The identity of ONE preflight verdict: which candidate, which profile state,
+ * which issues. Consent to install despite warnings binds to this — a boolean
+ * `acceptWarnings: true` carries no such identity, so the report changing
+ * between the user's confirmation and the retry used to slip different
+ * warnings through under an old yes (profile edits force a re-probe; the new
+ * report can carry entirely different warnings).
+ *
+ * Candidate name+version come from the probe's own manifest, so a re-probe of
+ * a drifted mutable spec produces a different digest even when the issue list
+ * happens to read the same. 16 hex chars — this detects change, it is not a
+ * security boundary.
+ */
+export function preflightConsentDigest(report, fingerprint) {
+  const canonical = JSON.stringify({
+    verdict: report?.verdict ?? null,
+    candidateName: report?.candidate?.name ?? null,
+    candidateVersion: report?.candidate?.version ?? null,
+    fingerprint: fingerprint ?? null,
+    issues: (report?.issues ?? []).map((entry) => [entry.severity ?? null, entry.title ?? null, entry.detail ?? null]),
+  });
+  return createHash("sha256").update(canonical).digest("hex").slice(0, 16);
+}
+
+function preflightRefusal(report, acceptWarnings, label, { digestProvided, fingerprint, consentBoundByToken = false } = {}) {
   if (report.verdict === "blocked") {
     return `${label}: ${report.summary}\n${report.issues.filter((entry) => entry.severity === "block").map(renderPreflightIssue).join("\n")}`;
   }
-  if (report.verdict === "warning" && acceptWarnings !== true) {
-    return `${label}: ${report.summary}\n${report.issues.filter((entry) => entry.severity === "warn").map(renderPreflightIssue).join("\n")}\n\nTo continue, show these warnings to the user and, after their explicit confirmation, call again with acceptWarnings: true.`;
+  if (report.verdict === "warning") {
+    const digest = preflightConsentDigest(report, fingerprint);
+    const warnLines = report.issues.filter((entry) => entry.severity === "warn").map(renderPreflightIssue).join("\n");
+    // 审批 token 自带报告摘要比对（consumeApprovalToken），它给出的同意已经
+    // 绑定了报告；只有裸布尔 acceptWarnings 这条道需要在这里比对 digest。
+    const consentMatches = acceptWarnings === true
+      && (consentBoundByToken === true || digestProvided === digest);
+    if (!consentMatches) {
+      const why = acceptWarnings === true
+        ? "the preflight report changed since the warnings were confirmed (or no report digest was supplied), so the earlier yes cannot carry over. Current warnings:"
+        : `${report.summary}`;
+      return `${label}: ${why}\n${warnLines}\n\nCurrent report digest: ${digest}. To continue, show these warnings to the user and, after their explicit confirmation, call again with acceptWarnings: true and reportDigest: ${digest}.`;
+    }
   }
   return undefined;
 }
@@ -1322,8 +1357,8 @@ function preflightRefusal(report, acceptWarnings, label) {
  * Enforce a preflight verdict for an install. Throws when a blocker exists, or
  * when there are only warnings and acceptWarnings is not true.
  */
-function enforcePreflight(report, acceptWarnings, label) {
-  const refusal = preflightRefusal(report, acceptWarnings, label);
+function enforcePreflight(report, acceptWarnings, label, consent) {
+  const refusal = preflightRefusal(report, acceptWarnings, label, consent);
   if (refusal !== undefined) {
     const error = new Error(refusal);
     error.preflight = report;
@@ -1370,6 +1405,7 @@ function createInstallJobProducer({
   profile,
   spec: requestedSpec,
   acceptWarnings: acceptWarningsRequested = false,
+  reportDigest,
   allowBuildScripts,
   approvalToken,
   agentOwner,
@@ -1439,7 +1475,11 @@ function createInstallJobProducer({
       acceptWarningsActive = acceptWarnings;
     }
 
-    const refusal = preflightRefusal(preflight.report, acceptWarnings, `market_install ${spec}`);
+    const refusal = preflightRefusal(preflight.report, acceptWarnings, `market_install ${spec}`, {
+      digestProvided: reportDigest,
+      fingerprint: preflight.fingerprint,
+      consentBoundByToken: approvalToken !== undefined, // consume 已带报告摘要比对
+    });
     if (refusal !== undefined) {
       // 拒绝是这个 job 的正常结局，不是异常：作为 failed 的 detail 回去，
       // 模型从 job_output 就能读到逐条 BLOCK/WARN。
@@ -1804,7 +1844,7 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
           session,
           run: async (push) => {
             push(`[dsh-plugin-mall] 预检 ${resolved}：隔离目录探装（脚本禁用）\n`);
-            const { report, profileDir: probedDir } = await runPreflight({ profile, spec: resolved, onOutput: (text) => push(text) });
+            const { report, profileDir: probedDir, fingerprint: probedFingerprint } = await runPreflight({ profile, spec: resolved, onOutput: (text) => push(text) });
             // 结论 + 逐条原因都进日志。extras 只喂给风险卡片，卡片一关就什么
             // 都不剩了；日志是留得住的那一份。
             push(preflightVerdictLog(report));
@@ -1819,7 +1859,13 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
             // 有任何改动这条缓存就立刻作废而不是被钉住。钉的是「同一个 profile
             // 状态下的同一次结论」，10 分钟内复用与重跑完全等价。
             pinPreflight(probedDir, resolved);
-            return { status: "completed", detail: `预检完成：${report.verdict}`, extras: report };
+            // extras 额外带 consentDigest：风险卡片确认时原样回传，装的时候
+            // 与当前报告比对——同意绑定的是「这份报告」，不是一次布尔值。
+            return {
+              status: "completed",
+              detail: `预检完成：${report.verdict}`,
+              extras: { ...report, consentDigest: preflightConsentDigest(report, probedFingerprint) },
+            };
           },
         });
         return rpcOk({ jobId, profile, spec: resolved });
@@ -1889,7 +1935,11 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
           acceptWarnings = payload?.acceptWarnings === true;
           acceptWarningsActive = acceptWarnings;
         }
-        enforcePreflight(preflight.report, acceptWarnings, `install ${spec}`);
+        enforcePreflight(preflight.report, acceptWarnings, `install ${spec}`, {
+          digestProvided: payload?.acceptedReportDigest,
+          fingerprint: preflight.fingerprint,
+          consentBoundByToken: approvalToken !== undefined, // consume 已带报告摘要比对
+        });
       } catch (error) {
         return rpcFail(error);
       }
@@ -2208,6 +2258,10 @@ export function apply(ctx, config = {}) {
         type: "boolean",
         description: "Set true only after the USER has explicitly confirmed they accept the preflight warnings the previous call reported. Without it, an install whose preflight found only warnings is refused. Never set this on your own initiative.",
       },
+      reportDigest: {
+        type: "string",
+        description: "The \"Current report digest\" printed by the failed job you are retrying. The warning consent is bound to that exact report: if the candidate package or the profile changed in between, the digest no longer matches and the job fails again with the NEW warnings — show those to the user and confirm anew. Required whenever acceptWarnings is true.",
+      },
       approvalToken: {
         type: "string",
         description: "Opaque one-shot approval token issued when a previous install paused for install script approval. Required on retry if the install had accepted preflight warnings.",
@@ -2272,6 +2326,7 @@ export function apply(ctx, config = {}) {
           profile,
           spec,
           acceptWarnings: args.acceptWarnings === true,
+          reportDigest: typeof args.reportDigest === "string" ? args.reportDigest.trim() : undefined,
           allowBuildScripts,
           approvalToken,
           agentOwner,
@@ -3390,6 +3445,106 @@ export async function runSelfTests() {
       }).done, 5000, "warning job");
       check("预检 warning 未确认 → failed 且提示 acceptWarnings",
         warnOutcome?.status === "failed" && /acceptWarnings: true/.test(warnOutcome?.detail ?? "") && warnInstalls.calls === 0);
+
+      // 13a2b. digest 的敏感性：报告的任何一个承重维度变了，digest 必须变。
+      // 「同意绑定的是这份报告」靠它成立——漏一个维度，那个维度上的漂移就
+      // 能从旧同意底下溜过去。
+      {
+        const consentReport = {
+          verdict: "warning",
+          candidate: { name: "warn-pkg", version: "1.0.0" },
+          issues: [{ severity: "warn", title: "替换整块 config", detail: "sandbox-policy" }],
+        };
+        const d0 = preflightConsentDigest(consentReport, "fp-consent");
+        check("digest 对同一输入稳定", d0 === preflightConsentDigest(consentReport, "fp-consent"));
+        check("issues 变化 → digest 变",
+          d0 !== preflightConsentDigest({ ...consentReport, issues: [{ severity: "warn", title: "替换整块 config", detail: "别的块" }] }, "fp-consent"));
+        check("候选版本变化 → digest 变",
+          d0 !== preflightConsentDigest({ ...consentReport, candidate: { name: "warn-pkg", version: "2.0.0" } }, "fp-consent"));
+        check("profile 指纹变化 → digest 变", d0 !== preflightConsentDigest(consentReport, "fp-other"));
+        check("verdict 变化 → digest 变", d0 !== preflightConsentDigest({ ...consentReport, verdict: "safe" }, "fp-consent"));
+      }
+
+      // 13a3. 同意绑定 digest：acceptWarnings:true 不再是无条件的通行证。
+      // 用户确认警告到重试之间，报告可能整个换过（profile 变了触发重跑、
+      // 候选发了新版）——布尔同意不得沿用，必须重新看新的警告。
+      {
+        const consentReport = {
+          verdict: "warning",
+          candidate: { name: "warn-pkg", version: "1.0.0" },
+          issues: [{ severity: "warn", title: "替换整块 config", detail: "sandbox-policy" }],
+        };
+        const consentFingerprint = "fp-consent";
+        const goodDigest = preflightConsentDigest(consentReport, consentFingerprint);
+
+        // a) digest 匹配 → 通过警告关卡，进入安装。
+        const matchInstalls = { calls: 0 };
+        const matchOutcome = await settleWithin(createInstallJobProducer({
+          profile: "web",
+          spec: "warn-pkg",
+          agentOwner: "agent-selftest",
+          acceptWarnings: true,
+          reportDigest: goodDigest,
+          ...seams({
+            _runPreflight: async () => ({ report: consentReport, profileDir, fingerprint: consentFingerprint }),
+            _runInstall: neverInstall(matchInstalls),
+          }),
+        }).done, 5000, "digest 匹配");
+        check("警告同意 digest 匹配 → 进入安装",
+          matchOutcome?.status === "completed" && matchInstalls.calls === 1,
+          `status=${matchOutcome?.status} calls=${matchInstalls.calls} detail=${matchOutcome?.detail}`);
+
+        // b) digest 过期：重跑后报告变了（多了一条警告、候选升了版本）。
+        //    拒绝，且 detail 给出**新** digest——模型照着新警告重新确认。
+        const driftedReport = {
+          verdict: "warning",
+          candidate: { name: "warn-pkg", version: "2.0.0" },
+          issues: [
+            { severity: "warn", title: "替换整块 config", detail: "sandbox-policy" },
+            { severity: "warn", title: "新版本的额外改动", detail: "loader-id 顶掉现有行" },
+          ],
+        };
+        const newDigest = preflightConsentDigest(driftedReport, consentFingerprint);
+        const driftInstalls = { calls: 0 };
+        const driftOutcome = await settleWithin(createInstallJobProducer({
+          profile: "web",
+          spec: "warn-pkg",
+          agentOwner: "agent-selftest",
+          acceptWarnings: true,
+          reportDigest: goodDigest, // 用户当初确认的是旧报告的 digest
+          ...seams({
+            _runPreflight: async () => ({ report: driftedReport, profileDir, fingerprint: consentFingerprint }),
+            _runInstall: neverInstall(driftInstalls),
+          }),
+        }).done, 5000, "digest 过期");
+        check("报告变了 → 旧 digest 拒绝安装",
+          driftOutcome?.status === "failed" && driftInstalls.calls === 0,
+          `status=${driftOutcome?.status} calls=${driftInstalls.calls}`);
+        check("报告变了 → 拒绝时展示新警告原文", /新版本的额外改动/.test(driftOutcome?.detail ?? ""));
+        check("报告变了 → 拒绝时给出新 digest 供重新确认",
+          driftOutcome?.detail?.includes(newDigest) === true && !driftOutcome.detail.includes(goodDigest));
+
+        // c) acceptWarnings:true 但压根没给 digest → 同样拒绝。
+        const bareInstalls = { calls: 0 };
+        const bareOutcome = await settleWithin(createInstallJobProducer({
+          profile: "web",
+          spec: "warn-pkg",
+          agentOwner: "agent-selftest",
+          acceptWarnings: true,
+          ...seams({
+            _runPreflight: async () => ({ report: consentReport, profileDir, fingerprint: consentFingerprint }),
+            _runInstall: neverInstall(bareInstalls),
+          }),
+        }).done, 5000, "无 digest");
+        check("acceptWarnings:true 无 digest → 拒绝并索要 digest",
+          bareOutcome?.status === "failed" && /reportDigest/.test(bareOutcome?.detail ?? "") && bareInstalls.calls === 0);
+
+        // d) 审批 token 路径不需要裸 digest：consumeApprovalToken 自己比对
+        //    报告摘要（那次真实事故「preflight report changed」就是它拦的），
+        //    再要求一份裸 digest 属于重复关卡。
+        check("审批 token 路径不受裸 digest 关卡影响",
+          preflightRefusal(consentReport, true, "lbl", { fingerprint: consentFingerprint, consentBoundByToken: true }) === undefined);
+      }
 
       // 13b. 预检通过 → 进入安装。同时钉两件事：pnpm 拿到的是防抢注解析后的
       // spec（label 用的是归一 spec，两者可以不同），以及 readOutput 的顺序。

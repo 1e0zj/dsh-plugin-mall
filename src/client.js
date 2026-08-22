@@ -1056,7 +1056,10 @@ window.__ModuleLoader__.load({
             var spec = preflight.spec;
             var carry = preflight.jobId;
             setPreflight(null);
-            doRawInstall(spec, { acceptWarnings: true }, carry);
+            // consentDigest 来自预检 job 的 extras，装的时候与当前报告比对：
+            // 用户点「继续」到安装真正开跑之间候选包或 profile 变了，
+            // 布尔同意不得沿用，要重新看新的警告。
+            doRawInstall(spec, { acceptWarnings: true, acceptedReportDigest: preflight.report.consentDigest }, carry);
           },
           onClose: function () {
             if (preflight && preflight.spec) delete approvalTokensRef.current[preflight.spec];
