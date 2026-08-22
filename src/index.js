@@ -1804,10 +1804,21 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
           session,
           run: async (push) => {
             push(`[dsh-plugin-mall] 预检 ${resolved}：隔离目录探装（脚本禁用）\n`);
-            const { report } = await runPreflight({ profile, spec: resolved, onOutput: (text) => push(text) });
+            const { report, profileDir: probedDir } = await runPreflight({ profile, spec: resolved, onOutput: (text) => push(text) });
             // 结论 + 逐条原因都进日志。extras 只喂给风险卡片，卡片一关就什么
             // 都不剩了；日志是留得住的那一份。
             push(preflightVerdictLog(report));
+            // 钉住这份结论，别让用户的思考时间把它作废。
+            //
+            // PREFLIGHT_TTL 只有 30 秒，而有警告时下一步正是让用户读完风险卡片
+            // 再决定——读两条「无法验证宿主依赖」基本必然超过 30 秒，于是点下
+            // 「继续安装」时缓存已过期，隔离探装整个重跑一遍：用户看到的是确认
+            // 之后又干等几十秒，而那几十秒里没有任何反馈。
+            //
+            // pin 不会让判断变陈旧：pinPreflight 先比对 profile 指纹，profile
+            // 有任何改动这条缓存就立刻作废而不是被钉住。钉的是「同一个 profile
+            // 状态下的同一次结论」，10 分钟内复用与重跑完全等价。
+            pinPreflight(probedDir, resolved);
             return { status: "completed", detail: `预检完成：${report.verdict}`, extras: report };
           },
         });
@@ -3239,6 +3250,39 @@ export async function runSelfTests() {
     const rolledLog = quietLog();
     runStartupRecovery("profile-a", { recover: () => ({ action: "rolled-back", reason: "静态校验未通过" }), log: rolledLog });
     check("回滚路径播报原因", rolledLog.lines.some((line) => line.includes("rolled back") && line.includes("静态校验未通过")));
+
+    // ── 12a. 预检 job 结算即 pin：用户的思考时间不该让结论作废 ──────────────
+    //
+    // 有警告时下一步是让用户读风险卡片再决定，而 PREFLIGHT_TTL 只有 30 秒。
+    // 读两条警告基本必然超时，于是点「继续安装」时缓存已过期、隔离探装整个
+    // 重跑一遍——用户看到的就是确认之后又干等几十秒。
+    {
+      const pinSpec = "pin-me";
+      const pinKey = preflightCacheKey(profileDir, pinSpec);
+      preflightCache.set(pinKey, {
+        report: { verdict: "warning", summary: "", issues: [] },
+        fingerprint: computeProfileFingerprint(profileDir),
+        at: Date.now(),
+        pinnedAt: undefined,
+      });
+      pinPreflight(profileDir, pinSpec);
+      check("预检结算后 pin 生效", isPinned(preflightCache.get(pinKey)) === true);
+
+      // 把落库时间推到 TTL 之外——没有 pin 的话这条已经该重跑了。
+      preflightCache.get(pinKey).at = Date.now() - (PREFLIGHT_TTL + 5000);
+      const stale = preflightCache.get(pinKey);
+      check("超过 30 秒 TTL 后，pin 仍让它有效（不必重跑探装）",
+        isPinned(stale) === true && Date.now() - stale.at > PREFLIGHT_TTL);
+
+      // 但 pin 绝不能护住一个已经对不上 profile 的结论：指纹一变就丢弃。
+      // 这是 pin 可以放心提前打的全部理由。
+      const patchPath = join(profileDir, "cordis.patch.yml");
+      const patchBefore = readFileSync(patchPath, "utf8");
+      writeFileSync(patchPath, `${patchBefore}\n- name: pin-test-drift\n`);
+      pinPreflight(profileDir, pinSpec);
+      check("profile 一变 → pin 拒绝钉住并丢弃缓存", preflightCache.get(pinKey) === undefined);
+      writeFileSync(patchPath, patchBefore);
+    }
 
     // ── 12b. 预检的告警原文必须留在 job 日志里 ──────────────────────────────
     //
