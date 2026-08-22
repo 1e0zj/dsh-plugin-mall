@@ -1490,6 +1490,40 @@ function cancelSpawned(current) {
   }
 }
 
+/**
+ * Did this pnpm run end because WE cancelled it?
+ *
+ * `exitCode === null` was the sole test, and it is a POSIX-only tell: it holds
+ * when Node itself signals a directly-spawned child, which is what every
+ * fixture here does (FakeProc emits close(null, "SIGTERM")). The real Windows
+ * path never produces it. pnpm is a .cmd shim, so it must be spawned through a
+ * shell wrapper, and cancelling means killProcessTree → `taskkill /T /F`; the
+ * wrapper is then TERMINATED rather than signalled, and Node reports
+ * `close(1, null)` — measured, not assumed. So a user pressing job_kill during
+ * `pnpm add` got:
+ *
+ *   failed, pnpm add <spec> failed (exit code 1). See job output.
+ *
+ * The model reading that concludes the plugin cannot be installed and starts
+ * debugging a problem that does not exist — registry, network, the candidate
+ * itself — when all that happened is the user cancelled. Rollback ran either
+ * way (the outer handler rolls back anything that is neither `completed` nor
+ * an approval pause), so this was purely a misreported ending — the same class
+ * of bug as a cancelled preflight surfacing as a blocked verdict.
+ *
+ * Our own intent is the reliable signal, so it is checked first; the exitCode
+ * test stays for a kill that arrives from outside this process.
+ */
+function endedByCancel(outcome, cancelRequested) {
+  return cancelRequested === true || outcome.exitCode === null;
+}
+
+/** How a cancelled run describes itself — exit codes are noise once cancelled. */
+function cancelDetail(outcome, cancelRequested) {
+  if (cancelRequested === true) return "cancelled — pnpm was terminated and the profile was restored";
+  return outcome.signal ? `signal: ${outcome.signal}` : "killed before exit";
+}
+
 /** Mirrors guard.js pendingPath(): <home>/guard/pending-<profile>.json. */
 function pendingMarkerPath(profileDir) {
   return join(dirname(dirname(profileDir)), "guard", `pending-${basename(profileDir)}.json`);
@@ -1718,6 +1752,7 @@ function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, pref
   }
 
   let current = undefined;
+  let cancelRequested = false; // see endedByCancel: exit codes cannot tell us this on Windows
   let pnpmSelfHealed = false;
   const plan = _spawn === undefined ? pnpmSpawnPlan() : { command: "pnpm", shell: false, treeKill: false };
   const spawnImpl = _spawn ?? spawn;
@@ -1809,9 +1844,9 @@ function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, pref
         : `could not start pnpm: ${outcome.spawnError.message}`;
       return { status: "failed", detail: hint };
     }
-    if (outcome.exitCode === null) {
+    if (endedByCancel(outcome, cancelRequested)) {
       restoreOriginalWorkspace();
-      return { status: "killed", detail: outcome.signal ? `signal: ${outcome.signal}` : "killed before exit" };
+      return { status: "killed", detail: cancelDetail(outcome, cancelRequested) };
     }
     const log = collected.join("");
     const ignored = parseIgnoredBuilds(log);
@@ -1898,8 +1933,8 @@ function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, pref
     if (retryOutcome.spawnError !== undefined) {
       return { status: "failed", detail: `retry could not start pnpm: ${retryOutcome.spawnError.message}` };
     }
-    if (retryOutcome.exitCode === null) {
-      return { status: "killed", detail: retryOutcome.signal ? `signal: ${retryOutcome.signal}` : "killed before exit" };
+    if (endedByCancel(retryOutcome, cancelRequested)) {
+      return { status: "killed", detail: cancelDetail(retryOutcome, cancelRequested) };
     }
     if (retryOutcome.exitCode === 0) {
       return tryFinalize();
@@ -1978,6 +2013,7 @@ function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, pref
 
   return {
     cancel: () => {
+      cancelRequested = true; // record intent BEFORE the kill — the exit code will not carry it
       cancelSpawned(current);
     },
     done,
@@ -2060,6 +2096,7 @@ function runRemoveInner({ profile, packageName, _profileDir, _spawn }, selfHeale
     deltaQueue.push(text);
   };
   let current = undefined;
+  let cancelRequested = false; // see endedByCancel: exit codes cannot tell us this on Windows
 
   // Snapshot + pending marker, exactly as an install does.
   //
@@ -2152,9 +2189,9 @@ function runRemoveInner({ profile, packageName, _profileDir, _spawn }, selfHeale
         : `could not start pnpm: ${outcome.spawnError.message}`;
       return rollbackRemove(hint);
     }
-    if (outcome.exitCode === null) {
+    if (endedByCancel(outcome, cancelRequested)) {
       // 取消也要还原：pnpm 可能已经删掉了 node_modules 里的目录。
-      const killed = rollbackRemove(outcome.signal ? `signal: ${outcome.signal}` : "killed before exit");
+      const killed = rollbackRemove(cancelDetail(outcome, cancelRequested));
       return { ...killed, status: "killed" };
     }
     if (outcome.exitCode !== 0) {
@@ -2192,6 +2229,7 @@ function runRemoveInner({ profile, packageName, _profileDir, _spawn }, selfHeale
 
   return {
     cancel: () => {
+      cancelRequested = true; // record intent BEFORE the kill — the exit code will not carry it
       cancelSpawned(current);
     },
     done,
@@ -2410,16 +2448,32 @@ function runNeutralizeFixtures() {
 // profile, pnpm, or network is involved.
 
 /** Minimal fake ChildProcess: stdout/stderr emitters, kill(), manual finish. */
+/**
+ * `killAs` picks which platform's cancellation this fake reproduces.
+ *
+ * It used to hard-code the POSIX one — close(null, "SIGTERM") — and that is
+ * precisely why the "取消在途 install → killed" fixture stayed green while
+ * the real Windows path reported `failed (exit code 1)`: the fake was written
+ * from the code's assumption instead of from what the OS does. On Windows the
+ * shell-wrapped pnpm is terminated by `taskkill /T /F`, not signalled, and
+ * Node reports close(1, null). Both dialects are now pinned.
+ */
 class FakeProc extends EventEmitter {
-  constructor() {
+  constructor(killAs = "posix") {
     super();
     this.stdout = new EventEmitter();
     this.stderr = new EventEmitter();
     this.pid = 424242;
     this.signalCode = null;
+    this.killAs = killAs;
   }
   kill() {
     queueMicrotask(() => {
+      if (this.killAs === "win32") {
+        // taskkill /T /F: terminated, never signalled — an ordinary nonzero exit.
+        this.emit("close", 1, null);
+        return;
+      }
       this.signalCode = "SIGTERM";
       this.emit("close", null, "SIGTERM");
     });
@@ -2450,10 +2504,10 @@ function scriptedSpawn(steps) {
 }
 
 /** Spawn fake whose procs stay alive until the test finishes them. */
-function blockingSpawn() {
+function blockingSpawn(killAs = "posix") {
   const procs = [];
   const spawnFn = () => {
-    const proc = new FakeProc();
+    const proc = new FakeProc(killAs);
     procs.push(proc);
     return proc;
   };
@@ -3309,11 +3363,12 @@ async function runTransactionFixtures() {
 
   // 3b-6. 在途取消：必须等进程真正退出后才回滚，否则会与还在写盘的 pnpm 抢。
   // 安装路径早有这条，卸载路径此前没有。
-  {
-    const { profileDir, cleanup } = makeTempProfile("remove-cancel-inflight", { "pkg-g": "1.0.0" });
+  // 两种终止方言都跑，理由同 install 侧的 4b。
+  for (const killAs of ["posix", "win32"]) {
+    const { profileDir, cleanup } = makeTempProfile(`remove-cancel-inflight-${killAs}`, { "pkg-g": "1.0.0" });
     try {
       materializeFakePackage(profileDir, "pkg-g", "1.0.0");
-      const { spawnFn, procs } = blockingSpawn();
+      const { spawnFn, procs } = blockingSpawn(killAs);
       const producer = runRemove({ profile: "p", packageName: "pkg-g", _profileDir: profileDir, _spawn: spawnFn });
       await flush();
       // 与 install 的取消用例同规格：spawn 起来了、marker 已登记，取消之后
@@ -3324,12 +3379,17 @@ async function runTransactionFixtures() {
       producer.cancel();
       const outcome = await producer.done;
       check(
-        "取消在途 remove → killed + 回滚收 marker，包仍在盘上",
+        `取消在途 remove（${killAs} 终止方言）→ killed + 回滚收 marker，包仍在盘上`,
         spawnedAndMarked
           && outcome.status === "killed"
           && !existsSync(pendingMarkerPath(profileDir))
           && existsSync(join(profileDir, "node_modules", "pkg-g")),
         `spawnedAndMarked=${spawnedAndMarked} status=${outcome.status} marker=${existsSync(pendingMarkerPath(profileDir))} detail=${JSON.stringify(outcome.detail)}`,
+      );
+      check(
+        `取消在途 remove（${killAs}）→ detail 不谎称 pnpm 失败`,
+        !/exit code/.test(outcome.detail ?? ""),
+        `detail=${outcome.detail}`,
       );
     } finally {
       cleanup();
@@ -3460,11 +3520,16 @@ async function runTransactionFixtures() {
 
   // 4b. 取消时序：cancel() → 进程 close → killed 结局 → 回滚收 marker，
   // 回滚严格发生在进程退出之后（done 链只在 'close' 后推进）。
-  {
-    const { profileDir, cleanup } = makeTempProfile("cancel-order");
+  //
+  // 两种平台方言都要跑。只跑 posix 的时候这条一直是绿的，而真实 Windows 上
+  // 用户按 job_kill 收到的是 `failed (exit code 1)`——taskkill /T /F 是终止
+  // 不是发信号，Node 报 close(1, null)，`exitCode === null` 判据落空。fixture
+  // 照着代码的假设写，就只能验证代码符合自己的假设。
+  for (const killAs of ["posix", "win32"]) {
+    const { profileDir, cleanup } = makeTempProfile(`cancel-order-${killAs}`);
     try {
       materializeFakePackage(profileDir, "pkg-a", "1.0.0");
-      const { spawnFn, procs } = blockingSpawn();
+      const { spawnFn, procs } = blockingSpawn(killAs);
       const install = runInstall({ profile: "p", spec: "pkg-a", preflight: preflightStub("pkg-a"), _profileDir: profileDir, _spawn: spawnFn });
       await flush();
       const spawnedAndMarked = procs.length === 1 && existsSync(pendingMarkerPath(profileDir));
@@ -3472,12 +3537,19 @@ async function runTransactionFixtures() {
       const outcome = await install.done;
       const output = (() => { let text = ""; let chunk = install.readOutput(); while (chunk.length > 0) { text += chunk; chunk = install.readOutput(); } return text; })();
       check(
-        "取消在途 install → killed + 回滚收 marker（在进程退出之后）",
+        `取消在途 install（${killAs} 终止方言）→ killed + 回滚收 marker（在进程退出之后）`,
         spawnedAndMarked
           && outcome.status === "killed"
           && !existsSync(pendingMarkerPath(profileDir))
           && /restored profile files/.test(output),
-        `status=${outcome.status} marker=${existsSync(pendingMarkerPath(profileDir))}`,
+        `status=${outcome.status} detail=${outcome.detail} marker=${existsSync(pendingMarkerPath(profileDir))}`,
+      );
+      // 取消的结局不许把 pnpm 的退出码当成失败原因报出去——模型读到
+      // "failed (exit code 1)" 会去排查一个根本不存在的安装故障。
+      check(
+        `取消在途 install（${killAs}）→ detail 不谎称 pnpm 失败`,
+        !/exit code/.test(outcome.detail ?? ""),
+        `detail=${outcome.detail}`,
       );
     } finally {
       cleanup();
