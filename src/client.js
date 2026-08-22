@@ -499,10 +499,10 @@ window.__ModuleLoader__.load({
                 busy: props.approving === job.spec,
                 onApprove: function (names) {
                   // 不先 drop：旧条目由重试任务的 track(carryFromId) 原子接管
-                  // （撤条目 + 日志接续一拍完成）。先删的话，call("install")
-                  // 要走数秒（重试还会重跑一次隔离预检），面板会空白一段，
-                  // 「批准后任务消失、开始安装才冒出来」的割裂就是这么来的。
-                  // 等待期间按钮由 approving 态显示「继续中…」。
+                  // （撤条目 + 日志接续一拍完成）。install RPC 现在只做本地校验、
+                  // 立刻返回新 job id，但保留这个次序仍然是它最稳的形态——
+                  // 万一 RPC 失败，旧条目和日志还在。等待期间按钮由 approving
+                  // 态显示「继续中…」。
                   props.onApprove(job.spec, names, job.approvalToken, id);
                 },
                 onDismiss: function () { props.onDismiss(id); },

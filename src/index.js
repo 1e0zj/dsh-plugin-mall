@@ -1058,11 +1058,6 @@ export function createJobTracker({ producerFactory } = {}) {
       profile,
       spec,
       verb = "add",
-      allowBuildScripts,
-      approvedProof,
-      preflight,
-      profileDir,
-      acceptWarningsActive = false,
       surface = "browser",
       session,
       onSettled,
@@ -1071,11 +1066,15 @@ export function createJobTracker({ producerFactory } = {}) {
       const id = `market-${++trackerCounter}`;
       const kind = verb === "remove" ? "dsh-plugin-uninstall" : "dsh-plugin-install";
       const factory = startProducerFactory ?? producerFactory;
+      // install 必须带 producerFactory：createInstallJobProducer 是整条链
+      // （含审批 token 签发）的唯一所有者，tracker 不再自己拼 runInstall——
+      // 那条老路没有预检、没有 token 语义，只是历史上预检跑在 RPC 里时的
+      // 残余。remove 仍可直接起 runRemove。
       const producer = typeof factory === "function"
-        ? factory({ profile, spec, verb, allowBuildScripts, approvedProof, preflight, profileDir })
+        ? factory({ profile, spec, verb })
         : verb === "remove"
           ? runRemove({ profile, packageName: spec })
-          : runInstall({ profile, spec, allowBuildScripts, approvedProof, preflight });
+          : (() => { throw new Error("install jobs require a producerFactory — the preflight chain owns the producer, not the tracker"); })();
 
       const record = {
         id,
@@ -1110,25 +1109,13 @@ export function createJobTracker({ producerFactory } = {}) {
           record.staleOnRestart = outcome?.staleOnRestart === true;
           record.finishedAt = Date.now();
 
-          if (status === "completed") {
-            if (profileDir) invalidatePreflightFor(profileDir);
-            clearApprovalTokensFor(profile, spec);
-          } else if (outcome?.needsApproval && outcome.needsApproval.length > 0) {
-            clearApprovalTokensFor(profile, spec, { surface: record.surface, owner: record.session });
-            const token = issueApprovalToken({
-              profile,
-              profileDir,
-              spec,
-              preflightReport: preflight,
-              needsApproval: outcome.needsApproval,
-              proof: outcome.proof,
-              surface: record.surface,
-              owner: record.session,
-              acceptWarningsActive,
-            });
-            record.approvalToken = token;
-          } else {
-            clearApprovalTokensFor(profile, spec, { surface: record.surface, owner: record.session });
+          // 审批 token 由 producer 签发（createInstallJobProducer 是唯一签发
+          // 者：它手里才有预检报告与 profileDir，也才能把签发失败写进 detail
+          // 而不是顶掉结论）。tracker 只把 outcome 里带出来的 token 摘到
+          // record 上，供同 session 的快照下发——不签发、不清理，避免同一份
+          // 职责在两条路径上各写一份、再各自漂移。
+          if (typeof outcome?.approvalToken === "string" && outcome.approvalToken.length > 0) {
+            record.approvalToken = outcome.approvalToken;
           }
 
           try {
@@ -1384,13 +1371,12 @@ function preflightVerdictLog(report) {
 /**
  * Why this install must not proceed — or undefined when it may.
  *
- * Split out of enforcePreflight() because the two call sites need the verdict
- * in two different shapes. The browser RPC decides BEFORE any job exists, so
- * an exception is the right carrier: it aborts the request and becomes an
- * rpcFail. The agent tool now decides INSIDE the job, where an exception is
- * exactly the wrong carrier — a producer's `done` must never reject, and "the
- * preflight refused this candidate" is not an internal error but the job's
- * legitimate outcome, so it has to travel as text on a `failed` outcome.
+ * Both surfaces (agent tool and browser RPC) decide INSIDE the job, so the
+ * verdict travels as text on a `failed` outcome — a producer's `done` must
+ * never reject, and "the preflight refused this candidate" is not an internal
+ * error but the job's legitimate ending. It used to have an exception-shaped
+ * twin (enforcePreflight) for the browser, back when the browser decided
+ * before any job existed; that path is gone and so is the twin.
  */
 /**
  * The identity of ONE preflight verdict: which candidate, which profile state,
@@ -1438,22 +1424,9 @@ function preflightRefusal(report, acceptWarnings, label, { digestProvided, finge
 }
 
 /**
- * Enforce a preflight verdict for an install. Throws when a blocker exists, or
- * when there are only warnings and acceptWarnings is not true.
- */
-function enforcePreflight(report, acceptWarnings, label, consent) {
-  const refusal = preflightRefusal(report, acceptWarnings, label, consent);
-  if (refusal !== undefined) {
-    const error = new Error(refusal);
-    error.preflight = report;
-    throw error;
-  }
-}
-
-/**
- * The whole agent-side install — registry lookup, spec resolution, host-shadow
- * check, isolated preflight, approval-token consumption, verdict, and pnpm —
- * as ONE job producer.
+ * The whole install — registry lookup, spec resolution, host-shadow check,
+ * isolated preflight, approval-token consumption, verdict, and pnpm — as ONE
+ * job producer, for BOTH surfaces (agent tool and browser RPC).
  *
  * Why it all lives in here (issue #8): `ctx.jobs.start()` treats `run()` as a
  * synchronous start boundary, so anything awaited before that call happens
@@ -1492,7 +1465,12 @@ function createInstallJobProducer({
   reportDigest,
   allowBuildScripts,
   approvalToken,
-  agentOwner,
+  // 审批 token 的归属：agent 工具传 { surface: "agent", owner: <agent 标量
+  // id> }，浏览器 RPC 传 { surface: "browser", owner: <session> }。签发、
+  // 消费、清理都从这里走——producer 是审批 token 的唯一签发者，tracker 只
+  // 复制 outcome.approvalToken，不再自己签。
+  surface = "agent",
+  owner,
   npmRegistry = "",
   rawSources = [],
   profileExisted = true,
@@ -1545,11 +1523,11 @@ function createInstallJobProducer({
         spec,
         preflightReport: preflight.report,
         allowBuildScripts,
-        surface: "agent",
-        owner: agentOwner,
+        surface,
+        owner,
       });
       if (!consumeResult.valid) {
-        return { status: "failed", detail: `market_install: invalid approval token: ${consumeResult.reason}` };
+        return { status: "failed", detail: `invalid approval token: ${consumeResult.reason}` };
       }
       acceptWarnings = consumeResult.warningConsent;
       acceptWarningsActive = consumeResult.warningConsent;
@@ -1581,7 +1559,7 @@ function createInstallJobProducer({
       invalidatePreflightFor(preflight.profileDir);
       clearApprovalTokensFor(profile, spec);
     } else if (outcome?.needsApproval && outcome.needsApproval.length > 0) {
-      clearApprovalTokensFor(profile, spec, { surface: "agent", owner: agentOwner });
+      clearApprovalTokensFor(profile, spec, { surface, owner });
       try {
         const token = issueApprovalToken({
           profile,
@@ -1590,8 +1568,8 @@ function createInstallJobProducer({
           preflightReport: preflight.report,
           needsApproval: outcome.needsApproval,
           proof: outcome.proof,
-          surface: "agent",
-          owner: agentOwner,
+          surface,
+          owner,
           acceptWarningsActive,
         });
         outcome.approvalToken = token;
@@ -1601,10 +1579,10 @@ function createInstallJobProducer({
         // 里，抛出去就把 done 变成 rejected —— 官方明说 done 必须不 reject，
         // 而且那样一来「pnpm 拦下了安装脚本」这条真正的结论会被一条内部错误
         // 顶掉。改成写进 detail：结论照常送达，同时明说这次没法重试。
-        outcome.detail = `${outcome.detail ?? ""}\n\nNOTE: no approval token could be issued (${error?.message ?? String(error)}), so allowBuildScripts cannot be used to retry this run — start a fresh market_install instead.`;
+        outcome.detail = `${outcome.detail ?? ""}\n\nNOTE: no approval token could be issued (${error?.message ?? String(error)}), so allowBuildScripts cannot be used to retry this run — start a fresh install instead.`;
       }
     } else {
-      clearApprovalTokensFor(profile, spec, { surface: "agent", owner: agentOwner });
+      clearApprovalTokensFor(profile, spec, { surface, owner });
     }
     return outcome;
   })().catch((error) => {
@@ -1972,12 +1950,17 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
       } catch (error) {
         return rpcFail(error);
       }
-      const registry = await registryFor(profile, npmRegistry);
-      spec = await preferNpmSpec({ spec, registry, sources: rawSources });
+      // profile 名非法当场报错，与 market_uninstall / agent 工具一致——不是
+      // 一个注定失败的后台 job。顺带取「动手之前」的磁盘状态：producer 的
+      // 取消文案要靠它区分「profile 从未被动过」和「预检把不存在的 profile
+      // 建出来了」。
+      let installProfileDir;
+      let profileExisted = true;
       try {
-        await assertSafeToInstall({ spec, registry, sources: rawSources });
+        installProfileDir = resolveProfileDir(profile);
+        profileExisted = existsSync(join(installProfileDir, "package.json"));
       } catch (error) {
-        return rpcFail(error);
+        return rpcFail(new Error(`invalid profile: ${error.message}`));
       }
       const allowBuildScripts = Array.isArray(payload?.allowBuildScripts)
         ? payload.allowBuildScripts.map((name) => String(name))
@@ -1992,62 +1975,35 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
         return rpcFail(error);
       }
 
-      let preflight;
-      let acceptWarnings = false;
-      let acceptWarningsActive = false;
-      let approvedProof = undefined;
-      try {
-        preflight = await runPreflight({ profile, spec, registry, sources: rawSources });
-        if (approvalToken !== undefined) {
-          const consumeResult = consumeApprovalToken({
-            token: approvalToken,
-            profile,
-            profileDir: preflight.profileDir,
-            spec,
-            preflightReport: preflight.report,
-            allowBuildScripts,
-            surface: "browser",
-            owner: session,
-          });
-          if (!consumeResult.valid) {
-            return rpcFail(new Error(`invalid approval token: ${consumeResult.reason}`));
-          }
-          acceptWarnings = consumeResult.warningConsent;
-          acceptWarningsActive = consumeResult.warningConsent;
-          approvedProof = consumeResult.proof;
-        } else {
-          acceptWarnings = payload?.acceptWarnings === true;
-          acceptWarningsActive = acceptWarnings;
-        }
-        enforcePreflight(preflight.report, acceptWarnings, `install ${spec}`, {
-          digestProvided: payload?.acceptedReportDigest,
-          fingerprint: preflight.fingerprint,
-          consentBoundByToken: approvalToken !== undefined, // consume 已带报告摘要比对
-        });
-      } catch (error) {
-        return rpcFail(error);
-      }
-
-      pinPreflight(preflight.profileDir, spec);
-      try {
-        const jobId = tracker.start({
+      // 到这里为止只做本地、同步、必须在返回 job id 之前失败的检查——与
+      // market_install 的 execute() 同构。registry 解析、防抢注、宿主遮蔽
+      // 检查、预检（缓存/身份再校验）、token 消费、警告关卡与 pnpm 全部在
+      // producer 里跑：旧行为把整段 await 在 tracker.start 之前，用户点
+      // 「继续安装」后风险框立刻消失而任务条目几十秒不动，预检 TTL 一过还
+      // 会把隔离探装整个重跑一遍（那个洞已由结算即 pin 堵上，这里是根治）。
+      // 结论形态随之对齐 agent 路径：blocker/未确认警告不再让 RPC 报错，
+      // 而是作为 job 的 failed outcome 送达，日志里看得到原文。
+      const jobId = tracker.start({
+        profile,
+        spec,
+        surface: "browser",
+        session,
+        producerFactory: () => createInstallJobProducer({
           profile,
           spec,
+          acceptWarnings: payload?.acceptWarnings === true,
+          reportDigest: typeof payload?.acceptedReportDigest === "string" ? payload.acceptedReportDigest.trim() : undefined,
           allowBuildScripts,
-          approvedProof,
-          preflight: preflight.report,
-          profileDir: preflight.profileDir,
-          acceptWarningsActive,
+          approvalToken,
           surface: "browser",
-          session,
-          onSettled: (outcome) => {
-            if (outcome?.status === "completed") invalidatePreflightFor(preflight.profileDir);
-          },
-        });
-        return rpcOk({ jobId, profile, spec, preflight: { verdict: preflight.report.verdict, summary: preflight.report.summary } });
-      } catch (error) {
-        return rpcFail(error);
-      }
+          owner: session,
+          npmRegistry,
+          rawSources,
+          profileExisted,
+          profileDir: installProfileDir,
+        }),
+      });
+      return rpcOk({ jobId, profile, spec });
     }
     case "uninstall": {
       const profile = String(payload?.profile ?? defaultProfile).trim();
@@ -2078,7 +2034,6 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
           profile,
           spec: packageName,
           verb: "remove",
-          profileDir,
           surface: "browser",
           session,
           onSettled: (outcome) => {
@@ -2413,7 +2368,8 @@ export function apply(ctx, config = {}) {
           reportDigest: typeof args.reportDigest === "string" ? args.reportDigest.trim() : undefined,
           allowBuildScripts,
           approvalToken,
-          agentOwner,
+          surface: "agent",
+          owner: agentOwner,
           npmRegistry,
           rawSources,
           profileExisted,
@@ -2885,12 +2841,26 @@ export async function runSelfTests() {
     });
     check("跨 surface (agent vs browser) 消费审批 token 失败且被销毁", !crossSurfaceRes.valid && /surface mismatch/.test(crossSurfaceRes.reason));
 
-    // Tracker 隔离与 session 校验
+    // Tracker 隔离与 session 校验。
+    // 审批 token 由 producer 签发（createInstallJobProducer 是唯一签发者），
+    // tracker 只把 outcome.approvalToken 摘到 record 上——这里的假 producer
+    // 照真实流程先签好、挂在 outcome 里带出来。
     const trackerProof = proofFor("foo-script");
+    const trackerTok = issueApprovalToken({
+      profile: "web",
+      profileDir,
+      spec: "foo-script",
+      preflightReport: cleanPreflightReport,
+      needsApproval: disclosureFor(trackerProof),
+      proof: trackerProof,
+      surface: "browser",
+      owner: "session-alpha",
+    });
     let needsApprovalOutcome = {
       status: "needsApproval",
       needsApproval: disclosureFor(trackerProof),
       proof: trackerProof,
+      approvalToken: trackerTok,
     };
     const approvalProducer = {
       cancel: () => {},
@@ -2903,7 +2873,6 @@ export async function runSelfTests() {
     const sessionJobId = sessionTracker.start({
       profile: "web",
       spec: "foo-script",
-      profileDir,
       surface: "browser",
       session: "session-alpha",
     });
@@ -2913,7 +2882,8 @@ export async function runSelfTests() {
     check("不同 session 查询 job 时不会暴露 approvalToken", snapDiffSession.approvalToken === undefined);
 
     const snapSameSession = sessionTracker.get(sessionJobId, "session-alpha").snapshot;
-    check("相同 session 查询 job 时可获取 approvalToken", typeof snapSameSession.approvalToken === "string");
+    check("tracker 复制 producer 签发的 approvalToken（同 session 可见）",
+      snapSameSession.approvalToken === trackerTok);
 
     let cancelRefused = false;
     try {
@@ -3206,7 +3176,6 @@ export async function runSelfTests() {
     const jobId = tracker.start({
       profile: "fixture-profile",
       spec: "fail-pkg",
-      profileDir,
       onSettled: (outcome) => { settledOutcome = outcome; },
     });
     await new Promise((resolvePromise) => setImmediate(resolvePromise));
@@ -3538,6 +3507,45 @@ export async function runSelfTests() {
         preflightVerdictLog({ verdict: "safe" }) === "[dsh-plugin-mall] 预检结论：safe\n");
     }
 
+    // ── 12b3. 预检 job 全链路（startCustom → get）：日志行与 digest 真的
+    // 能走完 tracker 的整条路。只测 formatter 测不出「extras 序列化下发」
+    // 这一段——前端拿 digest 全靠它。
+    {
+      const integrationReport = {
+        verdict: "warning",
+        summary: "有需要确认的改动",
+        candidate: { name: "x", version: "1.0.0" },
+        issues: [{ severity: "warn", title: "替换整块 config", detail: "sandbox-policy" }],
+      };
+      const integrationTracker = createJobTracker();
+      const integrationId = integrationTracker.startCustom({
+        kind: "dsh-plugin-preflight",
+        label: "preflight x",
+        profile: "web",
+        spec: "x",
+        surface: "browser",
+        session: "sess-i",
+        run: async (push) => {
+          push("[dsh-plugin-mall] 预检 x：隔离目录探装（脚本禁用）\n");
+          push(preflightVerdictLog(integrationReport));
+          return {
+            status: "completed",
+            detail: `预检完成：${integrationReport.verdict}`,
+            extras: { ...integrationReport, consentDigest: preflightConsentDigest(integrationReport, "fp-i") },
+          };
+        },
+      });
+      await new Promise((resolvePromise) => setImmediate(resolvePromise));
+      const integrationDelta = integrationTracker.get(integrationId, "sess-i");
+      const integrationLog = integrationDelta.output ?? "";
+      check("预检 job 集成：结论与逐条 WARN 进快照输出",
+        /预检结论：warning/.test(integrationLog) && /\[WARN\] 替换整块 config: sandbox-policy/.test(integrationLog),
+        `output=${JSON.stringify(integrationLog)}`);
+      check("预检 job 集成：digest 随 extras 送达",
+        integrationDelta.snapshot?.extras?.consentDigest === preflightConsentDigest(integrationReport, "fp-i"),
+        `extras=${JSON.stringify(integrationDelta.snapshot?.extras)?.slice(0, 120)}`);
+    }
+
     // ── 13. market_install：整条链跑在 job 里（issue #8）────────────────────
     // 原来 registry 查询 → 防抢注解析 → 隔离预检全在 ctx.jobs.start() 之前 await，
     // 于是几十秒里没有 job id、没有日志、job_kill 够不着，而工具描述写的是
@@ -3722,6 +3730,48 @@ export async function runSelfTests() {
         //    再要求一份裸 digest 属于重复关卡。
         check("审批 token 路径不受裸 digest 关卡影响",
           preflightRefusal(consentReport, true, "lbl", { fingerprint: consentFingerprint, consentBoundByToken: true }) === undefined);
+      }
+
+      // 13a4. surface/owner 参数化：producer 是唯一签发者，浏览器 surface
+      // 签出的 token 必须归属那个 session——参数要是接错线（漏传、写死
+      // agent），token 会落在错误的归属域里，跨域消费的隔离就形同虚设。
+      {
+        const surfProof = proofFor("surf-pkg");
+        const surfOutcome = await settleWithin(createInstallJobProducer({
+          profile: "web",
+          spec: "surf-pkg",
+          surface: "browser",
+          owner: "session-surf",
+          ...seams({
+            _runPreflight: async () => ({ report: cleanReport, profileDir, fingerprint: "fp-surf" }),
+            _runInstall: () => ({
+              cancel: () => {},
+              done: Promise.resolve({
+                status: "needsApproval",
+                detail: "approval needed",
+                needsApproval: disclosureFor(surfProof),
+                proof: surfProof,
+              }),
+              readOutput: () => "",
+            }),
+          }),
+        }).done, 5000, "surface job");
+        const surfToken = surfOutcome?.approvalToken;
+        const surfConsume = typeof surfToken === "string"
+          ? consumeApprovalToken({
+            token: surfToken,
+            profile: "web",
+            profileDir,
+            spec: "surf-pkg",
+            preflightReport: cleanReport,
+            allowBuildScripts: ["surf-pkg"],
+            surface: "browser",
+            owner: "session-surf",
+          })
+          : { valid: false, reason: "no token" };
+        check("browser surface 的 producer 签发归属该 session 的 token",
+          surfConsume.valid === true,
+          `token=${typeof surfToken} reason=${surfConsume.reason}`);
       }
 
       // 13b. 预检通过 → 进入安装。同时钉两件事：pnpm 拿到的是防抢注解析后的

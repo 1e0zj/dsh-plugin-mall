@@ -112,7 +112,14 @@ jobs、RPC cancellation、Cordis lifecycle，以及 `module-graph` / `config-cat
   >    用户读完警告再决策基本必然超时，隔离探装整个重跑一遍；
   > ③ 前端 `setPreflight(null)` 在 RPC 之前执行，而 `installing[spec]` 唯一的
   >    显示位置就是那张卡片的「安装中…」，卡片一拆就没有任何反馈了。
-  > 只修 ① 三件会一起好转——重跑一旦进了 job，那几十秒就从黑箱变成实时日志。
+  >
+  > ✅ 已根治（fix/browser-install-job-boundary，2026-08-22）：`install` RPC
+  > 现在只做本地同步校验（spec、profile 名、审批参数）就返回 job id，registry
+  > 解析、防抢注、宿主遮蔽、预检、token 消费、警告关卡与 pnpm 全部在
+  > `createInstallJobProducer` 里——它成为两个 surface 共用的唯一 producer，
+  > 也是审批 token 的唯一签发者（tracker 只复制 `outcome.approvalToken`）。
+  > 预检 job 结算即 pin，确认后命中缓存不再重跑探装。②③ 随 ① 消失。
+  > 浏览器侧仍独立存在的缺口只有 #7（RPC 取消不传播，页面关掉 Host 照跑）。
 - Connection/RPC 与 `api-gateway.zh.md` 明确把 carrier `AbortSignal` 作为取消边界。
   当前 `/market` handler 收到了 `signal`，但 `rpcDispatch()` 不接收也不向搜索、验证、
   registry 查询或预检传递；浏览器关闭/切换/主动取消请求后，Host 仍会继续网络与 pnpm
