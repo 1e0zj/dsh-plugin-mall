@@ -17,6 +17,7 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -840,46 +841,128 @@ function disabledState(value) {
 const DSH_MCP_CLIENT_MODULE = "@deepseek-ai/dsh-mcp-client";
 // dshHomePath 只有作为 !!js 表达式才被 loader 求值成路径；!!js 在内存里是
 // { __jsExpr: source }。只认「恰好一个单字面量实参的调用」，其余形态
-// （拼接、三元、嵌套）求值前无从判断，一律不碰。
-const DSH_HOME_PATH_EXACT = /^dshHomePath\(\s*(['"])([^'"\\]*)\1\s*\)$/;
+// （拼接、三元、嵌套）求值前无从判断，一律不碰。实参里允许反斜杠
+// （Windows 写法，匹配后归一成 /）；引号排除——出现引号即不是这种形状。
+const DSH_HOME_PATH_EXACT = /^dshHomePath\(\s*(['"])([^'"]*)\1\s*\)$/;
+// 安装期 lifecycle 脚本：pnpm 的构建审批拦的就是这批，探装里它们没跑。
+const INSTALL_TIME_SCRIPT_RE = /^(?:pre|post)?install$|^prepare$|^prepublish$/;
+const RUNNABLE_ENTRY_RE = /\.(?:js|mjs|cjs)$/i;
 
-function mcpStartupFileIssues(mountedRows, candidateName, candidateDir, profileDir) {
+/** A plain file at the path (not a directory, not missing). */
+function isPlainFile(path) {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Match a row against the fatal shape; returns `{ pkgName, fileSegments }` or
+ * undefined. Pure — no filesystem access — so preflight and the post-install
+ * audit share one definition of what counts.
+ *
+ * Path handling notes (issue #14 review): the dshHomePath literal may use
+ * backslashes on Windows, so it is normalized to `/` before matching and the
+ * profile-name segment compares case-insensitively there; and existsSync is
+ * NOT entry resolution (`node src/guard` resolves to src/guard.js) — so only
+ * paths whose last segment carries a runnable extension (.js/.mjs/.cjs) are
+ * judged at all, and a target that exists but is not a plain file counts as
+ * missing.
+ */
+function fatalMcpEntry(row, profileName) {
+  if (row.name !== DSH_MCP_CLIENT_MODULE || row.state !== "enabled") return undefined;
+  const config = row.options?.config;
+  if (config === null || typeof config !== "object" || Array.isArray(config)) return undefined;
+  if (config.transport !== "stdio" || config.failOnStartupError !== true || config.command !== "node") return undefined;
+  const args = Array.isArray(config.args) ? config.args : [];
+  // 唯一参数才是入口。多个参数里混着 Node CLI 开关和业务路径（如
+  // --output dshHomePath('runtime/result.json')），逐一当入口查会把运行期
+  // 产物误判成缺失；不解析 Node CLI，多参行一律不判。
+  if (args.length !== 1 || !isJsExpr(args[0])) return undefined;
+  const call = DSH_HOME_PATH_EXACT.exec(String(args[0].__jsExpr ?? ""));
+  if (call === null) return undefined;
+  const segments = call[2].replaceAll("\\", "/").split("/");
+  const fold = process.platform === "win32" ? (value) => value.toLowerCase() : (value) => value;
+  if (segments.length < 5) return undefined;
+  if (fold(segments[0]) !== "profiles" || fold(segments[1]) !== fold(profileName) || segments[2] !== "node_modules") return undefined;
+  const rest = segments.slice(3);
+  const pkgName = rest[0]?.startsWith("@") === true && rest.length > 1 ? `${rest[0]}/${rest[1]}` : rest[0];
+  if (typeof pkgName !== "string" || pkgName.length === 0 || !NPM_PACKAGE_NAME_RE.test(pkgName)) return undefined;
+  const fileSegments = rest.slice(pkgName.split("/").length);
+  if (fileSegments.length === 0 || fileSegments.some((part) => part.length === 0 || part === "." || part === "..")) return undefined;
+  if (!RUNNABLE_ENTRY_RE.test(fileSegments[fileSegments.length - 1])) return undefined;
+  return { pkgName, fileSegments };
+}
+
+function mcpStartupFileIssues(mountedRows, candidateManifest, candidateName, candidateDir, profileDir) {
   if (candidateName.length === 0 || typeof candidateDir !== "string") return [];
   const profileName = basename(profileDir);
-  const modulesPrefix = `profiles/${profileName}/node_modules/`;
-  const candidatePrefix = `${candidateName}/`;
+  const hasInstallScripts = Object.keys(candidateManifest?.scripts ?? {}).some((name) => INSTALL_TIME_SCRIPT_RE.test(name));
   const issues = [];
   for (const row of mountedRows) {
-    if (row.name !== DSH_MCP_CLIENT_MODULE || row.state !== "enabled") continue;
-    const config = row.options?.config;
-    if (config === null || typeof config !== "object" || Array.isArray(config)) continue;
-    if (config.transport !== "stdio" || config.failOnStartupError !== true || config.command !== "node") continue;
-    const args = Array.isArray(config.args) ? config.args : [];
-    for (const arg of args) {
-      if (!isJsExpr(arg)) continue;
-      const call = DSH_HOME_PATH_EXACT.exec(String(arg.__jsExpr ?? ""));
-      if (call === null) continue; // 不是精确的单字面量调用：求值前无从判断
-      const rel = call[2];
-      if (!rel.startsWith(modulesPrefix)) continue; // 指向别的 profile：越界不管
-      const underModules = rel.slice(modulesPrefix.length);
-      if (!underModules.startsWith(candidatePrefix)) continue; // 指向别的包：探针树里没有，判不了
-      const fileRel = underModules.slice(candidatePrefix.length);
-      const segments = fileRel.split("/");
-      if (segments.length === 0 || segments.some((part) => part.length === 0 || part === "." || part === "..")) continue;
-      if (!existsSync(join(candidateDir, ...segments))) {
-        issues.push(issue(
-          "block",
-          "mcp-entry-missing",
-          "安装会使 dsh 无法启动",
-          `行 ${row.id}（${DSH_MCP_CLIENT_MODULE}，stdio）设置了 failOnStartupError: true，并以 node 启动候选包内的 ${segments.join("/")}，但候选包里没有这个文件（未构建的源码安装的典型形态）。安装后 dsh 会在装配阶段因该行失败而直接退出。`,
-          { row: row.id, file: segments.join("/") },
-        ));
-      }
+    const fatal = fatalMcpEntry(row, profileName);
+    if (fatal === undefined || fatal.pkgName !== candidateName) continue; // 只判候选自己的包：探针树里只有它
+    if (isPlainFile(join(candidateDir, ...fatal.fileSegments))) continue;
+    const fileRel = fatal.fileSegments.join("/");
+    if (hasInstallScripts) {
+      // 探装禁了 lifecycle 脚本，正式安装可能在用户审批后执行它们并生成
+      // 入口——静态「必缺」在这里不成立；硬保证移到装后终检。
+      issues.push(issue(
+        "warn",
+        "mcp-entry-unverifiable",
+        "入口缺失，但候选带安装期脚本",
+        `行 ${row.id}（${DSH_MCP_CLIENT_MODULE}）设置了 failOnStartupError: true 并以 node 启动 ${fileRel}，探装（脚本禁用）里该文件不存在。候选声明了安装期脚本，入口可能要等脚本执行后才生成：预检不据此拦截，安装完成前会对照真树终检，仍缺失则回滚。`,
+        { row: row.id, file: fileRel },
+      ));
+    } else {
+      issues.push(issue(
+        "block",
+        "mcp-entry-missing",
+        "安装会使 dsh 无法启动",
+        `行 ${row.id}（${DSH_MCP_CLIENT_MODULE}，stdio）设置了 failOnStartupError: true，并以 node 启动候选包内的 ${fileRel}，但候选包里没有这个文件（未构建的源码安装的典型形态，且没有安装期脚本可能生成它）。安装后 dsh 会在装配阶段因该行失败而直接退出。`,
+        { row: row.id, file: fileRel },
+      ));
     }
   }
   return issues;
 }
 
+/**
+ * Post-install audit (issue #14): the REAL profile tree, at the moment a
+ * successful install is about to commit. Scripts that were going to run have
+ * run (or were never declared); if the fatal entry is still not a plain file,
+ * committing would leave a profile that cannot start. The caller treats any
+ * returned issue as install failure so the outer handler rolls back.
+ *
+ * Only rows whose entry points into THE CANDIDATE's own package are judged —
+ * other packages' rows are not this install's doing, and the audit is not the
+ * place to condemn pre-existing profile state.
+ */
+export function mcpEntryAuditForInstall({ profileDir, candidateName }) {
+  if (typeof candidateName !== "string" || candidateName.length === 0 || typeof profileDir !== "string") return [];
+  let current;
+  try {
+    current = installedProfile(profileDir, []);
+  } catch {
+    return []; // unreadable profile is somebody else's error to report
+  }
+  const profileName = basename(profileDir);
+  const issues = [];
+  for (const row of current.composedRows) {
+    const fatal = fatalMcpEntry(row, profileName);
+    if (fatal === undefined || fatal.pkgName !== candidateName) continue;
+    if (isPlainFile(join(profileDir, "node_modules", ...fatal.pkgName.split("/"), ...fatal.fileSegments))) continue;
+    issues.push(issue(
+      "block",
+      "mcp-entry-missing",
+      "安装完成但入口仍缺失",
+      `行 ${row.id}（${DSH_MCP_CLIENT_MODULE}）以 failOnStartupError: true 启动 ${fatal.fileSegments.join("/")}，安装完成后该文件仍不存在——提交这个 profile 会让 dsh 在装配阶段退出。`,
+      { row: row.id, file: fatal.fileSegments.join("/") },
+    ));
+  }
+  return issues;
+}
 /** How a pair of projected rows would mount together. */
 function bothMount(left, right) {
   const states = [left.state, right.state];
@@ -1380,8 +1463,10 @@ export function inspectCandidate({ profileDir, candidateManifestPath, spec }) {
   issues.push(...newConflictIssues(candidateName, current.composedRows, simulated.mounted));
   issues.push(...patchTargetIssues(candidateName, candidate.manifest, patch, current, simulated));
   // 落盘后的文件树检查只能在这里做：探针树里候选包已实体化，MCP 入口存不
-  // 存在是可判定的。浏览期扫描（inspectRemoteCandidate）没有文件树，不参与。
-  issues.push(...mcpStartupFileIssues(simulated.mounted, candidateName, candidate.dir, profileDir));
+  // 存在是可判定的（带安装期脚本的候选降为 warn，硬保证在装后终检——见
+  // mcpStartupFileIssues 的注释）。浏览期扫描（inspectRemoteCandidate）
+  // 没有文件树，不参与。
+  issues.push(...mcpStartupFileIssues(simulated.mounted, candidate.manifest, candidateName, candidate.dir, profileDir));
 
   // UI replacements historically predate exclusiveGroups.  Keep the
   // heuristic advisory-only to avoid blocking legitimate sidebar extensions.
@@ -3585,6 +3670,83 @@ async function selfTest() {
       const scopedRep = inspectCandidate({ profileDir: p, candidateManifestPath: join(scopedDir, "package.json"), spec: "@scope/mcp-pkg" });
       if (!scopedRep.issues.some((e) => e.code === "mcp-entry-missing")) throw new Error("scoped 候选的缺失入口必须检出");
       console.log("PASS MCP 入口：scoped 包路径 → 检出");
+
+      // 9) 多参数：唯一参数才是入口，业务路径不参与判定（review P1）。业务
+      //    路径故意用 .js 后缀——过得了扩展名闸门，钉的就是「唯一参数」这
+      //    条规则本身，不是被扩展名顺带挡住的。
+      const multiArg = inspect(candidate("multiarg", "mcp-brick", `
+- insert:
+    - id: mcp-x
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        command: node
+        args:
+          - server.js
+          - '--output'
+          - !!js dshHomePath('profiles/mcpcheck/node_modules/mcp-brick/runtime/out.js')
+        failOnStartupError: true
+`), "mcp-brick");
+      if (multiArg.issues.some((e) => e.code === "mcp-entry-missing" || e.code === "mcp-entry-unverifiable")) {
+        throw new Error("多参数行的业务路径不得当入口判");
+      }
+      console.log("PASS MCP 入口：多参数（业务路径）→ 不判");
+
+      // 10) 无扩展名入口：node 会做扩展名/目录解析，existsSync 不等价——不判。
+      const extless = inspect(candidate("extless", "mcp-brick", mcpInsert("dist/mcp/entry")), "mcp-brick");
+      if (extless.issues.some((e) => e.code === "mcp-entry-missing")) throw new Error("无扩展名路径不得判入口");
+      console.log("PASS MCP 入口：无扩展名 → 不判");
+
+      // 11) 路径存在但是目录（名字带 .js）：不是普通文件，按缺失论。
+      const dirDir = candidate("dir-entry", "mcp-brick", mcpInsert("dist/index.js"));
+      mkdirSync(join(dirDir, "dist", "index.js"), { recursive: true }); // 目录！
+      const dirEntry = inspect(dirDir, "mcp-brick");
+      if (!dirEntry.issues.some((e) => e.code === "mcp-entry-missing")) throw new Error("目录顶替入口文件必须 block");
+      console.log("PASS MCP 入口：路径是目录（非普通文件）→ block");
+
+      // 12) 候选带 postinstall + 入口缺失 → 降为 warn（装后终检把关），不 block。
+      const scriptedDir = candidate("scripted", "mcp-brick", mcpInsert("dist/mcp/index.js"));
+      writeFileSync(join(scriptedDir, "package.json"), JSON.stringify({ name: "mcp-brick", version: "1.0.0", scripts: { postinstall: "node build.js" }, dsh: { bundle: { patch: "./cordis.patch.yml" } } }));
+      const scripted = inspect(scriptedDir, "mcp-brick");
+      const unverifiable = scripted.issues.find((e) => e.code === "mcp-entry-unverifiable");
+      if (scripted.verdict !== "warning" || unverifiable === undefined || scripted.issues.some((e) => e.code === "mcp-entry-missing")) {
+        throw new Error(`带安装期脚本的候选应降为 warn（终检把关），实得 ${scripted.verdict}: ${JSON.stringify(scripted.issues.map((e) => e.code))}`);
+      }
+      console.log("PASS MCP 入口：候选带 postinstall → warn 不 block（终检把关）");
+
+      // 13) 反斜杠路径（Windows 写法）→ 归一后同样检出。
+      const backslash = inspect(candidate("backslash", "mcp-brick", `
+- insert:
+    - id: mcp-x
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        command: node
+        args:
+          - !!js dshHomePath('profiles\\mcpcheck\\node_modules\\mcp-brick\\dist\\none.js')
+        failOnStartupError: true
+`), "mcp-brick");
+      if (!backslash.issues.some((e) => e.code === "mcp-entry-missing")) {
+        throw new Error(`反斜杠路径应归一检出，实得 ${JSON.stringify(backslash.issues.map((e) => e.code))}`);
+      }
+      console.log("PASS MCP 入口：反斜杠路径归一 → 检出");
+
+      // 14) 装后终检：真树里入口仍缺 → issue；存在 → 空；别人的包 → 不判。
+      {
+        resetProfile();
+        writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: { "mcp-brick": "1.0.0" }, dsh: { profile: { bundles: ["mcp-brick"] } } }));
+        const installedCand = join(p, "node_modules", "mcp-brick");
+        mkdirSync(installedCand, { recursive: true });
+        writeFileSync(join(installedCand, "package.json"), JSON.stringify({ name: "mcp-brick", version: "1.0.0", dsh: { bundle: { patch: "./cordis.patch.yml" } } }));
+        writeFileSync(join(installedCand, "cordis.patch.yml"), mcpInsert("dist/mcp/index.js"));
+        const auditMissing = mcpEntryAuditForInstall({ profileDir: p, candidateName: "mcp-brick" });
+        if (auditMissing.length !== 1 || auditMissing[0].code !== "mcp-entry-missing") throw new Error("终检：入口缺失必须报");
+        mkdirSync(join(installedCand, "dist", "mcp"), { recursive: true });
+        writeFileSync(join(installedCand, "dist", "mcp", "index.js"), "");
+        if (mcpEntryAuditForInstall({ profileDir: p, candidateName: "mcp-brick" }).length !== 0) throw new Error("终检：入口存在不得报");
+        if (mcpEntryAuditForInstall({ profileDir: p, candidateName: "someone-else" }).length !== 0) throw new Error("终检：别人的包不归这次安装判");
+        console.log("PASS MCP 入口：装后终检（缺→报、有→过、他人包→不判）");
+      }
 
       resetProfile();
     }

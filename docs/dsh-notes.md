@@ -716,3 +716,20 @@ the observe-or-forward duty stated in tools.zh.md.
   配了 `#fff` 等浅色 fallback，暗色主题因此仍渲染白色卡片和控件。正确名称是
   `bg-layer-*` / `specific-input-major` 与 `state-warn-*`；代码块使用
   `--dsw-alias-markdown-code-block`，主操作使用 `button-info-*`。
+
+### 2026-08-22（补记，issue #14）：dsh-mcp-client 的 failOnStartupError 语义
+
+核对已装的 @deepseek-ai/dsh-mcp-client 源码（profiles/web 里随宿主分发的那份）：
+config.failOnStartupError: true 时，stdio transport 的初始连接或工具同步失败会拒绝
+插件激活——不是降级、不是跳过该工具，是 activate 抛错。行是在 loader 装配阶段应用
+的，所以这个抛错发生在宿主启动路径上：整个 dsh 进程退出。2026-08-22 的 managed-agents
+事故（bundle patch 插入的 MCP 行指向不存在的 dist 文件）就是这条路径的实测。
+
+推论（已进实现，guard.js fatalMcpEntry / mcpEntryAuditForInstall）：
+- 预检探装与正式安装有个结构性不对称：探装禁 lifecycle 脚本，正式安装经用户审批可以
+  执行。所以「入口文件缺失」对带安装期脚本的候选不是可静态判定的砖——预检只
+  warn，硬闸设在安装事务完成前（finalizeSuccess 里对照真树终检，缺了就 failed +
+  回滚）。无脚本的候选缺失即必砖，预检直接 block。
+- existsSync 不等价于 Node 入口解析（node src/guard 能跑、existsSync("src/guard")
+  是 false）。判定收窄到「末段带 .js/.mjs/.cjs 的普通文件」：无扩展名一律不判，
+  存在但非普通文件按缺失论。

@@ -16,7 +16,7 @@ import { createHash } from "node:crypto";
 import { dump, load } from "js-yaml";
 import { DEFAULT_PROFILE_BUNDLES, PROFILE_TEMPLATES, initProfile, resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
 import { describeBuildScripts, npmNameOf } from "./github.js";
-import { clearPendingApprovalPause, commitPendingSnapshot, createProfileSnapshot, describeRollbackRebuild, markPendingApprovalPause, markPendingSnapshot, pausedCandidateBeforeState, pendingApprovalPaused, pnpmGuardEnv, pnpmSpawnPlan, readValidatedPendingSnapshot, rollbackPendingSnapshot, validateInstalledProfile, validateRemoveCompletion } from "./guard.js";
+import { clearPendingApprovalPause, commitPendingSnapshot, createProfileSnapshot, describeRollbackRebuild, markPendingApprovalPause, markPendingSnapshot, mcpEntryAuditForInstall, pausedCandidateBeforeState, pendingApprovalPaused, pnpmGuardEnv, pnpmSpawnPlan, readValidatedPendingSnapshot, rollbackPendingSnapshot, validateInstalledProfile, validateRemoveCompletion } from "./guard.js";
 
 // ── spec normalization ──────────────────────────────────────────────────────
 
@@ -1811,6 +1811,15 @@ function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, pref
   /** Post-success accounting: reconcile bundles, register client rows, summarize. */
   const finalizeSuccess = () => {
     const bundles = reconcileBundles(profileDir, beforeDeps);
+    // 装后终检（issue #14）：预检的探装禁了 lifecycle 脚本，正式安装可能
+    // 在用户审批后执行了它们——入口是否真的产生，只有此刻这棵真树说了算
+    // （预检对带安装期脚本的候选只给了 warn）。此刻构建要么跑完要么本来
+    // 就没有，终检不过就按失败结算，外层回滚到装前快照。
+    const auditIssues = mcpEntryAuditForInstall({ profileDir, candidateName: preflight?.candidate?.name ?? npmNameOf(spec) });
+    if (auditIssues.length > 0) {
+      push(`\n[dsh-plugin-mall] ${auditIssues[0].title}: ${auditIssues[0].detail}\n`);
+      return { status: "failed", detail: `pnpm installed ${spec}, but ${auditIssues[0].title}: 行 ${auditIssues[0].row ?? auditIssues[0].extra?.row} 的入口 ${auditIssues[0].file ?? auditIssues[0].extra?.file} 仍缺失 — the profile has been rolled back to its pre-install state.` };
+    }
     const manifest = readManifest(profileDir);
     const currentDeps = new Set(Object.keys(manifest.dependencies ?? {}));
     const clientRows = [];
@@ -3662,6 +3671,66 @@ async function runTransactionFixtures() {
       );
     } finally {
       cleanup();
+    }
+  }
+
+  // 4c. 装后终检（issue #14）：预检的探装禁了 lifecycle 脚本，带安装期脚本
+  // 的候选入口要等构建后才可能出现——预检对它们只 warn，这里是硬闸。
+  // pnpm 成功、入口在真树里仍缺 → failed + 回滚（绝不提交一块砖）；
+  // 构建产出了入口 → completed。beforeExit 模拟 pnpm add 的落盘效果
+  // （node_modules 实体化 + manifest 依赖写入）。
+  {
+    const fatalPatch = `
+- insert:
+    - id: mcp-x
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        command: node
+        args:
+          - !!js dshHomePath('profiles/p/node_modules/mcp-brick-pkg/dist/mcp/index.js')
+        failOnStartupError: true
+`;
+    const materializeCandidate = (profileDir, withEntry) => {
+      const dir = join(profileDir, "node_modules", "mcp-brick-pkg");
+      mkdirSync(dir, { recursive: true });
+      if (withEntry) {
+        mkdirSync(join(dir, "dist", "mcp"), { recursive: true });
+        writeFileSync(join(dir, "dist", "mcp", "index.js"), "");
+      }
+      writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "mcp-brick-pkg", version: "1.0.0", scripts: { postinstall: "node build.js" }, dsh: { bundle: { patch: "./cordis.patch.yml" } } }));
+      writeFileSync(join(dir, "cordis.patch.yml"), fatalPatch);
+      const manifest = JSON.parse(readFileSync(join(profileDir, "package.json"), "utf8"));
+      manifest.dependencies = { ...(manifest.dependencies ?? {}), "mcp-brick-pkg": "1.0.0" };
+      writeFileSync(join(profileDir, "package.json"), JSON.stringify(manifest, undefined, 2) + "\n");
+    };
+    const runAuditInstall = (profileDir, withEntry) => {
+      const spawn = scriptedSpawn([{ code: 0, out: "Done in 1s\n", beforeExit: () => materializeCandidate(profileDir, withEntry) }]);
+      return runInstall({ profile: "p", spec: "mcp-brick-pkg", preflight: preflightStub("mcp-brick-pkg"), _profileDir: profileDir, _spawn: spawn.spawnFn, _describe: async () => [] }).done;
+    };
+
+    {
+      const { profileDir, cleanup } = makeTempProfile("audit-missing");
+      try {
+        const outcome = await runAuditInstall(profileDir, false);
+        const depGone = JSON.parse(readFileSync(join(profileDir, "package.json"), "utf8")).dependencies?.["mcp-brick-pkg"] === undefined;
+        check(
+          "装后终检：入口仍缺 → failed 且回滚（不提交砖）",
+          outcome.status === "failed" && /入口/.test(outcome.detail ?? "") && depGone && !existsSync(pendingMarkerPath(profileDir)),
+          `status=${outcome.status} detail=${(outcome.detail ?? "").slice(0, 120)}`,
+        );
+      } finally {
+        cleanup();
+      }
+    }
+    {
+      const { profileDir, cleanup } = makeTempProfile("audit-present");
+      try {
+        const outcome = await runAuditInstall(profileDir, true);
+        check("装后终检：构建产出了入口 → completed", outcome.status === "completed", `status=${outcome.status} detail=${(outcome.detail ?? "").slice(0, 120)}`);
+      } finally {
+        cleanup();
+      }
     }
   }
 
