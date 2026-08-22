@@ -77,7 +77,11 @@ async function requestJson(path, { apiBase, token, signal }) {
       body = await response.json();
     } catch (error) {
       if (error?.name === "AbortError" && signal?.aborted) throw error;
-      if (error?.name === "TimeoutError") {
+      // 读体超时只在成功响应上重试。4xx 的结论在读体之前就已确定
+      // （见上方契约：4xx 判定式失败，从不重试）——404 有 404 的报法、
+      // 403 限流有专用诊断，读不出 body 不改变任何一件事；重试三次
+      // 只会把正确答案换成一句超时。
+      if (error?.name === "TimeoutError" && response.ok) {
         lastError = new Error(`GitHub API response body timed out after ${REQUEST_TIMEOUT / 1000}s (attempt ${attempt + 1})`);
         continue;
       }
@@ -750,47 +754,78 @@ if (process.argv[1]?.endsWith("github.js") && process.argv.includes("--self-test
     }
     if (clampFailed > 0) process.exit(1);
   }
-  // requestJson 读体阶段取消：响应头已到、body 读到一半调用方断开（分段
-  // HTTP 稳定触发）。打桩 fetch——离线、确定性，只有 json() 抛 AbortError。
-  // 修复前这里是 .catch(() => undefined)：200 响应返回 undefined，search 拿
-  // 到 TypeError 而不是取消；4xx 则把取消谎报成 not found。
+  // requestJson 读体阶段的三种失败。打桩 fetch——离线、确定性；abort 在
+  // json() 内部发生（不是调用前预 abort），逼近「响应头已到、body 读一半
+  // 浏览器断开」的真实时序。
   {
     const realFetch = globalThis.fetch;
     const makeError = (name) => { const error = new Error("synthetic"); error.name = name; return error; };
-    globalThis.fetch = async () => ({
-      ok: true,
-      status: 200,
-      statusText: "OK",
-      headers: new Headers(),
-      json: async () => { throw makeError("AbortError"); },
+    const fakeResponse = ({ status, headers, json }) => ({
+      ok: status < 400,
+      status,
+      statusText: status === 404 ? "Not Found" : status === 403 ? "Forbidden" : "OK",
+      headers: headers ?? new Headers(),
+      json,
     });
-    let abortFailed = 0;
+    let failed = 0;
     try {
-      const controller = new AbortController();
-      controller.abort();
-      let threw;
-      try {
-        await requestJson("/repos/owner/repo", { signal: controller.signal });
-      } catch (error) { threw = error; }
-      if (threw?.name === "AbortError") console.log("  PASS 读体期间取消 → AbortError 上抛（不吞成 undefined）");
-      else { abortFailed++; console.log(`  FAIL 读体期间取消应抛 AbortError，实得 ${threw ? `${threw.name}: ${threw.message}` : "未抛（body 变 undefined）"}`); }
+      // 1) mid-body 取消：json() 里才 abort。修复前 .catch(()=>undefined)
+      //    把它吞掉——200 变 undefined（search 得 TypeError）、4xx 谎报 not found。
+      {
+        const controller = new AbortController();
+        let threw;
+        globalThis.fetch = async () => fakeResponse({
+          status: 200,
+          json: async () => { controller.abort(); throw makeError("AbortError"); },
+        });
+        try {
+          await requestJson("/repos/owner/repo", { signal: controller.signal });
+        } catch (error) { threw = error; }
+        if (threw?.name === "AbortError") console.log("  PASS 读体期间取消 → AbortError 上抛（不吞成 undefined）");
+        else { failed++; console.log(`  FAIL 读体期间取消应抛 AbortError，实得 ${threw ? `${threw.name}: ${threw.message}` : "未抛（body 变 undefined）"}`); }
+      }
 
-      // 内部超时打断读体 → 归类为一次失败尝试，退避重试（重试轮换成成功）。
-      let attempts = 0;
-      globalThis.fetch = async () => ({
-        ok: true,
-        status: 200,
-        statusText: "OK",
-        headers: new Headers(),
-        json: async () => { attempts++; if (attempts === 1) throw makeError("TimeoutError"); return { ok: true }; },
-      });
-      const retried = await requestJson("/repos/owner/repo", {});
-      if (retried?.ok === true && attempts === 2) console.log("  PASS 读体超时 → 记一次失败并重试成功");
-      else { abortFailed++; console.log(`  FAIL 读体超时应重试，实得 attempts=${attempts} result=${JSON.stringify(retried)}`); }
+      // 2) 成功响应的读体超时 → 记一次失败，退避重试（重试轮换成成功）。
+      {
+        let attempts = 0;
+        globalThis.fetch = async () => fakeResponse({
+          status: 200,
+          json: async () => { attempts++; if (attempts === 1) throw makeError("TimeoutError"); return { ok: true }; },
+        });
+        const retried = await requestJson("/repos/owner/repo", {});
+        if (retried?.ok === true && attempts === 2) console.log("  PASS 读体超时（200）→ 记一次失败并重试成功");
+        else { failed++; console.log(`  FAIL 读体超时（200）应重试一次，实得 attempts=${attempts} result=${JSON.stringify(retried)}`); }
+      }
+
+      // 3) 4xx 的结论在读体之前就已确定，读体超时绝不重试——重试只会把
+      //    正确的 404 换成一句超时。一次调用、报 404 的报法。
+      {
+        let calls = 0;
+        globalThis.fetch = async () => { calls++; return fakeResponse({ status: 404, json: async () => { throw makeError("TimeoutError"); } }); };
+        let threw;
+        try {
+          await requestJson("/repos/owner/absent", {});
+        } catch (error) { threw = error; }
+        if (calls === 1 && /GitHub API 404/.test(threw?.message ?? "")) console.log("  PASS 读体超时（404）→ 不重试，保留 404 结论");
+        else { failed++; console.log(`  FAIL 404+读体超时应一次调用报 404，实得 calls=${calls} error=${threw?.message}`); }
+      }
+
+      // 4) 403 限流同理：专用诊断靠响应头（不依赖 body），必须一次到位。
+      {
+        let calls = 0;
+        const limited = new Headers({ "x-ratelimit-remaining": "0", "x-ratelimit-reset": "4102444800" });
+        globalThis.fetch = async () => { calls++; return fakeResponse({ status: 403, headers: limited, json: async () => { throw makeError("TimeoutError"); } }); };
+        let threw;
+        try {
+          await requestJson("/search/repositories", {});
+        } catch (error) { threw = error; }
+        if (calls === 1 && /rate limit exceeded/.test(threw?.message ?? "")) console.log("  PASS 读体超时（403 限流）→ 不重试，保留限流诊断");
+        else { failed++; console.log(`  FAIL 403+读体超时应一次调用给限流诊断，实得 calls=${calls} error=${threw?.message}`); }
+      }
     } finally {
       globalThis.fetch = realFetch;
     }
-    if (abortFailed > 0) process.exit(1);
+    if (failed > 0) process.exit(1);
   }
   if (process.argv.includes("--offline")) process.exit(0);
   const apiBase = "https://api.github.com";
