@@ -727,13 +727,16 @@ config.failOnStartupError: true 时，stdio transport 的初始连接或工具�
 
 推论（已进实现，guard.js fatalMcpEntry / mcpEntryAuditForInstall）：
 - 预检探装与正式安装有个结构性不对称：探装禁构建，正式安装经用户审批可以执行。
-  「可能由构建生成入口」的判据不用自己发明——pnpm 自己的 requiresBuild 就是
-  权威清单（worker.js: pkgRequiresBuild + filesIncludeInstallScripts，逐字核对过
-  本机 pnpm 11.21.0 源码）：**manifest 声明 preinstall/install/postinstall/
-  prepublish/prepare 任一脚本，或包根有 binding.gyp，或 .hooks/ 下有任何文件**。
-  命中任一条的候选，入口缺失在预检只 warn（binding.gyp/.hooks 不需要任何
-  scripts 也算）；硬闸设在安装事务完成前（finalizeSuccess 里对照真树终检，
-  缺了就 failed + 回滚）。三类标记都不沾的候选，缺失即必砖，预检直接 block。
+  「可能由构建生成入口」的判据以 pnpm 的 requiresBuild 为基准（worker.js:
+  pkgRequiresBuild + filesIncludeInstallScripts，逐字核对过本机 pnpm 11.21.0
+  源码）：**manifest 声明 preinstall/install/postinstall 任一脚本，或包根有
+  binding.gyp，或 .hooks/ 下有任何文件**。guard 在此之上**额外**把
+  prepare/prepublish 也当作「可能构建」的保守信号——它们不在 pnpm 的原始
+  清单里，但同样可能在安装期产出文件；多出的这一档只会扩大 warn 车道，
+  绝不会扩大 block 车道。命中任一条的候选，入口缺失在预检只 warn
+  （binding.gyp/.hooks 不需要任何 scripts 也算）；硬闸设在安装事务完成前
+  （finalizeSuccess 里对照真树终检，缺了就 failed + 回滚）。这些标记都不沾
+  的候选，缺失即必砖，预检直接 block。
 - existsSync 不等价于 Node 入口解析（node src/guard 能跑、existsSync("src/guard")
   是 false）。判定收窄到「末段带 .js/.mjs/.cjs 的普通文件」：无扩展名一律不判，
   存在但非普通文件按缺失论。

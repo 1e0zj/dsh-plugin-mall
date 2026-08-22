@@ -849,15 +849,21 @@ const DSH_MCP_CLIENT_MODULE = "@deepseek-ai/dsh-mcp-client";
 // （拼接、三元、嵌套）求值前无从判断，一律不碰。实参里允许反斜杠
 // （Windows 写法，匹配后归一成 /）；引号排除——出现引号即不是这种形状。
 const DSH_HOME_PATH_EXACT = /^dshHomePath\(\s*(['"])([^'"]*)\1\s*\)$/;
-// 安装期 lifecycle 脚本：pnpm 的构建审批拦的就是这批，探装里它们没跑。
+// 安装期 lifecycle 脚本。pnpm 的 requiresBuild（worker.js: pkgRequiresBuild，
+// 11.21.0 逐字核对）实际只认 preinstall/install/postinstall；下面的
+// prepare/prepublish 是本守卫额外的保守信号——它们不在 pnpm 的清单里，
+// 但也绝非不可能在安装期产出文件，宁可多 warn 一次终检，不冒误杀风险。
 const INSTALL_TIME_SCRIPT_RE = /^(?:pre|post)?install$|^prepare$|^prepublish$/;
 const RUNNABLE_ENTRY_RE = /\.(?:js|mjs|cjs)$/i;
 
 /**
- * pnpm's own requiresBuild (worker.js: pkgRequiresBuild + filesIncludeInstallScripts):
- * install-time scripts OR a root binding.gyp OR anything under .hooks/. All
- * three mean the entry might only exist after an approved rebuild, so the
- * probe's missing file is not a verdict for such candidates.
+ * Whether the entry might only exist after a build pnpm would gate behind
+ * approval. Aligned with pnpm's own requiresBuild (worker.js:
+ * pkgRequiresBuild + filesIncludeInstallScripts, verified verbatim against
+ * 11.21.0): scripts preinstall/install/postinstall, a root binding.gyp, or
+ * anything under .hooks/. guard additionally treats prepare/prepublish as
+ * build-capable — a conservative addition of ours beyond pnpm's actual set,
+ * widening the warn lane, never narrowing the block lane.
  */
 function candidateMayBuildEntry(candidateManifest, candidateDir) {
   if (Object.keys(candidateManifest?.scripts ?? {}).some((name) => INSTALL_TIME_SCRIPT_RE.test(name))) return true;
