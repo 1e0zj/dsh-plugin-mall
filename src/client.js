@@ -28,6 +28,7 @@ window.__ModuleLoader__.load({
       ".mkt_btnDanger:hover:not(:disabled){border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary)}",
       ".mkt_btnSm{padding:3px 10px;font-size:12px}",
       ".mkt_error{color:var(--dsw-alias-state-error-primary);font-size:12px;line-height:18px}",
+      ".mkt_notice{border-left:3px solid var(--dsw-alias-state-error-primary);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-state-error-primary);padding:7px 10px;font-size:12px;line-height:18px;overflow-wrap:anywhere}",
       ".mkt_list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;align-items:stretch;min-width:0}",
       "@media (max-width:820px){.mkt_list{grid-template-columns:minmax(0,1fr)}}",
       ".mkt_listHead{grid-column:1/-1;font-size:12px;color:var(--dsw-alias-label-tertiary)}",
@@ -95,6 +96,11 @@ window.__ModuleLoader__.load({
       ".mkt_issueWarn{border-color:var(--dsw-alias-state-warn-primary)}",
       ".mkt_issueTitle{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary)}",
       ".mkt_issueDetail{font-size:12px;color:var(--dsw-alias-label-secondary);margin-top:4px;line-height:18px;overflow-wrap:anywhere}",
+      ".mkt_modalMask{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;padding:20px;background:var(--dsw-alias-bg-mask-3)}",
+      ".mkt_modal{width:min(420px,100%);max-height:min(520px,calc(100vh - 40px));display:flex;flex-direction:column;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-3);box-shadow:var(--dsw-shadow-lv3)}",
+      ".mkt_modalHead{padding:14px 16px 8px;font-size:15px;font-weight:600;color:var(--dsw-alias-label-primary)}",
+      ".mkt_modalBody{padding:0 16px 14px;font-size:12.5px;line-height:19px;color:var(--dsw-alias-label-secondary);overflow:auto}",
+      ".mkt_modalActions{display:flex;justify-content:flex-end;gap:8px;padding:10px 16px;border-top:1px solid var(--dsw-alias-border-l2)}",
     ].join("\n");
     var tagId = "@1e0zj/dsh-plugin-mall/market-tab.css";
     if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId) + "]") === null) {
@@ -381,6 +387,34 @@ window.__ModuleLoader__.load({
         h("div", { className: "mkt_decisionActions" }, props.actions));
     }
 
+    function ErrorNotice(props) {
+      if (!props.message) return null;
+      return h("div", { className: "mkt_notice", role: "alert" }, props.message);
+    }
+
+    function RestartDialog(props) {
+      useEffect(function () {
+        function onKeyDown(event) {
+          if (event.key === "Escape" && props.busy !== true) props.onCancel();
+        }
+        document.addEventListener("keydown", onKeyDown);
+        return function () { document.removeEventListener("keydown", onKeyDown); };
+      }, [props.busy, props.onCancel]);
+      return h("div", {
+        className: "mkt_modalMask",
+        onMouseDown: function (event) {
+          if (event.target === event.currentTarget && props.busy !== true) props.onCancel();
+        },
+      }, h("div", { className: "mkt_modal", role: "dialog", "aria-modal": "true", "aria-labelledby": "mkt-restart-title" },
+        h("div", { id: "mkt-restart-title", className: "mkt_modalHead" }, "重启 dsh"),
+        h("div", { className: "mkt_modalBody" }, props.activeCount > 0
+          ? "当前有 " + props.activeCount + " 个任务仍在进行。重启会中断这些任务，未完成的改动将由事务恢复逻辑处理。"
+          : "重启后，已经完成的插件安装、更新或卸载才会生效。"),
+        h("div", { className: "mkt_modalActions" },
+          h("button", { className: "mkt_btn", disabled: props.busy === true, autoFocus: true, onClick: props.onCancel }, "取消"),
+          h("button", { className: "mkt_btn mkt_btnPrimary", disabled: props.busy === true, onClick: props.onConfirm }, props.busy ? "重启中…" : "确认重启"))));
+    }
+
     // ── install-script approval ─────────────────────────────────────────────
     function ApprovalRequest(props) {
       var pkgs = props.needsApproval || [];
@@ -529,7 +563,7 @@ window.__ModuleLoader__.load({
     // ── jobs panel ──────────────────────────────────────────────────────────
     function JobsPanel(props) {
       var ids = Object.keys(props.jobs);
-      if (ids.length === 0) return null;
+      if (ids.length === 0 && !props.error) return null;
       var hasSettled = ids.some(function (id) {
         var job = props.jobs[id];
         var hasDecision = (props.preflight && props.preflight.jobId === id)
@@ -541,6 +575,7 @@ window.__ModuleLoader__.load({
           h("p", { className: "mkt_panelTitle" }, "任务"),
           props.onClear && hasSettled ? h("span", { className: "mkt_link", onClick: props.onClear }, "清空已结束") : null
         ),
+        h(ErrorNotice, { message: props.error }),
         ids.map(function (id) {
           var job = props.jobs[id];
           var done = job.status === "completed" || job.status === "failed" || job.status === "killed";
@@ -625,6 +660,7 @@ window.__ModuleLoader__.load({
           h("span", { className: "mkt_badge" }, count + " 个"),
           h("span", { className: "mkt_meta mkt_installedToggle" }, open ? "收起" : "展开")
         ),
+        h(ErrorNotice, { message: props.error }),
         installed.error
           ? h("div", { className: "mkt_error" }, installed.error)
           : !open ? null
@@ -681,6 +717,9 @@ window.__ModuleLoader__.load({
       var _error = useState(null);
       var error = _error[0];
       var setError = _error[1];
+      var reportError = useCallback(function (scope, value) {
+        setError({ scope: scope, message: errorText(value) });
+      }, []);
       var _installed = useState(null);
       var installed = _installed[0];
       var setInstalled = _installed[1];
@@ -722,6 +761,9 @@ window.__ModuleLoader__.load({
       var _restarting = useState(false);
       var restarting = _restarting[0];
       var setRestarting = _restarting[1];
+      var _restartConfirm = useState(false);
+      var restartConfirm = _restartConfirm[0];
+      var setRestartConfirm = _restartConfirm[1];
       // 本次宿主进程的启动时间（jobs 端点带回）：完成时间早于它的任务，
       // 其「重启 dsh 生效」按钮已经兑现，改显示「重启已生效」。
       var _hostStartedAt = useState(0);
@@ -791,11 +833,11 @@ window.__ModuleLoader__.load({
           setCompat({});
           verifyPage(value.items);
         }).catch(function (e) {
-          setError(errorText(e));
+          reportError("search", e);
         }).finally(function () {
           setLoading(false);
         });
-      }, [call, query, sort, verifyPage]);
+      }, [call, query, reportError, sort, verifyPage]);
 
       var canLoadMore = results !== null && results.items.length < results.total && !reachedLimit;
       var loadMoreLock = useRef(false);
@@ -821,13 +863,13 @@ window.__ModuleLoader__.load({
             return { total: value.total, items: merged };
           });
         }).catch(function (e) {
-          setError(errorText(e));
+          reportError("search", e);
           setRetryAt(Date.now() + 60000);
         }).finally(function () {
           loadMoreLock.current = false;
           setLoadingMore(false);
         });
-      }, [call, canLoadMore, loading, loadingMore, page, query, sort, retryAt, verifyPage]);
+      }, [call, canLoadMore, loading, loadingMore, page, query, reportError, sort, retryAt, verifyPage]);
 
       useEffect(function () {
         var node = sentinelRef.current;
@@ -852,7 +894,7 @@ window.__ModuleLoader__.load({
             return prev && !prev.error ? Object.assign({}, prev, { entries: value.entries }) : prev;
           });
         }).catch(function (e) {
-          setError(errorText(e));
+          reportError("installed", e);
         }).finally(function () {
           setToggling(function (prev) {
             var next = Object.assign({}, prev);
@@ -860,7 +902,7 @@ window.__ModuleLoader__.load({
             return next;
           });
         });
-      }, [call]);
+      }, [call, reportError]);
 
       var refreshInstalled = useCallback(function () {
         call("installed", {}).then(function (value) {
@@ -925,7 +967,7 @@ window.__ModuleLoader__.load({
           track(value.jobId, spec, carryFromId);
         }).catch(function (e) {
           delete approvalTokensRef.current[spec];
-          setError(errorText(e));
+          reportError("tasks", e);
         }).finally(function () {
           setInstalling(function (prev) {
             var next = Object.assign({}, prev);
@@ -933,7 +975,7 @@ window.__ModuleLoader__.load({
             return next;
           });
         });
-      }, [call, track]);
+      }, [call, reportError, track]);
 
       var doApprove = useCallback(function (spec, names, token, carryFromId) {
         var extra = { allowBuildScripts: names };
@@ -949,7 +991,7 @@ window.__ModuleLoader__.load({
       useEffect(function () {
         preflightHandlerRef.current = function (spec, report, jobId) {
           if (!report || !report.verdict) {
-            setError("预检没有返回结论，请重试");
+            reportError("tasks", "预检没有返回结论，请重试");
             return;
           }
           if (report.verdict === "safe") {
@@ -959,7 +1001,7 @@ window.__ModuleLoader__.load({
             setPreflight({ spec: spec, report: report, jobId: jobId });
           }
         };
-      }, [doRawInstall]);
+      }, [doRawInstall, reportError]);
 
       // 点安装 = 立刻起一个预检 job，面板马上有东西看、日志实时流。
       // 结论由轮询经 onPreflightSettled 交回上面的 handler，这里不等待。
@@ -969,18 +1011,15 @@ window.__ModuleLoader__.load({
         call("preflight", { spec: spec }).then(function (value) {
           track(value.jobId, value.spec || spec);
         }).catch(function (e) {
-          setError(errorText(e));
+          reportError("tasks", e);
         });
-      }, [call, track]);
+      }, [call, reportError, track]);
 
       var doInstall = useCallback(function (repo) {
         preflightAndInstall("github:" + repo);
       }, [preflightAndInstall]);
 
       var doRestart = useCallback(function () {
-        if (typeof window !== "undefined" && typeof window.confirm === "function") {
-          if (window.confirm("重启 dsh？正在进行的任务会中断。") !== true) return;
-        }
         clearRestartPing();
         setRestarting(true);
         setError(null);
@@ -998,7 +1037,7 @@ window.__ModuleLoader__.load({
             if (tries > 40) {
               clearRestartPing();
               setRestarting(false);
-              setError("2 分钟内未检测到 dsh 重启完成，请手动检查 dsh 状态后刷新页面。");
+              reportError("restart", "2 分钟内未检测到 dsh 重启完成，请手动检查 dsh 状态后刷新页面。");
               return;
             }
             // Prefer identity change over wall-clock ordering: NTP may move the
@@ -1021,9 +1060,9 @@ window.__ModuleLoader__.load({
           if (restartControlRef.current.mounted !== true) return;
           clearRestartPing();
           setRestarting(false);
-          setError(errorText(e));
+          reportError("restart", e);
         });
-      }, [call, clearRestartPing, hostStartedAt]);
+      }, [call, clearRestartPing, hostStartedAt, reportError]);
 
       var doUninstall = useCallback(function (name) {
         delete approvalTokensRef.current[name];
@@ -1035,7 +1074,7 @@ window.__ModuleLoader__.load({
         call("uninstall", { package: name }).then(function (value) {
           track(value.jobId, name);
         }).catch(function (e) {
-          setError(errorText(e));
+          reportError("installed", e);
         }).finally(function () {
           setRemoving(function (prev) {
             var next = Object.assign({}, prev);
@@ -1043,7 +1082,7 @@ window.__ModuleLoader__.load({
             return next;
           });
         });
-      }, [call, track]);
+      }, [call, reportError, track]);
 
       useEffect(function () {
         refreshInstalled();
@@ -1055,6 +1094,9 @@ window.__ModuleLoader__.load({
         return v !== undefined && (v.kind === "bundle" || v.kind === "client")
           && !(v.hostDeps !== undefined && v.hostDeps.length > 0);
       });
+      var activeJobCount = Object.keys(jobs).filter(function (id) {
+        return jobs[id] && isJobActive(jobs[id].status);
+      }).length;
       resultsRef.current = results;
       var verifyPending = results !== null && results.items.some(function (it) { return verified[it.fullName] === undefined; });
 
@@ -1077,12 +1119,12 @@ window.__ModuleLoader__.load({
             h("option", { value: "forks" }, "按 fork")
           ),
           h("button", { className: "mkt_btn mkt_btnPrimary", disabled: loading, onClick: doSearch }, loading ? "搜索中…" : "搜索"),
-          h("button", { className: "mkt_btn mkt_btnDanger", disabled: restarting, onClick: doRestart }, restarting ? "重启中…" : "重启 dsh"),
+          h("button", { className: "mkt_btn mkt_btnDanger", disabled: restarting, onClick: function () { setRestartConfirm(true); } }, restarting ? "重启中…" : "重启 dsh"),
           h("label", { className: "mkt_check" },
             h("input", { type: "checkbox", checked: verifiedOnly, onChange: function (e) { setVerifiedOnly(e.target.checked); } }),
             "只看已验证插件")
         ),
-        error ? h("div", { className: "mkt_error" }, error) : null,
+        h(ErrorNotice, { message: error && (error.scope === "search" || error.scope === "restart") ? error.message : null }),
         h(InstalledPanel, {
           installed: installed,
           removing: removing,
@@ -1092,9 +1134,11 @@ window.__ModuleLoader__.load({
           onToggle: doToggle,
           onUninstall: doUninstall,
           onInstallSpec: preflightAndInstall,
+          error: error && error.scope === "installed" ? error.message : null,
         }),
         h(JobsPanel, {
           jobs: jobs,
+          error: error && error.scope === "tasks" ? error.message : null,
           preflight: preflight,
           preflightBusy: preflight ? installing[preflight.spec] === true : false,
           onClear: function () {
@@ -1115,7 +1159,7 @@ window.__ModuleLoader__.load({
             setJobStatus(id, "stopping");
             call("jobCancel", { jobId: id }).catch(function (e) {
               setJobStatus(id, "running");
-              setError(errorText(e));
+              reportError("tasks", e);
             });
           },
           onApprove: doApprove,
@@ -1142,7 +1186,7 @@ window.__ModuleLoader__.load({
             dropJob(id);
           },
           onDrop: dropJob,
-          onRestart: doRestart,
+          onRestart: function () { setRestartConfirm(true); },
           restarting: restarting,
           hostStartedAt: hostStartedAt,
           approving: Object.keys(installing).filter(function (s) { return installing[s]; })[0],
@@ -1183,7 +1227,16 @@ window.__ModuleLoader__.load({
                   ? h("div", { className: "mkt_loadMore", ref: sentinelRef }, loadingMore ? "加载中…" : Date.now() < retryAt ? "GitHub 限流中，稍后再下滑加载" : "下滑加载更多")
                   : h("div", { className: "mkt_loadMore" }, reachedLimit ? "已达 GitHub 搜索上限（前 1000 个结果）" : "已显示全部 " + results.items.length + " 个")
               )
-        )
+        ),
+        restartConfirm ? h(RestartDialog, {
+          activeCount: activeJobCount,
+          busy: restarting,
+          onCancel: function () { setRestartConfirm(false); },
+          onConfirm: function () {
+            setRestartConfirm(false);
+            doRestart();
+          },
+        }) : null
       );
     }
 

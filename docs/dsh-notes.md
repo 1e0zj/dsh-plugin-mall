@@ -782,4 +782,6 @@ config.failOnStartupError: true 时，stdio transport 的初始连接或工具�
 2026-08-22 已先修生命周期，再整理任务 UI：Host 拒绝 dismiss 未结算记录，页面只清
 终态并为活动任务提供 Stop；`stopping` / `killed` 使用 warning。两类决策已归入对应
 job 并共用 DecisionPanel，失败直接显示 `detail`，日志保留终端列且失败自动展开。
-页面级 RPC 错误和原生重启确认仍是独立问题，不计入这次任务面板整理。
+后续独立整理了剩余反馈：RPC 错误按 `search` / `installed` / `tasks` / `restart`
+作用域就近显示为持久 `role=alert`，不再共用页面顶部裸红字；原生 `window.confirm`
+替换为跟随主题的重启对话框，取消按钮默认聚焦，遮罩与 Escape 均为无副作用关闭。
