@@ -1818,7 +1818,10 @@ function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, pref
     const auditIssues = mcpEntryAuditForInstall({ profileDir, candidateName: preflight?.candidate?.name ?? npmNameOf(spec) });
     if (auditIssues.length > 0) {
       push(`\n[dsh-plugin-mall] ${auditIssues[0].title}: ${auditIssues[0].detail}\n`);
-      return { status: "failed", detail: `pnpm installed ${spec}, but ${auditIssues[0].title}: 行 ${auditIssues[0].row ?? auditIssues[0].extra?.row} 的入口 ${auditIssues[0].file ?? auditIssues[0].extra?.file} 仍缺失 — the profile has been rolled back to its pre-install state.` };
+      // 只描述失败，不预言恢复：回滚此刻还没发生（在外层收尾里），成没成
+      // 由它自己的三态结论去说。在这里写「已回滚」，回滚失败时 detail 会
+      // 同时出现「已回滚」和「无法回滚」两句打架的话。
+      return { status: "failed", detail: `pnpm installed ${spec}, but ${auditIssues[0].title}: 行 ${auditIssues[0].row ?? auditIssues[0].extra?.row} 的入口 ${auditIssues[0].file ?? auditIssues[0].extra?.file} 仍缺失，安装按失败结算。` };
     }
     const manifest = readManifest(profileDir);
     const currentDeps = new Set(Object.keys(manifest.dependencies ?? {}));
@@ -3728,6 +3731,34 @@ async function runTransactionFixtures() {
       try {
         const outcome = await runAuditInstall(profileDir, true);
         check("装后终检：构建产出了入口 → completed", outcome.status === "completed", `status=${outcome.status} detail=${(outcome.detail ?? "").slice(0, 120)}`);
+      } finally {
+        cleanup();
+      }
+    }
+
+    // 终检失败 + 回滚做不成（marker 被外部抽掉）：detail 绝不能同时出现
+    // 「已回滚」和「无法回滚」——终检文案只说失败，恢复结论由外层三态拼。
+    {
+      const { profileDir, cleanup } = makeTempProfile("audit-rollback-fails");
+      try {
+        const spawn = scriptedSpawn([{
+          code: 0,
+          out: "Done in 1s\n",
+          beforeExit: () => {
+            materializeCandidate(profileDir, false);
+            rmSync(pendingMarkerPath(profileDir), { force: true }); // 抽掉还原目标
+          },
+        }]);
+        const outcome = await runInstall({ profile: "p", spec: "mcp-brick-pkg", preflight: preflightStub("mcp-brick-pkg"), _profileDir: profileDir, _spawn: spawn.spawnFn, _describe: async () => [] }).done;
+        const detail = outcome.detail ?? "";
+        check(
+          "终检失败 + 回滚失败 → 不预言恢复，failed 且指名 marker",
+          outcome.status === "failed"
+            && /仍缺失/.test(detail)
+            && /could NOT be restored|marker/.test(detail)
+            && !/has been rolled back/.test(detail),
+          `status=${outcome.status} detail=${detail.slice(0, 160)}`,
+        );
       } finally {
         cleanup();
       }

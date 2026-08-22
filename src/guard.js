@@ -825,18 +825,23 @@ function disabledState(value) {
  *     user patch that disables it, retargets args, or drops the fatal flag
  *     exempts it — and a candidate that overrides an EXISTING mcp row into
  *     this shape is caught just the same);
- *   - the arg is EXACTLY `!!js dshHomePath('<literal>')` — no concatenation,
- *     no ternary, nothing that needs evaluation;
+ *   - args has exactly one element — the entry — which is EXACTLY
+ *     `!!js dshHomePath('<literal>')`, no concatenation, no ternary;
  *   - the literal points INSIDE `profiles/<this profile>/node_modules/<the
  *     candidate's own package>/…` — other profiles and other packages are out
  *     of scope (the probe tree cannot verify them), and the remainder is
- *     clamped: no `..`, no backslash, no drive/absolute form.
+ *     clamped segment-wise;
+ *   - the last segment carries a runnable extension and resolves to a plain
+ *     file.
  *
- * Only then is the mapped file looked up in the isolated probe tree — where it
- * is already absent for an unbuilt source install — and a miss is a block:
- * that candidate, installed, makes dsh exit during loader assembly. The
- * browsing-time scan cannot run this (no file tree); this is install-preflight
- * only.
+ * A miss in the isolated probe tree is a BLOCK only when nothing could have
+ * built the entry later: no install-time scripts, no binding.gyp, no .hooks/
+ * (pnpm's requiresBuild treats all three as build-capable — verified against
+ * its worker.js source, see docs/dsh-notes.md). A build-capable candidate
+ * downgrades to a WARNING here because the probe disables lifecycle scripts
+ * while a real install may run them after approval; the hard gate for that
+ * case is mcpEntryAuditForInstall at finalize time. The browsing-time scan
+ * cannot run any of this (no file tree); this is install-preflight only.
  */
 const DSH_MCP_CLIENT_MODULE = "@deepseek-ai/dsh-mcp-client";
 // dshHomePath 只有作为 !!js 表达式才被 loader 求值成路径；!!js 在内存里是
@@ -847,6 +852,23 @@ const DSH_HOME_PATH_EXACT = /^dshHomePath\(\s*(['"])([^'"]*)\1\s*\)$/;
 // 安装期 lifecycle 脚本：pnpm 的构建审批拦的就是这批，探装里它们没跑。
 const INSTALL_TIME_SCRIPT_RE = /^(?:pre|post)?install$|^prepare$|^prepublish$/;
 const RUNNABLE_ENTRY_RE = /\.(?:js|mjs|cjs)$/i;
+
+/**
+ * pnpm's own requiresBuild (worker.js: pkgRequiresBuild + filesIncludeInstallScripts):
+ * install-time scripts OR a root binding.gyp OR anything under .hooks/. All
+ * three mean the entry might only exist after an approved rebuild, so the
+ * probe's missing file is not a verdict for such candidates.
+ */
+function candidateMayBuildEntry(candidateManifest, candidateDir) {
+  if (Object.keys(candidateManifest?.scripts ?? {}).some((name) => INSTALL_TIME_SCRIPT_RE.test(name))) return true;
+  if (typeof candidateDir !== "string") return false;
+  if (isPlainFile(join(candidateDir, "binding.gyp"))) return true;
+  try {
+    return readdirSync(join(candidateDir, ".hooks")).length > 0;
+  } catch {
+    return false;
+  }
+}
 
 /** A plain file at the path (not a directory, not missing). */
 function isPlainFile(path) {
@@ -882,10 +904,31 @@ function fatalMcpEntry(row, profileName) {
   if (args.length !== 1 || !isJsExpr(args[0])) return undefined;
   const call = DSH_HOME_PATH_EXACT.exec(String(args[0].__jsExpr ?? ""));
   if (call === null) return undefined;
-  const segments = call[2].replaceAll("\\", "/").split("/");
+  // JS 字符串字面量里的 Windows 分隔符写作 \\（求值后是单个 \）；单独的 \
+  // 是转义序列（\w 之类），求值结果无法静态确定——含未成对反斜杠的形态
+  // 一律不判。成对的 \\ 直接折成 /。
+  const rawLiteral = call[2];
+  let soloBackslash = false;
+  const normalized = [];
+  for (let i = 0; i < rawLiteral.length; i++) {
+    const ch = rawLiteral[i];
+    if (ch === "\\") {
+      if (rawLiteral[i + 1] === "\\") {
+        normalized.push("/");
+        i++;
+      } else {
+        soloBackslash = true;
+        break;
+      }
+    } else {
+      normalized.push(ch);
+    }
+  }
+  if (soloBackslash) return undefined;
+  const segments = normalized.join("").split("/");
   const fold = process.platform === "win32" ? (value) => value.toLowerCase() : (value) => value;
   if (segments.length < 5) return undefined;
-  if (fold(segments[0]) !== "profiles" || fold(segments[1]) !== fold(profileName) || segments[2] !== "node_modules") return undefined;
+  if (fold(segments[0]) !== "profiles" || fold(segments[1]) !== fold(profileName) || fold(segments[2]) !== "node_modules") return undefined;
   const rest = segments.slice(3);
   const pkgName = rest[0]?.startsWith("@") === true && rest.length > 1 ? `${rest[0]}/${rest[1]}` : rest[0];
   if (typeof pkgName !== "string" || pkgName.length === 0 || !NPM_PACKAGE_NAME_RE.test(pkgName)) return undefined;
@@ -898,7 +941,7 @@ function fatalMcpEntry(row, profileName) {
 function mcpStartupFileIssues(mountedRows, candidateManifest, candidateName, candidateDir, profileDir) {
   if (candidateName.length === 0 || typeof candidateDir !== "string") return [];
   const profileName = basename(profileDir);
-  const hasInstallScripts = Object.keys(candidateManifest?.scripts ?? {}).some((name) => INSTALL_TIME_SCRIPT_RE.test(name));
+  const hasInstallScripts = candidateMayBuildEntry(candidateManifest, candidateDir);
   const issues = [];
   for (const row of mountedRows) {
     const fatal = fatalMcpEntry(row, profileName);
@@ -911,8 +954,8 @@ function mcpStartupFileIssues(mountedRows, candidateManifest, candidateName, can
       issues.push(issue(
         "warn",
         "mcp-entry-unverifiable",
-        "入口缺失，但候选带安装期脚本",
-        `行 ${row.id}（${DSH_MCP_CLIENT_MODULE}）设置了 failOnStartupError: true 并以 node 启动 ${fileRel}，探装（脚本禁用）里该文件不存在。候选声明了安装期脚本，入口可能要等脚本执行后才生成：预检不据此拦截，安装完成前会对照真树终检，仍缺失则回滚。`,
+        "入口缺失，但候选可能在构建后才生成它",
+        `行 ${row.id}（${DSH_MCP_CLIENT_MODULE}）设置了 failOnStartupError: true 并以 node 启动 ${fileRel}，探装（脚本禁用）里该文件不存在。候选带安装期脚本或构建清单（binding.gyp / .hooks），入口可能要等构建执行后才生成：预检不据此拦截，安装完成前会对照真树终检，仍缺失则回滚。`,
         { row: row.id, file: fileRel },
       ));
     } else {
@@ -3714,8 +3757,25 @@ async function selfTest() {
       }
       console.log("PASS MCP 入口：候选带 postinstall → warn 不 block（终检把关）");
 
-      // 13) 反斜杠路径（Windows 写法）→ 归一后同样检出。
+      // 13) 反斜杠路径：JS 字面量里的真实写法是 \\（求值后单个 \）——归一
+      //     后同样检出。单个不成对的 \ 是转义序列（\w 之类），求值结果无
+      //     从静态确定，不判。
       const backslash = inspect(candidate("backslash", "mcp-brick", `
+- insert:
+    - id: mcp-x
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        command: node
+        args:
+          - !!js dshHomePath('profiles\\\\mcpcheck\\\\node_modules\\\\mcp-brick\\\\dist\\\\none.js')
+        failOnStartupError: true
+`), "mcp-brick");
+      if (!backslash.issues.some((e) => e.code === "mcp-entry-missing")) {
+        throw new Error(`反斜杠路径（\\\\ 形式）应归一检出，实得 ${JSON.stringify(backslash.issues.map((e) => e.code))}`);
+      }
+      console.log("PASS MCP 入口：反斜杠路径（\\\\ 形式）归一 → 检出");
+      const soloBackslash = inspect(candidate("solo-backslash", "mcp-brick", `
 - insert:
     - id: mcp-x
       name: '@deepseek-ai/dsh-mcp-client'
@@ -3726,10 +3786,20 @@ async function selfTest() {
           - !!js dshHomePath('profiles\\mcpcheck\\node_modules\\mcp-brick\\dist\\none.js')
         failOnStartupError: true
 `), "mcp-brick");
-      if (!backslash.issues.some((e) => e.code === "mcp-entry-missing")) {
-        throw new Error(`反斜杠路径应归一检出，实得 ${JSON.stringify(backslash.issues.map((e) => e.code))}`);
+      if (soloBackslash.issues.some((e) => e.code === "mcp-entry-missing" || e.code === "mcp-entry-unverifiable")) {
+        throw new Error("不成对的单个反斜杠（转义序列）不得判");
       }
-      console.log("PASS MCP 入口：反斜杠路径归一 → 检出");
+      console.log("PASS MCP 入口：单个反斜杠（转义序列）→ 不判");
+
+      // 13b) binding.gyp（无任何 scripts）：pnpm 的 requiresBuild 同样视为
+      //      需构建——入口可能由 node-gyp 链路产出，静态只 warn。
+      const gypDir = candidate("gyp", "mcp-brick", mcpInsert("dist/mcp/index.js"));
+      writeFileSync(join(gypDir, "binding.gyp"), "{}\n");
+      const gyp = inspect(gypDir, "mcp-brick");
+      if (!gyp.issues.some((e) => e.code === "mcp-entry-unverifiable") || gyp.issues.some((e) => e.code === "mcp-entry-missing")) {
+        throw new Error(`binding.gyp 候选应降为 warn，实得 ${gyp.verdict}: ${JSON.stringify(gyp.issues.map((e) => e.code))}`);
+      }
+      console.log("PASS MCP 入口：binding.gyp（无 scripts）→ warn 不 block");
 
       // 14) 装后终检：真树里入口仍缺 → issue；存在 → 空；别人的包 → 不判。
       {
