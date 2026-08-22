@@ -697,3 +697,22 @@ The data layer (`github.js`: `requestJson` / `npmPackageInfo` /
 `AbortSignal.any` timeout merging). What is missing is purely forwarding the
 signal received by `rpcDispatch` down the call chain - the forward half of
 the observe-or-forward duty stated in tools.zh.md.
+
+### 2026-08-22：Web 插件跟随 Host 明暗主题
+
+全文检索 107 篇中文文档后，主题相关命中为 `web-styling.zh.md`、
+`cookbook/adding-a-settings-card.zh.md`、`tool-catalog.zh.md`、
+`subsystems/web-server.zh.md`、`config-catalog.zh.md`、`module-graph.zh.md` 和
+`postmortem/0003-web-agent-gui-feedback-loop.zh.md`；另核对了已安装的
+`dsh-client-ui-theme`、`dsh-client-ui-layout` 与官方设置卡片源码。
+
+- 功能插件只消费 `--dsw-alias-*` 等官方语义 token，不复制色板，也不自行写
+  `body[data-ds-dark-theme]` 或 `prefers-color-scheme` 分支。
+- `ui-theme` 解析 `light` / `dark` / `system`；`ui-layout` 把结果应用为
+  `html.style.colorScheme`、`body[data-ds-dark-theme]` 及 body 上的 alias token。
+  因此主题切换会自动刷新使用这些变量的插件，不需要监听 `theme/change`。
+- 本项目原先使用了不存在的 `--dsw-alias-bg-primary`、
+  `--dsw-alias-bg-secondary`、`--dsw-alias-state-warning-primary`，又给前两者
+  配了 `#fff` 等浅色 fallback，暗色主题因此仍渲染白色卡片和控件。正确名称是
+  `bg-layer-*` / `specific-input-major` 与 `state-warn-*`；代码块使用
+  `--dsw-alias-markdown-code-block`，主操作使用 `button-info-*`。
