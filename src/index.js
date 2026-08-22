@@ -640,6 +640,16 @@ export function consumeApprovalToken({
     return { valid: false, reason: "invalid or already consumed approval token" };
   }
 
+  // 归属校验先于销毁。token 一旦泄漏（哪怕只泄漏给另一个 session），任何
+  // 拿到它的人都不该能靠「试一下」把别人的批准流程烧掉——错误归属的尝试
+  // 原样退回，token 留给真正的 owner。其余校验维持「一试即焚」的一次性。
+  if (record.surface !== surface) {
+    return { valid: false, reason: "approval token surface mismatch (cannot reuse between browser and agent)" };
+  }
+  if (record.owner !== (owner ?? "")) {
+    return { valid: false, reason: `approval token ${surface === "browser" ? "session" : "owner"} mismatch` };
+  }
+
   // Atomically delete token on validation to guarantee one-shot
   approvalTokens.delete(cleanToken);
 
@@ -661,12 +671,6 @@ export function consumeApprovalToken({
     } catch {
       return { valid: false, reason: "approval token profile directory mismatch" };
     }
-  }
-  if (record.surface !== surface) {
-    return { valid: false, reason: "approval token surface mismatch (cannot reuse between browser and agent)" };
-  }
-  if (record.owner !== (owner ?? "")) {
-    return { valid: false, reason: `approval token ${surface === "browser" ? "session" : "owner"} mismatch` };
   }
   if (
     createHash("sha256").update(record.disclosureSerialized).digest("hex") !== record.disclosureDigest
@@ -1573,7 +1577,15 @@ function createInstallJobProducer({
           acceptWarningsActive,
         });
         outcome.approvalToken = token;
-        outcome.detail = `${outcome.detail ?? ""}\n\nApproval token (pass to approvalToken on retry): ${token}`;
+        // token 只写进 agent 的 detail：agent 的 job_output 由宿主按 owner
+        // 隔离，模型重试时要从这里读到 token。浏览器的 detail 是任务面板
+        // 明文展示的字段，tracker.get/list 又无条件下发它（只有独立的
+        // approvalToken 字段做 session 隔离）——拼进去等于把 token 发给
+        // 所有 session。浏览器侧 token 只走 outcome.approvalToken →
+        // record.approvalToken → 同 session 的快照字段。
+        if (surface === "agent") {
+          outcome.detail = `${outcome.detail ?? ""}\n\nApproval token (pass to approvalToken on retry): ${token}`;
+        }
       } catch (error) {
         // 签发会因为凭证不完整（proof 缺失/不匹配）抛错。以前这段跑在 `.then`
         // 里，抛出去就把 done 变成 rejected —— 官方明说 done 必须不 reject，
@@ -2815,7 +2827,21 @@ export async function runSelfTests() {
       surface: "browser",
       owner: "session-beta",
     });
-    check("跨浏览器 session 消费审批 token 被拒绝且销毁", !crossSessionRes.valid && /session mismatch/.test(crossSessionRes.reason));
+    // 归属不符的尝试**不许销毁** token：一旦 token 经由任何渠道泄漏，拿到
+    // 它的人也不能靠「试一下」烧掉别人的批准流程。归属校验先于一次性销毁。
+    check("跨浏览器 session 消费审批 token 被拒绝且不销毁", !crossSessionRes.valid && /session mismatch/.test(crossSessionRes.reason));
+    const rightfulSessionRes = consumeApprovalToken({
+      token: browserTok,
+      profile: "web",
+      profileDir,
+      spec: "browser-pkg",
+      preflightReport: cleanPreflightReport,
+      allowBuildScripts: ["browser-pkg"],
+      surface: "browser",
+      owner: "session-alpha",
+    });
+    check("被异 session 碰过的 token 仍归正主消费",
+      rightfulSessionRes.valid === true, `reason=${rightfulSessionRes.reason}`);
 
     // 跨 surface (browser vs agent)
     const agentProof = proofFor("agent-pkg");
@@ -2839,7 +2865,19 @@ export async function runSelfTests() {
       surface: "browser",
       owner: "browser-sess",
     });
-    check("跨 surface (agent vs browser) 消费审批 token 失败且被销毁", !crossSurfaceRes.valid && /surface mismatch/.test(crossSurfaceRes.reason));
+    check("跨 surface (agent vs browser) 消费审批 token 失败且不被销毁",
+      !crossSurfaceRes.valid && /surface mismatch/.test(crossSurfaceRes.reason));
+    const rightfulAgentRes = consumeApprovalToken({
+      token: agentTok,
+      profile: "web",
+      profileDir,
+      spec: "agent-pkg",
+      preflightReport: cleanPreflightReport,
+      allowBuildScripts: ["agent-pkg"],
+      surface: "agent",
+      owner: "agent-1",
+    });
+    check("被跨 surface 碰过的 token 仍归正主消费", rightfulAgentRes.valid === true, `reason=${rightfulAgentRes.reason}`);
 
     // Tracker 隔离与 session 校验。
     // 审批 token 由 producer 签发（createInstallJobProducer 是唯一签发者），
@@ -2880,6 +2918,11 @@ export async function runSelfTests() {
 
     const snapDiffSession = sessionTracker.get(sessionJobId, "session-beta").snapshot;
     check("不同 session 查询 job 时不会暴露 approvalToken", snapDiffSession.approvalToken === undefined);
+    // 整个序列化结果都不含 token——不只看 approvalToken 字段：detail、日志、
+    // 任何嵌套位置藏一份都算泄漏。
+    check("不同 session 的 get/list 序列化结果整体不含 token",
+      !JSON.stringify(sessionTracker.get(sessionJobId, "session-beta")).includes(trackerTok)
+      && !JSON.stringify(sessionTracker.list("session-beta")).includes(trackerTok));
 
     const snapSameSession = sessionTracker.get(sessionJobId, "session-alpha").snapshot;
     check("tracker 复制 producer 签发的 approvalToken（同 session 可见）",
@@ -3772,6 +3815,36 @@ export async function runSelfTests() {
         check("browser surface 的 producer 签发归属该 session 的 token",
           surfConsume.valid === true,
           `token=${typeof surfToken} reason=${surfConsume.reason}`);
+        // token 绝不进 browser 的 detail：tracker.get/list 无条件下发 detail，
+        // 只有独立的 approvalToken 字段做 session 隔离——拼进去等于发给
+        // 所有 session。浏览器只走 outcome.approvalToken → 同 session 快照。
+        check("browser surface 的 detail 不含 token（防跨 session 泄漏）",
+          !String(surfOutcome?.detail ?? "").includes(String(surfToken)),
+          `detail=${String(surfOutcome?.detail ?? "").slice(0, 120)}`);
+
+        // agent 的 detail 必须仍然带 token：宿主按 owner 隔离 job_output，
+        // 模型重试全靠从 detail 里读到它。
+        const agentProof = proofFor("surf-agent-pkg");
+        const agentDetailOutcome = await settleWithin(createInstallJobProducer({
+          profile: "web",
+          spec: "surf-agent-pkg",
+          agentOwner: "agent-surf",
+          ...seams({
+            _runPreflight: async () => ({ report: cleanReport, profileDir, fingerprint: "fp-surf-agent" }),
+            _runInstall: () => ({
+              cancel: () => {},
+              done: Promise.resolve({
+                status: "needsApproval",
+                detail: "approval needed",
+                needsApproval: disclosureFor(agentProof),
+                proof: agentProof,
+              }),
+              readOutput: () => "",
+            }),
+          }),
+        }).done, 5000, "agent surface job");
+        check("agent surface 的 detail 仍带 token（模型重试要读它）",
+          /Approval token \(pass to approvalToken on retry\)/.test(String(agentDetailOutcome?.detail ?? "")));
       }
 
       // 13b. 预检通过 → 进入安装。同时钉两件事：pnpm 拿到的是防抢注解析后的
