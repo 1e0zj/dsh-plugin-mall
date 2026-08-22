@@ -350,7 +350,10 @@ window.__ModuleLoader__.load({
       var installLabel = props.alreadyInstalled === true ? "已装" : "安装";
       var installDisabled = installing || props.alreadyInstalled === true;
       if (!installing && job) {
-        if (job.status === "running") { installLabel = "安装中…"; installDisabled = true; }
+        if (isJobActive(job.status)) {
+          installLabel = job.status === "stopping" ? "停止中…" : "安装中…";
+          installDisabled = true;
+        }
         else if (job.status === "completed") { installLabel = "已装 · 重启生效"; installDisabled = true; }
         else if (job.status === "failed") { installLabel = "安装失败 · 见任务日志"; }
         else { installLabel = "已取消 · 重试"; }
