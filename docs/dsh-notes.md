@@ -523,3 +523,177 @@ loader 用 `===`。扫描器擅自 `trim()` 会两头错：
 
 把「truthy 的非字符串 id」当成「无 id」会连错两次：既报了不存在的随机 id 问题，
 又漏掉了必然启动失败的重复 id。差分测试的 id 字母表因此混入了 `7` 和 `0`。
+
+### issue #7: RPC cancellation contract - when the carrier AbortSignal aborts, and how a handler must consume it (2026-08-22)
+
+(Tooling note: the Bash tool on this machine rejects non-ASCII command strings,
+so this section is narrated in English. Every Chinese passage below is a
+verbatim line extraction from the cited doc, not a paraphrase.)
+
+`/market` is a generic RPC channel registered through dsh-client-connection:
+`ctx.connection.rpc.handle("/market", (endpoint, payload, signal) => ...)`.
+For this issue I read api-gateway / web-server / web / core / client-modules /
+jobs / commands / tools / defensive-patterns / glossary, all four postmortems,
+three internal architecture notes under `.agents/notes/` (linked from
+web-server.zh.md - docs/ is not the only official material), and verified the
+installed `@deepseek-ai/dsh-client-connection@0.1.1-rc.2`,
+`dsh-api-gateway` and `dsh-commands` source. All 107 zh docs were pulled
+locally and full-text searched for cancellation keywords.
+
+#### What the docs state explicitly
+
+**1. Cancellation is cooperative and the signal is part of the handler
+signature** - `api-gateway.zh.md` line 56:
+
+> Remote 方法可以同步返回或返回 Promise。若需要协作式取消，Host 签名的最后一个参数必须是全局类型的 `signal: AbortSignal`；它记录在描述符中而不是进入 `args`，Client 生成的方法则接受最后一个可选的 `AbortSignal`。
+
+The example right above it starts with `signal.throwIfAborted()`. The
+component table, line 91:
+
+> | 双侧 | `@deepseek-ai/dsh-client-connection` | 提供 RPC carrier、请求关联、信任边界、取消、响应 envelope 与 `/api` HTTP bridge |
+
+Line 123:
+
+> Connection 在 HTTP bridge 之前执行 `/api` 的统一信任检查，再在共享 FetchHandler 内按 interceptor 顺序分发。Typert Gateway 只认领存在严格描述符或活跃 SRC marker 的两段式 endpoint；未认领的请求回退到既有 API Proxy。Connection 拥有传输、RPC id、响应 envelope 和请求取消，Gateway 只拥有 Remote 数据协议和业务分发。未来替换 Connection carrier 不要求改变 Remote 描述符或 Client 编程接口。
+
+Line 129 - unloading a client contribution aborts its in-flight calls:
+
+> Client 卸载一个贡献时会一起移除描述符和具体方法，中止其进行中的调用，并使外部仍持有的陈旧方法句柄拒绝继续调用。Host 上已经注册过的严格 endpoint 被撤回后也不会降级到 SRC 推断，以免热卸载悄然降低校验强度。
+
+**2. Long async work must observe or forward the signal - the normative
+sentence** - `subsystems/tools.zh.md` lines 32-35 (about tools, not RPC, but
+the most explicit official statement of the duty of long in-host async work
+versus a cancellation signal):
+
+> Async work must observe or forward `exec.signal` and settle only after its owned work reaches quiescence. The registry preserves caller cancellation through around-dispatch signal replacement and does not abandon this promise, but it cannot hard-kill same-process code.
+
+`timeoutMs` declaration semantics, lines 57-58:
+
+> parameters. Declaring it asserts this tool forwards `exec.signal` to a cooperative implementation that can reach quiescence when the signal aborts.
+
+**3. UI-initiated requests carry a signal owned by that UI request** -
+`subsystems/commands.zh.md`, `CommandInvocation.signal` lines 74-75:
+
+> /** Cancellation signal owned by the dispatching UI request. */ readonly signal: AbortSignal
+
+lifecycle, lines 159-161:
+
+> A resolved command's lifecycle is logged: `command/run` is appended before the handler is invoked and `command/done` after settlement (a thrown or aborted handler settles as `kind: 'error'`). Both are direct
+
+and the Remote signature, line 182:
+
+> @Remote async execute( agent: Agent, line: string, images: readonly EncodedImageAttachment[], signal: AbortSignal, ): Promise<CommandExecution | undefined>
+
+**4. Capability seams forward cancellation down to the provider** -
+`subsystems/web.zh.md` (`ctx.web.search` Javadoc, line 183) and
+`subsystems/session-query.zh.md` (line 394):
+
+> @param signal - optional cancellation signal forwarded to the provider.
+
+> @param signal - optional cancellation for persistence listing.
+
+Error vocabularies include `WEB_ABORTED` / `SESSION_QUERY_ABORTED`.
+
+**5. Transport timeout versus cancellation is a deliberate split** - internal
+note `.agents/notes/implemented/architecture/2026-07-19-gui-layering-and-rpc-protocol.zh.md`
+line 205:
+
+> | unary 时限 | 普通 unary 调用使用 `AbortSignal.timeout`（默认 30s，构造参数可调）；由用户掌控节奏的 `host.pickDirectory` 和 `command.execute` 不设该时限，但保留调用方／连接取消；流不设时限 |
+
+The rejected-alternative row, line 253, says it more directly:
+
+> | 对 `command.execute` 应用 30 秒传输时限 | 命令耗时属于操作本身，而非传输健康预算；该时限会终止本应继续运行的长时处理器，调用方／连接取消已提供所需的停止路径 |
+
+Official position: the stop path for a long operation is the cancellation
+signal, not a timeout.
+
+**6. Downlink stream cancellation is a different carrier** - internal note
+`2026-08-04-websocket-downlink-carrier.zh.md` line 21:
+
+> 浏览器 abort 或 socket close 会取消对应的 host 流；插件 teardown 还会等待该 source iterator 完成清理。host 流中途抛错时，载体发送一个现有的 `stream/error` frame 后关闭 socket；客户端把该 frame 收敛为连接丢失，不投递给业务 sink。每条 WebSocket 独立报告 open，既有 readiness handshake 仍等待 mux、host 都 open 且 `host.describe` HTTP 调用成功后才发布 connected。
+
+That covers only the events.mux / events.host WebSocket downlinks; unary
+calls go over HTTP POST and are unaffected by it.
+
+**7. No postmortem covers this failure class.** The four postmortems (full
+list in README.zh.md) are: ACP export default, js-expression disabled (0002),
+GUI verification against the wrong server, landlock misclassification. None
+is about unpropagated cancellation or orphaned host-side requests. The
+closest lesson in 0003 is about unmanaged processes surviving past their
+turn - process governance, not RPC.
+
+#### Verified in installed source (hard facts the docs do not spell out)
+
+`~/.dsh/profiles/node_modules/@deepseek-ai/dsh-client-connection@0.1.1-rc.2`
+`lib/index.js`:
+
+- The carrier signal has exactly one abort condition. `bridge()` creates an
+  AbortController and hooks `res.on("close")`, aborting only when the
+  response has not finished writing; the function header comment reads
+  "client close aborts". So: the connection closing before the HTTP response
+  finished writing - browser aborts the fetch, page or tab close, network
+  drop. Normal completion does NOT abort it. It has nothing to do with the
+  WebSocket downlink or with reconnects.
+- The signal rides the WHATWG `Request`; `rpcFetchHandler` hands it to
+  the handler untouched as the third argument:
+  `await handler(endpoint, message.payload, request.signal)`. Generic
+  channels have NO host-side timeout - the signal lives until the handler
+  settles.
+- A throwing handler becomes a 500 `handler failure: ...`. After an abort,
+  whatever the handler returns or throws is still serialized and written
+  back to the closed connection; nobody reads it.
+- Browser half `createWebConnectionRpc.call(channel, endpoint, payload, signal)`:
+  the signal reaches fetch only if passed; generic channels have no default
+  timeout (official /api `callUnary` merges `AbortSignal.timeout(30s)`;
+  `host.pickDirectory` is exempt via `timeoutPolicy: "caller-signal-only"`).
+
+Two official consumption examples (installed packages):
+
+- `dsh-api-gateway/lib/index.js`: the signal is injected only when the
+  descriptor declares cancellation - `args.push(request.signal ??
+  NEVER_ABORTED_SIGNAL)`; a business rejection observed after carrier abort
+  is rethrown as `RemoteInvocationCancelled` (Business invocation lost its
+  carrier cancellation race) - separating lost-to-cancellation from business
+  failure.
+- `dsh-commands/lib/index.js` `execute(agent, line, images, signal)`:
+  entry check `if (signal.aborted) throw abortError(signal)`; re-check with
+  `cancellationOf(signal)` after each await; the handler promise is raced
+  against abort via `withAbort(promise, signal)`; the signal goes into
+  `CommandInvocation.signal` untouched.
+
+#### Inference (not stated by docs or source - marked as such)
+
+- Even when the browser passes no signal (our current state), closing the
+  page still aborts the host carrier: page teardown drops the connection
+  and `res.on("close")` fires. The primary gap is the host handler ignoring
+  the signal. A browser-side signal (cancel on unmount) is the secondary
+  improvement - active cancellation while the page stays open.
+- Few official generic-channel handlers consume the signal directly, because
+  official long work is either a Typert Remote method (signal in the
+  descriptor) or a job (`ctx.jobs` with its own `job_kill` path) - issue #8
+  took the latter route.
+
+#### Diff against our current state (issue #7 checklist)
+
+`src/index.js` `registerRpcChannel` (~line 2231): the handler signature
+receives the signal, but `rpcDispatch(ctx, endpoint, payload, config, token,
+tracker)` does not accept it. Network awaits inside the handler that keep
+running after the page closes:
+
+| endpoint | network await inside the handler | state |
+|---|---|---|
+| `search` | `searchPlugins` (GitHub search) | signal ignored |
+| `verify` | `verifyPlugins` (fetch manifests per repo) | signal ignored |
+| `compat` | `verifyPlugins` + `fetchRawFile` (up to 30 repos) | signal ignored |
+| `updates` | `npmPackageInfo` per dependency | signal ignored |
+| `info` | `repoInfo` | signal ignored |
+| `preflight` / `install` / `uninstall` | already moved into jobs (return jobId) | job runtime owns the kill path - outside this gap |
+
+`src/client.js` `call()` (~line 684): `rpc.call("/market", endpoint, body)`
+passes no fourth argument; no browser-side active cancellation.
+
+The data layer (`github.js`: `requestJson` / `npmPackageInfo` /
+`fetchRawFile` ...) already accepts `signal` everywhere (some with
+`AbortSignal.any` timeout merging). What is missing is purely forwarding the
+signal received by `rpcDispatch` down the call chain - the forward half of
+the observe-or-forward duty stated in tools.zh.md.

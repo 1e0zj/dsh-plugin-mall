@@ -1771,7 +1771,19 @@ function rpcFail(error) {
 /**
  * Dispatch one /market RPC endpoint.
  */
-async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
+/**
+ * `signal` is the RPC carrier's AbortSignal: the Host aborts it when the
+ * browser side drops the connection mid-request (fetch aborted, tab closed,
+ * network gone) — see docs/dsh-notes.md「issue #7」. Per the official posture
+ * (tools.zh.md: "Async work must observe or forward exec.signal"), every
+ * branch that awaits NETWORK work inside the request lifetime forwards it, so
+ * a closed page stops the Host-side fetches instead of running them to the
+ * end for a response nobody will read. Branches that only start a job and
+ * return its id deliberately do NOT wire it: the job must outlive the request
+ * (same reason the agent producer does not consume exec.signal), its kill
+ * path is the job panel's cancel.
+ */
+async function rpcDispatch(ctx, endpoint, payload, config, token, tracker, signal) {
   const { defaultProfile = "web", apiBase = "https://api.github.com", perPageMax = 30, npmRegistry = "", rawSources = [] } = config;
   switch (endpoint) {
     case "search": {
@@ -1784,11 +1796,12 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
         minStars: payload?.minStars,
         apiBase,
         token,
+        signal,
       });
       return rpcOk(result);
     }
     case "verify": {
-      const result = await verifyPlugins({ repos: payload?.repos, sources: rawSources });
+      const result = await verifyPlugins({ repos: payload?.repos, sources: rawSources, signal });
       return rpcOk(result);
     }
     case "compat": {
@@ -1805,7 +1818,7 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
       const repos = [...new Set((Array.isArray(payload?.repos) ? payload.repos : []).map(String)
         .filter((repo) => /^[^@/\s][^/\s]*\/[^/\s]+$/.test(repo) && !repo.includes("..")))].slice(0, 30);
       if (repos.length === 0) return rpcOk({ results: {} });
-      await verifyPlugins({ repos, sources: rawSources }); // populates the manifest cache
+      await verifyPlugins({ repos, sources: rawSources, signal }); // populates the manifest cache
       let fingerprint;
       const results = {};
       await mapLimit(repos, NETWORK_CONCURRENCY, async (repo) => {
@@ -1817,7 +1830,7 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
         try {
           let patchText;
           if (typeof manifest.dsh?.bundle?.patch === "string") {
-            patchText = await fetchRawFile(repo, manifest.dsh.bundle.patch, { sources: rawSources });
+            patchText = await fetchRawFile(repo, manifest.dsh.bundle.patch, { sources: rawSources, signal });
           }
           fingerprint ??= computeProfileFingerprint(profileDir);
           const cacheKey = `${fingerprint}::${repo}`;
@@ -1833,7 +1846,10 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
           };
           compatCacheSet(cacheKey, entry);
           results[repo] = entry;
-        } catch {
+        } catch (error) {
+          // 取消必须先于兜底放行：客户端已经断开，把 AbortError 吞成
+          // "unknown" 会让剩下的仓库继续被逐个扫完——为一份没人读的响应。
+          if (isAbortError(error)) throw error;
           results[repo] = { state: "unknown", summary: "兼容性检查失败" };
         }
       });
@@ -1852,7 +1868,7 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
       const results = {};
       await mapLimit(deps, NETWORK_CONCURRENCY, async (dep) => {
         if (dep.kind === "missing") { results[dep.name] = { latest: null }; return; }
-        const info = await npmPackageInfo(dep.name, { registry });
+        const info = await npmPackageInfo(dep.name, { registry, signal });
         results[dep.name] = info === null
           ? { latest: null }
           : { latest: info.latest, hasUpdate: compareVersions(info.latest, dep.version) > 0 };
@@ -1860,7 +1876,7 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
       return rpcOk(results);
     }
     case "info": {
-      const result = await repoInfo({ repo: payload?.repo, apiBase, token });
+      const result = await repoInfo({ repo: payload?.repo, apiBase, token, signal });
       return rpcOk(result);
     }
     case "installed": {
@@ -1947,7 +1963,10 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
       }
       try {
         const registry = await registryFor(profile, npmRegistry);
-        const resolved = await preferNpmSpec({ spec, registry, sources: rawSources });
+        // registryFor 刻意不接 signal（缓存的是 promise，一次取消会污染整条
+        // 缓存——见 createInstallJobProducer 的注释）；它之后的联网步骤接。
+        const resolved = await preferNpmSpec({ spec, registry, sources: rawSources, signal });
+        signal?.throwIfAborted(); // 断连发生在解析完成与建 job 之间：一个 job 都不要建
         const jobId = tracker.startCustom({
           kind: "dsh-plugin-preflight",
           label: `preflight ${resolved}`,
@@ -1983,6 +2002,9 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
         });
         return rpcOk({ jobId, profile, spec: resolved });
       } catch (error) {
+        // 取消不是业务失败：客户端已断开，rpcFail 的响应没人读，还会在
+        // 存活的重连页面上被当成市场故障渲染出来。
+        if (isAbortError(error)) throw error;
         return rpcFail(error);
       }
     }
@@ -2232,9 +2254,16 @@ function registerRpcChannel(ctx, config, token) {
   const tracker = createJobTracker();
   ctx.inject(["connection"], (connectionCtx) => {
     connectionCtx.connection.rpc.handle("/market", async (endpoint, payload, signal) => {
+      // signal 是 carrier 的取消信号：浏览器断开（关页/断网/主动 abort）时
+      // Host 侧 abort（见 docs/dsh-notes.md「issue #7」）。此前在这里被扔掉，
+      // 查询类 RPC 在页面关掉后照跑到底。
       try {
-        return await rpcDispatch(ctx, endpoint, payload ?? {}, config, token, tracker);
+        return await rpcDispatch(ctx, endpoint, payload ?? {}, config, token, tracker, signal);
       } catch (error) {
+        // 取消归类为「输给取消」而非业务错误：不打错误日志（每次关页都会
+        // 触发一次，纯噪音），也不转 rpcFail——响应早已无人读，转了只会在
+        // 存活的重连页面上被渲染成市场故障。
+        if (isAbortError(error)) throw error;
         console.error(`[dsh-plugin-mall] /market/${String(endpoint)} failed:`, error);
         return rpcFail(error);
       }
@@ -3712,6 +3741,39 @@ export async function runSelfTests() {
       check("预检 job 集成：digest 随 extras 送达",
         integrationDelta.snapshot?.extras?.consentDigest === preflightConsentDigest(integrationReport, "fp-i"),
         `extras=${JSON.stringify(integrationDelta.snapshot?.extras)?.slice(0, 120)}`);
+    }
+
+    // ── 12d. 查询类 RPC 响应 carrier 取消（issue #7）────────────────────────
+    //
+    // carrier signal 在 Host 收到浏览器断连时 abort。用预 abort 的 signal 验
+    // 接线：fetch 在发起任何网络请求前立刻拒绝。若某个分支没接（收了没传），
+    // 离线环境里它会真去连网——要么慢超时要么返回正常结果，断言随之下沉。
+    {
+      const cfg = { apiBase: "https://api.github.com", npmRegistry: "https://registry.npmjs.org", rawSources: [] };
+      const assertAborts = async (label, endpoint, rpcPayload) => {
+        try {
+          const value = await rpcDispatch(null, endpoint, rpcPayload, cfg, undefined, createJobTracker(), AbortSignal.abort());
+          check(label, false, `返回了 ${JSON.stringify(value).slice(0, 60)}——signal 没接进 ${endpoint}`);
+        } catch (error) {
+          check(label, isAbortError(error), `抛了 ${error?.name}: ${String(error?.message).slice(0, 60)}`);
+        }
+      };
+      await assertAborts("search 预取消 → AbortError（不发任何请求）", "search", { query: "x" });
+      await assertAborts("verify 预取消 → AbortError", "verify", { repos: ["owner/repo"] });
+      await assertAborts("info 预取消 → AbortError（不被包装成 not found）", "info", { repo: "owner/repo" });
+
+      // preflight：断连发生在解析与建 job 之间——一个 job 都不许建，否则
+      // 面板上会冒出一个注定无人认领的孤儿任务。
+      const abortTracker = createJobTracker();
+      const abortSession = `sess_${"a".repeat(32)}`; // 合法 nonce 形状
+      try {
+        const preflightValue = await rpcDispatch(null, "preflight", { session: abortSession, spec: "github:owner/repo" }, cfg, undefined, abortTracker, AbortSignal.abort());
+        check("preflight 预取消 → AbortError 且不建 job", false, `没有抛，返回 ${JSON.stringify(preflightValue).slice(0, 200)}`);
+      } catch (error) {
+        check("preflight 预取消 → AbortError 且不建 job",
+          isAbortError(error) && abortTracker.list(abortSession).length === 0,
+          `${error?.name} jobs=${abortTracker.list(abortSession).length}`);
+      }
     }
 
     // ── 13. market_install：整条链跑在 job 里（issue #8）────────────────────

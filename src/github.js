@@ -618,6 +618,9 @@ export async function repoInfo({ repo, apiBase, token, signal }) {
   try {
     meta = await requestJson(`/repos/${trimmed}`, { apiBase, token, signal });
   } catch (error) {
+    // 取消不是「仓库不存在」：包装会把这个信号翻译成业务错误，调用方据此
+    // 报告一个不存在的网络故障。取消原样上抛。
+    if (error?.name === "AbortError") throw error;
     throw new Error(`market_info: repository ${trimmed} not found on GitHub (${error.message})`);
   }
   let packageJson;
@@ -626,7 +629,8 @@ export async function repoInfo({ repo, apiBase, token, signal }) {
     if (typeof contents.content === "string") {
       packageJson = JSON.parse(Buffer.from(contents.content, "base64").toString("utf8"));
     }
-  } catch {
+  } catch (error) {
+    if (error?.name === "AbortError") throw error; // 取消不是「没有 package.json」
     packageJson = undefined; // no package.json at the repo root
   }
   return {
