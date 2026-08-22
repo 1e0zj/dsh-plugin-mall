@@ -1488,6 +1488,12 @@ export function isAbortError(error) {
  * the whole tree. Either way the promise still settles on 'close', never on
  * the abort itself: the caller must not get control back (and start deleting
  * the probe directory) while a pnpm process is still writing into it.
+ *
+ * 'close' bounds the WRITING, not the operating system's bookkeeping. It
+ * arrives the instant taskkill signals the wrapper, while Windows still holds
+ * the probe directory — it is the killed pnpm's cwd — for a moment longer, so
+ * an rmSync right here still hits EPERM. That last stretch belongs to
+ * cleanupProbeDir's retries, not to this promise.
  */
 function spawnCapture(command, args, options, onOutput, { signal, treeKill = false } = {}) {
   return new Promise((resolvePromise) => {
@@ -1655,7 +1661,41 @@ export async function preflightInstall({ profileDir, spec, onOutput, signal }) {
   } finally {
     // probeDir is created by mkdtemp directly under the system temp folder;
     // it never contains user-authored files.
-    rmSync(probeDir, { recursive: true, force: true });
+    cleanupProbeDir(probeDir, onOutput);
+  }
+}
+
+/**
+ * Delete the throwaway probe directory — WITHOUT ever changing the outcome of
+ * the preflight that created it.
+ *
+ * Two things bite here, and they compound:
+ *
+ *  1. On Windows `'close'` arrives the instant taskkill /T /F signals the
+ *     wrapper, but the killed pnpm and its children release their file
+ *     handles a moment later. rmSync straight after a cancel therefore hits
+ *     EPERM on a directory that is about to become deletable. `maxRetries`
+ *     (Node retries exactly EBUSY/EMFILE/ENFILE/ENOTEMPTY/EPERM) rides that
+ *     out; the delay backs off linearly, so 10 × 100ms is ~5s worst case.
+ *
+ *  2. This runs in a `finally`, and an exception thrown from `finally`
+ *     REPLACES the one already propagating. So a failed cleanup used to
+ *     swallow the AbortError of a cancelled preflight and surface as
+ *     `failed: EPERM \\?\C:\...\dsh-plugin-guard-XXXX` — the user pressed
+ *     cancel and got an unreadable path error about a temp directory they
+ *     never knew existed. Leaking a temp dir the OS will reap anyway is far
+ *     cheaper than misreporting why the job ended, so the throw stops here.
+ *
+ * `remove` is a test seam. The real EPERM comes from an OS race — the probe
+ * directory is the killed pnpm's cwd, and Windows keeps it locked until that
+ * process is truly gone — which cannot be reproduced reliably in a fixture.
+ * The fixture therefore pins OUR error handling, not the kernel's timing.
+ */
+function cleanupProbeDir(probeDir, onOutput, remove = rmSync) {
+  try {
+    remove(probeDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch (error) {
+    onOutput?.(`[dsh-plugin-guard] could not remove probe directory ${probeDir} (${error?.code ?? error?.message}) — leaving it for the OS to reclaim\n`);
   }
 }
 
@@ -4704,6 +4744,38 @@ async function selfTest() {
       }
       if (cancelOutcome !== "abort") throw new Error(`preflightInstall 取消必须上抛 AbortError，实得 ${cancelOutcome}`);
       console.log("PASS 取消：preflightInstall 上抛 AbortError（不伪造阻断报告）");
+
+      // 4) 探针目录删不掉时，清理不许改变结局。
+      //    实测踩到的：取消后 taskkill /T /F 一发，wrapper 的 'close' 立刻到，
+      //    但探针目录是那个被强杀的 pnpm 的 cwd，Windows 会一直锁着它，
+      //    finally 里的 rmSync 撞 EPERM —— 而 finally 抛出的异常会顶掉正在
+      //    上抛的 AbortError，于是「用户按了取消」在 job 里显示成一条看不懂的
+      //    EPERM 临时目录路径。
+      //    这里注入一个必抛的 remove：真实 EPERM 靠的是 OS 时序，fixture 复现
+      //    不稳定（Node 的 openSync 带 FILE_SHARE_DELETE，占着句柄照样能删），
+      //    而要钉住的本来就是我们的错误处理，不是内核的时机。
+      const cleanupDir = mkdtempSync(join(tmpdir(), "dsh-guard-cleanup-"));
+      let cleanupThrew;
+      let cleanupReport = "";
+      try {
+        cleanupProbeDir(cleanupDir, (text) => { cleanupReport += text; }, () => {
+          const error = new Error(`EPERM, Permission denied: ${cleanupDir}`);
+          error.code = "EPERM";
+          throw error;
+        });
+      } catch (error) {
+        cleanupThrew = error;
+      }
+      if (cleanupThrew !== undefined) {
+        throw new Error(`cleanupProbeDir 抛了 ${cleanupThrew?.code ?? cleanupThrew?.message}——它跑在 finally 里，会顶掉 AbortError`);
+      }
+      if (!cleanupReport.includes("could not remove probe directory")) {
+        throw new Error("清理失败必须被报告出来，而不是静默吞掉");
+      }
+      // 真能删的时候要真的删掉——上面那条别把清理本身测没了。
+      cleanupProbeDir(cleanupDir, undefined);
+      if (existsSync(cleanupDir)) throw new Error("cleanupProbeDir 未能删除可删除的目录");
+      console.log("PASS 取消：探针目录清理失败不改变结局（且可删时确实删掉）");
     }
 
     console.log("PASS conflict scan and snapshot/pending/rollback fixtures");
