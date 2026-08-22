@@ -16,9 +16,6 @@ window.__ModuleLoader__.load({
     // ── styles ──────────────────────────────────────────────────────────────
     var css = [
       ".mkt_root{display:flex;flex-direction:column;gap:12px;max-width:1040px}",
-      ".mkt_head{display:flex;flex-direction:column;gap:2px}",
-      ".mkt_title{font-size:16px;font-weight:600;color:var(--dsw-alias-label-primary)}",
-      ".mkt_sub{font-size:12px;color:var(--dsw-alias-label-tertiary)}",
       ".mkt_row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}",
       ".mkt_input{flex:1;min-width:200px;background:var(--dsw-specific-input-major);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:6px 10px;font-size:13px;color:var(--dsw-alias-label-primary)}",
       ".mkt_input::placeholder{color:var(--dsw-alias-label-caption)}",
@@ -985,10 +982,6 @@ window.__ModuleLoader__.load({
       var verifyPending = results !== null && results.items.some(function (it) { return verified[it.fullName] === undefined; });
 
       return h("div", { className: "mkt_root" },
-        h("div", { className: "mkt_head" },
-          h("div", { className: "mkt_title" }, "插件市场"),
-          h("div", { className: "mkt_sub" }, "搜索 GitHub dsh-plugin 话题插件 · 装/卸后需重启 dsh 生效")
-        ),
         h("div", { className: "mkt_row" },
           h("input", {
             className: "mkt_input",
@@ -1007,7 +1000,6 @@ window.__ModuleLoader__.load({
             h("option", { value: "forks" }, "按 fork")
           ),
           h("button", { className: "mkt_btn mkt_btnPrimary", disabled: loading, onClick: doSearch }, loading ? "搜索中…" : "搜索"),
-          h("button", { className: "mkt_btn", onClick: refreshInstalled }, "刷新已装"),
           h("button", { className: "mkt_btn mkt_btnDanger", disabled: restarting, onClick: doRestart }, restarting ? "重启中…" : "重启 dsh"),
           h("label", { className: "mkt_check" },
             h("input", { type: "checkbox", checked: verifiedOnly, onChange: function (e) { setVerifiedOnly(e.target.checked); } }),
