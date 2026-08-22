@@ -1084,14 +1084,13 @@ export function createJobTracker({ producerFactory } = {}) {
   const prune = () => {
     const now = Date.now();
     for (const [id, record] of records) {
-      const terminal = record.status !== "running";
-      if (terminal && record.finishedAt !== undefined && now - record.finishedAt > 3600000) records.delete(id);
+      if (record.finishedAt !== undefined && now - record.finishedAt > 3600000) records.delete(id);
     }
     if (records.size > 20) {
       const ordered = [...records.entries()].sort((a, b) => a[1].startedAt - b[1].startedAt);
       for (const [id, record] of ordered) {
         if (records.size <= 20) break;
-        if (record.status !== "running") records.delete(id);
+        if (record.finishedAt !== undefined) records.delete(id);
       }
     }
   };
@@ -1314,6 +1313,9 @@ export function createJobTracker({ producerFactory } = {}) {
         }
       }
       if (typeof record.producer?.cancel === "function") {
+        if (record.finishedAt === undefined && record.status === "running") {
+          record.status = "stopping";
+        }
         record.producer.cancel();
       }
       if (record.approvalToken) {
@@ -1330,6 +1332,9 @@ export function createJobTracker({ producerFactory } = {}) {
       if (record.surface === "browser" && (record.session === "" || record.session !== session)) {
         return false;
       }
+      // Dismiss hides settled history. Live work must go through cancel and
+      // remain observable until its producer reports a terminal outcome.
+      if (record.finishedAt === undefined) return false;
       // Marked, not deleted: `list` (panel restore after a remount) skips these,
       // so a cleared panel stays cleared across remounts.
       record.dismissed = true;
@@ -3011,6 +3016,40 @@ export async function runSelfTests() {
     check("相同 session dismiss job 成功且 token 被注销", dismissSame === true);
     const snapAfterDismiss = sessionTracker.get(sessionJobId, "session-alpha").snapshot;
     check("dismiss 后 job snapshot 中 approvalToken 为 undefined", snapAfterDismiss.approvalToken === undefined);
+
+    // 运行中任务不能靠 dismiss 从观察面消失；cancel 先进入 stopping，等
+    // producer 真正结算后才成为可清理的历史。
+    {
+      let settleLive;
+      let cancelCalls = 0;
+      const liveProducer = {
+        cancel: () => { cancelCalls++; },
+        done: new Promise((resolvePromise) => { settleLive = resolvePromise; }),
+        readOutput: () => "",
+      };
+      const liveTracker = createJobTracker({ producerFactory: () => liveProducer });
+      const liveJobId = liveTracker.start({
+        profile: "web",
+        spec: "live-pkg",
+        surface: "browser",
+        session: "session-alpha",
+      });
+      check("运行中 job 拒绝 dismiss", liveTracker.dismiss(liveJobId, "session-alpha") === false);
+      check("dismiss 被拒后运行中 job 仍可恢复",
+        liveTracker.list("session-alpha").some((entry) => entry.id === liveJobId));
+      check("cancel 请求把可杀 job 标为 stopping",
+        liveTracker.cancel(liveJobId, "session-alpha") === "requested"
+        && liveTracker.get(liveJobId, "session-alpha").snapshot.status === "stopping"
+        && cancelCalls === 1);
+      check("stopping job 仍拒绝 dismiss", liveTracker.dismiss(liveJobId, "session-alpha") === false);
+      settleLive({ status: "killed", detail: "cancelled" });
+      await new Promise((resolvePromise) => setImmediate(resolvePromise));
+      check("producer 结算后 job 进入 killed",
+        liveTracker.get(liveJobId, "session-alpha").snapshot.status === "killed");
+      check("终态 job 可 dismiss 并不再恢复",
+        liveTracker.dismiss(liveJobId, "session-alpha") === true
+        && liveTracker.list("session-alpha").every((entry) => entry.id !== liveJobId));
+    }
 
     // ── 5b. list（重挂载恢复）：日志累积、dismissed 过滤、session 隔离 ────────
     // 安装事务改写 cordis.patch.yml 会让 dsh 重放装配树、市场 UI 整体重挂载，

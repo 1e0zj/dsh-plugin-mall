@@ -45,6 +45,7 @@ window.__ModuleLoader__.load({
       ".mkt_panelRow .mkt_link{margin-left:auto}",
       ".mkt_pre{font-family:Consolas,Monaco,monospace;font-size:11.5px;line-height:16px;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-markdown-code-block);border-radius:6px;padding:8px;max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-all}",
       ".mkt_ok{color:var(--dsw-alias-state-success-primary)}",
+      ".mkt_warn{color:var(--dsw-alias-state-warn-label)}",
       ".mkt_badge{display:inline-block;border-radius:999px;padding:1px 8px;font-size:11px;border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-tertiary)}",
       ".mkt_badgeOk{border-color:var(--dsw-alias-state-success-primary);color:var(--dsw-alias-state-success-primary)}",
       ".mkt_badgeWarn{border-color:var(--dsw-alias-state-warn-primary);color:var(--dsw-alias-state-warn-label)}",
@@ -100,6 +101,10 @@ window.__ModuleLoader__.load({
 
     function errorText(e) {
       return String(e && e.message ? e.message : e);
+    }
+
+    function isJobActive(status) {
+      return status === "running" || status === "stopping";
     }
 
     function kindLabel(kind) {
@@ -159,7 +164,7 @@ window.__ModuleLoader__.load({
           var current = jobsRef.current;
           var running = Object.keys(current).filter(function (id) {
             var job = current[id];
-            return job && job.status !== "completed" && job.status !== "failed" && job.status !== "killed";
+            return job && isJobActive(job.status);
           });
           if (running.length === 0) return;
           running.forEach(function (id) {
@@ -211,20 +216,22 @@ window.__ModuleLoader__.load({
           delete next[carryFromId];
         }
         for (var key in next) {
-          if (key !== id && next[key] && next[key].spec === spec && next[key].status !== "running") {
+          if (key !== id && next[key] && next[key].spec === spec && !isJobActive(next[key].status)) {
             delete next[key];
           }
         }
         next[id] = { status: "running", spec: spec, output: carried };
         commit(next);
       }, [commit]);
-      var clear = useCallback(function () {
-        commit({});
-      }, [commit]);
       var drop = useCallback(function (id) {
         var next = Object.assign({}, jobsRef.current);
         delete next[id];
         commit(next);
+      }, [commit]);
+      var setStatus = useCallback(function (id, status) {
+        var current = jobsRef.current[id];
+        if (!current) return;
+        commit(Object.assign({}, jobsRef.current, { [id]: Object.assign({}, current, { status: status }) }));
       }, [commit]);
       // 恢复后端任务记录（tracker.list 的形状）：安装事务改写
       // cordis.patch.yml 会让 dsh 重放装配树、整个市场 UI 重挂载，React
@@ -269,7 +276,7 @@ window.__ModuleLoader__.load({
         for (var key in next) {
           if (serverIds[key]) continue;
           var stale = next[key];
-          if (stale.status === "running") {
+          if (isJobActive(stale.status)) {
             next[key] = Object.assign({}, stale, {
               status: "killed",
               detail: "宿主进程已重启，该任务的记录随之丢失",
@@ -282,7 +289,7 @@ window.__ModuleLoader__.load({
         }
         commit(next);
       }, [commit]);
-      return { jobs: jobs, track: track, clear: clear, drop: drop, restore: restore };
+      return { jobs: jobs, track: track, drop: drop, setStatus: setStatus, restore: restore };
     }
 
     // ── plugin verification badge ───────────────────────────────────────────
@@ -435,12 +442,14 @@ window.__ModuleLoader__.load({
       if (status === "completed") return "完成";
       if (status === "failed") return "失败";
       if (status === "killed") return "已取消";
+      if (status === "stopping") return "停止中";
       return "进行中";
     }
 
     function jobStatusClass(status) {
       if (status === "completed") return "mkt_ok";
-      if (status === "failed" || status === "killed") return "mkt_error";
+      if (status === "failed") return "mkt_error";
+      if (status === "killed" || status === "stopping") return "mkt_warn";
       return "";
     }
 
@@ -475,10 +484,11 @@ window.__ModuleLoader__.load({
     function JobsPanel(props) {
       var ids = Object.keys(props.jobs);
       if (ids.length === 0) return null;
+      var hasSettled = ids.some(function (id) { return !isJobActive(props.jobs[id].status); });
       return h("div", { className: "mkt_card" },
         h("div", { className: "mkt_panelRow" },
           h("p", { className: "mkt_panelTitle" }, "任务"),
-          props.onClear ? h("span", { className: "mkt_link", onClick: props.onClear }, "清空") : null
+          props.onClear && hasSettled ? h("span", { className: "mkt_link", onClick: props.onClear }, "清空已结束") : null
         ),
         ids.map(function (id) {
           var job = props.jobs[id];
@@ -490,7 +500,12 @@ window.__ModuleLoader__.load({
             // 都染色会喧宾夺主，只有结论需要一眼看见。
             h("div", { className: "mkt_meta" },
               jobKindLabel(job.kind) + clip(job.spec || "", 44) + " · ",
-              h("span", { className: jobStatusClass(job.status) }, jobStatusLabel(job.status))),
+              h("span", { className: jobStatusClass(job.status) }, jobStatusLabel(job.status)),
+              isJobActive(job.status) ? h("button", {
+                className: "mkt_btn mkt_btnSm",
+                disabled: job.status === "stopping",
+                onClick: function () { props.onCancel(id); },
+              }, job.status === "stopping" ? "停止中…" : "停止") : null),
             job.needsApproval && job.needsApproval.length > 0
               ? h(ApprovalRequest, {
                 needsApproval: job.needsApproval,
@@ -821,8 +836,8 @@ window.__ModuleLoader__.load({
       var polling = useJobPolling(call, onJobSettled, onApprovalToken, onPreflightSettled);
       var track = polling.track;
       var jobs = polling.jobs;
-      var clearJobs = polling.clear;
       var dropJob = polling.drop;
+      var setJobStatus = polling.setStatus;
 
       useEffect(function () {
         doSearch();
@@ -1021,11 +1036,21 @@ window.__ModuleLoader__.load({
           onClear: function () {
             Object.keys(jobs).forEach(function (id) {
               var job = jobs[id];
+              if (!job || isJobActive(job.status)) return;
               var token = job && job.approvalToken ? job.approvalToken : (job && job.spec ? approvalTokensRef.current[job.spec] : undefined);
               call("jobDismiss", { jobId: id, token: token }).catch(function () {});
+              if (job.spec) delete approvalTokensRef.current[job.spec];
+              dropJob(id);
             });
-            approvalTokensRef.current = {};
-            clearJobs();
+          },
+          onCancel: function (id) {
+            var job = jobs[id];
+            if (!job || job.status !== "running") return;
+            setJobStatus(id, "stopping");
+            call("jobCancel", { jobId: id }).catch(function (e) {
+              setJobStatus(id, "running");
+              setError(errorText(e));
+            });
           },
           onApprove: doApprove,
           onDismiss: function (id) {
