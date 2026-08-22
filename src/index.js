@@ -14,6 +14,7 @@
 // services, `Config` validates the row's config, `name` is the plugin name.
 
 import z from "@deepseek-ai/schemastery";
+import { valid as validExactVersion, maxSatisfying } from "semver";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { existsSync, readFileSync, realpathSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, openSync, closeSync, writeSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -25,7 +26,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
-import { repoInfo, searchPlugins, verifyPlugins, cachedRepoManifest, fetchRawFile, preferNpmSpec, npmPackageInfo, compareVersions, assertSafeToInstall, mapLimit, NETWORK_CONCURRENCY } from "./github.js";
+import { repoInfo, searchPlugins, verifyPlugins, cachedRepoManifest, fetchRawFile, preferNpmSpec, npmPackageInfo, npmPackageVersions, npmNameOf, compareVersions, assertSafeToInstall, mapLimit, NETWORK_CONCURRENCY } from "./github.js";
 import { ensureProfile, listInstalled, normalizeSpec, runInstall, runRemove, assertSafeSpec, resolveRegistry, serializeCanonicalProof, persistPluginDisabled } from "./installer.js";
 import { preflightInstall, inspectRemoteCandidate, recoverProfile, describeRollbackRebuild, isAbortError } from "./guard.js";
 import { createRestartHelperReadyMessage, RESTART_HELPER_READY_TYPE, RESTART_RESPONSE_DRAIN_MS, superviseRestartHelper } from "./restart-protocol.js";
@@ -358,10 +359,69 @@ function pinPreflight(profileDir, spec) {
  * a `blocked` report, that fabricated verdict would have been cached for the
  * whole TTL and every later install of this spec refused with it.)
  */
-async function runPreflight({ profile, spec, force = false, onOutput, signal }) {
+
+/**
+ * What a cache-reuse staleness check has to watch for this spec shape.
+ *
+ *   "npm-tag"    bare name / @latest / @* — resolves to whatever `latest` is now
+ *   "npm-range"  pkg@^1.2.0 — a new in-range release changes what pnpm picks
+ *   "github"     github:owner/repo without a pinned 40-hex commit — HEAD moves
+ *   null         immutable shapes: exact npm version (npm forbids overwriting
+ *                a published version), github:...#<full sha>, file:/link:/URL.
+ *                Nothing can drift, so no check is needed.
+ */
+export function specIdentityKind(raw) {
+  const spec = String(raw ?? "");
+  if (/^(?:file:|link:|https?:\/\/)/i.test(spec)) return null;
+  const gh = /^github:([^/\s]+\/[^/\s]+?)(?:\.git)?(?:#(.+))?$/i.exec(spec);
+  if (gh !== null) {
+    return /^[0-9a-f]{40}$/i.test(gh[2] ?? "") ? null : "github";
+  }
+  if (!/^@/.test(spec) && spec.includes("/")) return null; // owner/repo 形状交给 preferNpmSpec 之后再说
+  const name = npmNameOf(spec);
+  if (name === null) return null;
+  // 注意 scoped 裸名（@scope/name）没有 range：判定依据是「名字之后还有没有
+  // 东西」，不是字符串里有没有 @——scope 前缀本身就带 @。
+  const range = spec.length > name.length ? spec.slice(name.length + 1) : undefined;
+  if (range === undefined || range === "latest" || range === "*") return "npm-tag";
+  return validExactVersion(range) === null ? "npm-range" : null;
+}
+
+/**
+ * What this spec resolves to RIGHT NOW ({name, version}), for the mutable
+ * shapes above — the cheap half of "reuse equals rerun". The expensive half
+ * is the probe itself; this is one registry/CDN read per cache hit.
+ *
+ * Returns undefined when the shape is immutable, the resolution is
+ * unreachable, or the answer is not confident — the caller then keeps the
+ * cache entry rather than burning a full re-probe on a network hiccup. A
+ * reachable-and-different answer is the only thing that invalidates.
+ */
+async function resolveSpecIdentity({ spec, registry, sources, signal }) {
+  const kind = specIdentityKind(spec);
+  if (kind === null) return undefined;
+  if (kind === "github") {
+    const repo = /^github:([^/\s]+\/[^/\s]+?)(?:\.git)?/i.exec(String(spec))[1];
+    const { results } = await verifyPlugins({ repos: [repo], sources, signal });
+    const entry = results[repo];
+    return typeof entry?.name === "string" ? { name: entry.name, version: typeof entry.version === "string" ? entry.version : null } : undefined;
+  }
+  const name = npmNameOf(String(spec));
+  if (kind === "npm-tag") {
+    const info = await npmPackageInfo(name, { registry, signal });
+    return info === null || typeof info.latest !== "string" ? undefined : { name, version: info.latest };
+  }
+  const range = String(spec).slice(name.length + 1);
+  const versions = await npmPackageVersions(name, { registry, signal });
+  if (versions === null || versions.length === 0) return undefined;
+  const best = maxSatisfying(versions, range);
+  return best === null ? undefined : { name, version: best };
+}
+
+async function runPreflight({ profile, spec, force = false, onOutput, signal, registry, sources, _profileDir, _resolveSpecIdentity = resolveSpecIdentity, _preflightInstall = preflightInstall }) {
   let profileDir;
   try {
-    profileDir = resolveProfileDir(profile);
+    profileDir = _profileDir ?? resolveProfileDir(profile);
   } catch (error) {
     throw new Error(`invalid profile: ${error.message}`);
   }
@@ -381,10 +441,34 @@ async function runPreflight({ profile, spec, force = false, onOutput, signal }) 
     && (isPinned(validCached) || Date.now() - validCached.at < PREFLIGHT_TTL);
 
   if (!force && fresh) {
-    return { report: validCached.report, profileDir, fingerprint: currentFingerprint };
+    // 缓存复用的前提是「重跑会得到同一份结论」。profile 指纹管住了 profile
+    // 一侧；spec 若是可变引用（裸名、@latest、range、无 sha 的 github），
+    // 候选那一侧还必须再核一次——探测时装的是 1.0.0、现在 latest 是 2.0.0
+    // 的话，这份缓存喂给安装的就是从未预检过的内容。核不上（不可达、
+    // 形状不可判定）不强行作废：探针用的同一个 registry 都够不着，重跑也
+    // 只会失败。核得上且对不上 → 丢弃重跑。
+    const candidate = validCached.report?.candidate;
+    if (typeof candidate?.name !== "string" || typeof candidate?.version !== "string") {
+      return { report: validCached.report, profileDir, fingerprint: currentFingerprint };
+    }
+    let current;
+    try {
+      current = await _resolveSpecIdentity({ spec, registry, sources, signal });
+    } catch (error) {
+      if (isAbortError(error)) throw error; // 取消不是「核不上」，照旧上抛、不落缓存
+      current = undefined;
+    }
+    // 版本核不出来（清单没写 version、registry 不含该包）视同「核不上」，
+    // 不作废——否则一个没写 version 的仓库会让缓存永远命不中，每次都白跑
+    // 一整轮隔离探装。
+    if (current === undefined || typeof current.version !== "string"
+      || (current.name === candidate.name && current.version === candidate.version)) {
+      return { report: validCached.report, profileDir, fingerprint: currentFingerprint };
+    }
+    preflightCache.delete(key); // 身份漂了：缓存里这份结论作废，下面重跑探装
   }
 
-  const report = await preflightInstall({ profileDir, spec, onOutput, signal });
+  const report = await _preflightInstall({ profileDir, spec, onOutput, signal });
   preflightCache.set(key, {
     report,
     fingerprint: currentFingerprint,
@@ -1446,7 +1530,7 @@ function createInstallJobProducer({
     signal.throwIfAborted();
 
     pushPreflight(`[dsh-plugin-mall] 预检 ${spec}：隔离目录探装（脚本禁用）\n`);
-    const preflight = await _runPreflight({ profile, spec, onOutput: pushPreflight, signal });
+    const preflight = await _runPreflight({ profile, spec, onOutput: pushPreflight, signal, registry, sources: rawSources });
     signal.throwIfAborted(); // 命中缓存时预检不会自己抛，这里补一次取消检查
     pushPreflight(`[dsh-plugin-mall] 预检结论：${preflight.report.verdict}\n`);
 
@@ -1844,7 +1928,7 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
           session,
           run: async (push) => {
             push(`[dsh-plugin-mall] 预检 ${resolved}：隔离目录探装（脚本禁用）\n`);
-            const { report, profileDir: probedDir, fingerprint: probedFingerprint } = await runPreflight({ profile, spec: resolved, onOutput: (text) => push(text) });
+            const { report, profileDir: probedDir, fingerprint: probedFingerprint } = await runPreflight({ profile, spec: resolved, onOutput: (text) => push(text), registry, sources: rawSources });
             // 结论 + 逐条原因都进日志。extras 只喂给风险卡片，卡片一关就什么
             // 都不剩了；日志是留得住的那一份。
             push(preflightVerdictLog(report));
@@ -1913,7 +1997,7 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
       let acceptWarningsActive = false;
       let approvedProof = undefined;
       try {
-        preflight = await runPreflight({ profile, spec });
+        preflight = await runPreflight({ profile, spec, registry, sources: rawSources });
         if (approvalToken !== undefined) {
           const consumeResult = consumeApprovalToken({
             token: approvalToken,
@@ -3337,6 +3421,100 @@ export async function runSelfTests() {
       pinPreflight(profileDir, pinSpec);
       check("profile 一变 → pin 拒绝钉住并丢弃缓存", preflightCache.get(pinKey) === undefined);
       writeFileSync(patchPath, patchBefore);
+    }
+
+    // ── 12b1. spec 形态判定：哪些引用是可变的，复用前必须重新核 ──────────────
+    {
+      const cases = [
+        ["pkg", "npm-tag"],
+        ["pkg@latest", "npm-tag"],
+        ["pkg@*", "npm-tag"],
+        ["@scope/pkg", "npm-tag"], // scoped 裸名没有 range——判定看名字后有没有东西，不看 @
+        ["pkg@^1.2.0", "npm-range"],
+        ["@scope/pkg@~2.0.0", "npm-range"],
+        ["pkg@1.2.3", null], // 精确版本：npm 禁止覆盖已发布版本，不可变
+        ["pkg@1.2.3-beta.1", null],
+        ["github:owner/repo", "github"],
+        ["github:owner/repo#main", "github"],
+        ["github:owner/repo#a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", null], // 40 位 sha 钉死
+        ["file:../local.tgz", null],
+        ["link:../pkg", null],
+        ["https://example.com/pkg.tgz", null],
+        ["owner/repo", null], // 到 runPreflight 时已被 preferNpmSpec 改写过，防御性放行
+      ];
+      let kindOk = true;
+      for (const [spec, expected] of cases) {
+        if (specIdentityKind(spec) !== expected) { kindOk = false; console.error(`  specIdentityKind(${JSON.stringify(spec)}) = ${JSON.stringify(specIdentityKind(spec))}，预期 ${JSON.stringify(expected)}`); }
+      }
+      check("spec 形态判定表（可变/不可变）", kindOk);
+    }
+
+    // ── 12b2. 缓存复用的候选身份再校验：复用 ≡ 重跑，差在这里补齐 ──────────
+    //
+    // pin 的时长里 profile 可以不动而候选包发新版（裸名/@latest/range/无 sha
+    // 的 github）。指纹只管 profile 一侧；候选一侧靠复用前重新解析。核不上
+    // 不作废（探针用的同一个 registry 也够不着，重跑只会失败），核得上且对
+    // 不上才丢弃重跑。
+    {
+      const idSpec = "mutable-pkg";
+      const idKey = preflightCacheKey(profileDir, idSpec);
+      const probeCalls = { count: 0 };
+      const probeReport = (version) => ({
+        verdict: "safe", summary: "", issues: [],
+        candidate: { name: "mutable-pkg", version, kind: "bundle", rows: [] },
+      });
+      const seedCache = (version) => {
+        preflightCache.set(idKey, {
+          report: probeReport(version),
+          fingerprint: computeProfileFingerprint(profileDir),
+          at: Date.now(),
+          pinnedAt: Date.now(),
+        });
+      };
+      const run = (resolve) => runPreflight({
+        profile: "unused-by-fixture",
+        spec: idSpec,
+        _profileDir: profileDir,
+        registry: "https://registry.npmjs.org",
+        sources: [],
+        _resolveSpecIdentity: resolve,
+        _preflightInstall: async () => { probeCalls.count++; return probeReport("2.0.0"); },
+      });
+
+      // a) 身份一致 → 复用缓存，探装一次都不跑
+      seedCache("1.0.0");
+      const same = await run(async () => ({ name: "mutable-pkg", version: "1.0.0" }));
+      check("身份一致 → 复用缓存不重跑探装",
+        same.report.candidate.version === "1.0.0" && probeCalls.count === 0,
+        `version=${same.report.candidate.version} probes=${probeCalls.count}`);
+
+      // b) latest 漂了 → 缓存作废、重跑、新报告落缓存。重跑装的正是新版
+      //    2.0.0，新报告的 digest 也随之变化——上一条修的同意绑定由此接上。
+      const drifted = await run(async () => ({ name: "mutable-pkg", version: "2.0.0" }));
+      check("候选漂移 → 丢弃缓存重跑探装",
+        drifted.report.candidate.version === "2.0.0" && probeCalls.count === 1,
+        `version=${drifted.report.candidate.version} probes=${probeCalls.count}`);
+      check("漂移重跑后缓存里存的是新报告",
+        preflightCache.get(idKey)?.report?.candidate?.version === "2.0.0");
+
+      // c) 核不上（registry 不可达 / 清单没写 version）→ 保留缓存。否则一个
+      //    网络抖动就把所有 pin 打废，用户又要白等一轮探装。
+      seedCache("1.0.0");
+      const unreachable = await run(async () => undefined);
+      check("身份核不上 → 保留缓存",
+        unreachable.report.candidate.version === "1.0.0" && probeCalls.count === 1,
+        `version=${unreachable.report.candidate.version} probes=${probeCalls.count}`);
+      const noVersion = await run(async () => ({ name: "mutable-pkg", version: null }));
+      check("解析结果没有 version → 视同核不上，保留缓存",
+        noVersion.report.candidate.version === "1.0.0" && probeCalls.count === 1);
+
+      // d) 取消上抛，且缓存保持原样——取消不是「核不上」，不许走复用分支。
+      let aborted = false;
+      try {
+        await run(async () => { const error = new Error("cancelled"); error.name = "AbortError"; throw error; });
+      } catch (error) { aborted = error?.name === "AbortError"; }
+      check("身份再校验中取消 → 上抛 AbortError 且缓存原样",
+        aborted && preflightCache.get(idKey)?.report?.candidate?.version === "1.0.0" && probeCalls.count === 1);
     }
 
     // ── 12b. 预检的告警原文必须留在 job 日志里 ──────────────────────────────

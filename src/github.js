@@ -215,6 +215,44 @@ export async function npmPackageInfo(name, { registry, signal } = {}) {
   return info;
 }
 
+const npmVersionsCache = new Map();
+
+/**
+ * All published version strings of a package, oldest to newest, for resolving
+ * a RANGE spec ("pkg@^1.2.0") to the version pnpm would actually pick today.
+ * `/latest` cannot answer that — a new release inside the range is invisible
+ * to it until it becomes latest. Fetches the full packument (one request),
+ * which is why this lives behind its own TTL like npmPackageInfo. Same
+ * cancellation rule: AbortError is rethrown, never cached as an empty answer.
+ * @returns string[], or null when unreachable/unknown.
+ */
+export async function npmPackageVersions(name, { registry, signal } = {}) {
+  const clean = String(name ?? "").trim();
+  if (clean.length === 0 || !/^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/i.test(clean)) return null;
+  const base = normalizeRegistry(registry);
+  const key = `${base}|${clean}`;
+  const cached = npmVersionsCache.get(key);
+  if (cached !== undefined && Date.now() - cached.at < NPM_CACHE_TTL) return cached.versions;
+  let versions = null;
+  try {
+    const response = await fetch(`${base}/${clean.replace("/", "%2F")}`, {
+      headers: { "User-Agent": "dsh-plugin-mall", Accept: "application/json" },
+      signal,
+    });
+    if (response.ok) {
+      const body = await response.json();
+      if (body?.versions !== null && typeof body?.versions === "object") {
+        versions = Object.keys(body.versions);
+      }
+    }
+  } catch (error) {
+    if (error?.name === "AbortError") throw error;
+    versions = null;
+  }
+  npmVersionsCache.set(key, { versions, at: Date.now() });
+  return versions;
+}
+
 /**
  * Rewrite "github:owner/repo" (or "owner/repo") to the npm package name when
  * that package exists on npm AND its repository URL points back at the repo
