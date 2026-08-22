@@ -3718,13 +3718,21 @@ async function runTransactionFixtures() {
       };
       let releaseCorepack;
       const corepackRunning = new Promise((resolveGate) => { releaseCorepack = resolveGate; });
+      // corepack 的子进程必须真的被 cancel() 够到，而不只是「之后不再 spawn」。
+      // 交出去的句柄没人杀的话，corepack 会在后台把 pnpm 装完，用户按的那次
+      // 取消就只挡住了后半程。
+      let corepackKilled = false;
       const install = runInstall({
         profile: "p",
         spec: "pkg-a",
         preflight: preflightStub("pkg-a"),
         _profileDir: profileDir,
         _spawn: spawnFn,
-        _corepack: async () => { await corepackRunning; return true; }, // 自愈"成功"
+        _corepack: async (_push, onProc) => {
+          onProc?.({ proc: { pid: 999, kill: () => { corepackKilled = true; } }, treeKill: false });
+          await corepackRunning;
+          return true; // 自愈"成功"——取消也必须挡住它后面的安装
+        },
       });
       await flush();
       const spawnsBeforeCancel = spawnCount;
@@ -3735,6 +3743,11 @@ async function runTransactionFixtures() {
         "corepack 自愈期间取消 → retry spawn 次数为 0",
         spawnCount === spawnsBeforeCancel && spawnCount === 1,
         `spawnCount=${spawnCount} beforeCancel=${spawnsBeforeCancel}`,
+      );
+      check(
+        "corepack 自愈期间取消 → corepack 子进程确实收到 kill",
+        corepackKilled === true,
+        `corepackKilled=${corepackKilled}`,
       );
       check(
         "corepack 自愈期间取消 → 结局是 killed",

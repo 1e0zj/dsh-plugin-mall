@@ -1360,6 +1360,7 @@ function createInstallJobProducer({
   npmRegistry = "",
   rawSources = [],
   profileExisted = true,
+  profileDir: requestedProfileDir,
   _registryFor = registryFor,
   _preferNpmSpec = preferNpmSpec,
   _assertSafeToInstall = assertSafeToInstall,
@@ -1468,13 +1469,20 @@ function createInstallJobProducer({
     return outcome;
   })().catch((error) => {
     if (isAbortError(error)) {
-      // 取消发生在预检阶段：探装全在临时目录里，正式 profile 没被装进任何东西。
-      // 唯一的例外是 profile 本来就不存在——预检会先 ensureProfile() 把它建出来
+      // 取消时探装全在临时目录里，正式 profile 没被装进任何东西。唯一的例外
+      // 是 profile 本来就不存在——预检会先 ensureProfile() 把它建出来
       // （package.json / cordis.patch.yml / pnpm-workspace.yaml 真的落盘）。
-      // 那种情况下「从未被修改」是假的，如实说建了什么。
+      //
+      // 「本来不存在」不等于「我们建了」：ensureProfile() 在 runPreflight 里，
+      // 而取消可能发生在更早的 registry 查询、防抢注解析或宿主遮蔽检查阶段，
+      // 那时磁盘上一个字节都还没写。所以这里查磁盘的当前事实，而不是拿开工前
+      // 的快照去推断——推断会随着链路上再加一步就悄悄失真，实地检查不会。
+      const profileCreatedHere = profileExisted === false
+        && requestedProfileDir !== undefined
+        && existsSync(join(requestedProfileDir, "package.json"));
       return {
         status: "killed",
-        detail: profileExisted === false
+        detail: profileCreatedHere
           ? `install of ${requestedSpec} was cancelled during preflight — no packages were installed, but the profile did not exist and was initialized before the probe started`
           : `install of ${requestedSpec} was cancelled during preflight — the profile was never modified`,
       };
@@ -2199,13 +2207,15 @@ export function apply(ctx, config = {}) {
       const profile = String(args.profile ?? defaultProfile).trim();
       // profile 名非法要当场报错，而不是变成一个注定失败的后台 job——
       // 与 market_uninstall 一致。
+      let installProfileDir;
       let profileExisted;
       try {
         // 顺便记下 profile 本来存不存在：预检会给尚未初始化的 profile 调
         // ensureProfile()（真的落盘 package.json 等文件），所以取消时那句
         // 「profile 从未被修改」对新建的 profile 并不成立。这里是唯一还能
         // 看到「动手之前」状态的位置。
-        profileExisted = existsSync(join(resolveProfileDir(profile), "package.json"));
+        installProfileDir = resolveProfileDir(profile);
+        profileExisted = existsSync(join(installProfileDir, "package.json"));
       } catch (error) {
         throw new Error(`market_install: invalid profile: ${error.message}`);
       }
@@ -2239,6 +2249,7 @@ export function apply(ctx, config = {}) {
           npmRegistry,
           rawSources,
           profileExisted,
+          profileDir: installProfileDir,
         }),
       });
       return { kind: "background", jobId };
@@ -3372,6 +3383,7 @@ export async function runSelfTests() {
         spec: "slow-pkg",
         agentOwner: "agent-selftest",
         profileExisted: false,
+        profileDir, // 预检已经把它 ensureProfile 出来了（这个目录有 package.json）
         ...seams({
           _runPreflight: ({ signal }) => new Promise((_resolve, rejectPreflight) => {
             signal.addEventListener("abort", () => {
@@ -3392,6 +3404,38 @@ export async function runSelfTests() {
       check("未初始化 profile 取消 → 如实说明 profile 已被初始化",
         /was initialized before the probe started/.test(freshOutcome?.detail ?? ""));
       check("未初始化 profile 取消 → 仍然不进入 pnpm 阶段", freshInstalls.calls === 0);
+
+      // 13c3. 取消发生在预检**之前**（registry 查询这一段）。ensureProfile()
+      // 在 runPreflight 里，这时磁盘上一个字节都还没写，所以即便 profile
+      // 本来不存在，也绝不能说「已经把它初始化了」——那会让用户去找一个
+      // 根本不存在的目录。判据必须是磁盘的当前事实，不是开工前的快照。
+      const earlyInstalls = { calls: 0 };
+      let earlyPreflightCalls = 0;
+      let releaseRegistry;
+      const registryGate = new Promise((resolveGate) => { releaseRegistry = resolveGate; });
+      const earlyProducer = createInstallJobProducer({
+        profile: "web",
+        spec: "slow-pkg",
+        agentOwner: "agent-selftest",
+        profileExisted: false,
+        profileDir: join(root, "profile-that-was-never-created"),
+        ...seams({
+          // 真实的 registryFor 不吃 signal（见 producer 注释），照此模拟：
+          // 它跑完之后才轮到 throwIfAborted 生效。
+          _registryFor: async () => { await registryGate; return "https://registry.npmjs.org"; },
+          _runPreflight: () => { earlyPreflightCalls++; throw new Error("不该走到预检"); },
+          _runInstall: neverInstall(earlyInstalls),
+        }),
+      });
+      await new Promise((resolveTick) => setImmediate(resolveTick));
+      earlyProducer.cancel(); // 还卡在 registry 查询里
+      releaseRegistry();
+      const earlyOutcome = await settleWithin(earlyProducer.done, 5000, "预检之前的取消");
+      check("预检前取消 → 结算为 killed", earlyOutcome?.status === "killed");
+      check("预检前取消 → 根本没进预检", earlyPreflightCalls === 0 && earlyInstalls.calls === 0);
+      check("预检前取消 → 不谎称已初始化 profile（磁盘上什么都没建）",
+        !/was initialized before the probe started/.test(earlyOutcome?.detail ?? "")
+        && /the profile was never modified/.test(earlyOutcome?.detail ?? ""));
 
       // 13d. 审批 token 签发失败（这里用缺失的 proof 触发）。以前这段跑在
       // .then 里，一抛就把 done 变成 rejected —— 违反「done 必须不 reject」，
