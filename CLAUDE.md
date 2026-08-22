@@ -59,7 +59,8 @@ https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/HEAD/docs/<path>.
 
 ## 四、验证
 
-- 离线 fixture：`node src/<file>.js --self-test`（github.js 加 `--offline`）。
+- 离线 fixture：`node src/<file>.js --self-test`（github.js 加 `--offline`；
+  cli.js 例外，是子命令形式 `node src/cli.js self-test`）。
   改判定逻辑前后必跑。CI 发布前会全跑一遍。
 - **真实路径实测**不可省：fixture 照着设计测，测不出设计本身的错误假设。
   典型例子：guard 的启动保护原本要求用户改用 `guard launch` 启动，
