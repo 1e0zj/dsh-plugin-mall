@@ -1282,6 +1282,22 @@ function renderPreflightIssue(entry) {
 }
 
 /**
+ * The verdict plus every issue verbatim, as job-log text.
+ *
+ * The browser used to log only the verdict and hand the reasons to the risk
+ * card through `extras`. Closing that card — or clicking "install anyway" —
+ * took the reasons with it, and nothing else on the page ever had them. The
+ * job log is the part that survives, so the evidence belongs here; the card
+ * stays what it should be, the place to make the decision. The agent path
+ * has carried the individual BLOCK/WARN lines in its job detail all along.
+ */
+function preflightVerdictLog(report) {
+  const lines = [`[dsh-plugin-mall] 预检结论：${report?.verdict}\n`];
+  for (const entry of report?.issues ?? []) lines.push(`${renderPreflightIssue(entry)}\n`);
+  return lines.join("");
+}
+
+/**
  * Why this install must not proceed — or undefined when it may.
  *
  * Split out of enforcePreflight() because the two call sites need the verdict
@@ -1789,7 +1805,9 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker) {
           run: async (push) => {
             push(`[dsh-plugin-mall] 预检 ${resolved}：隔离目录探装（脚本禁用）\n`);
             const { report } = await runPreflight({ profile, spec: resolved, onOutput: (text) => push(text) });
-            push(`[dsh-plugin-mall] 预检结论：${report.verdict}\n`);
+            // 结论 + 逐条原因都进日志。extras 只喂给风险卡片，卡片一关就什么
+            // 都不剩了；日志是留得住的那一份。
+            push(preflightVerdictLog(report));
             return { status: "completed", detail: `预检完成：${report.verdict}`, extras: report };
           },
         });
@@ -3221,6 +3239,27 @@ export async function runSelfTests() {
     const rolledLog = quietLog();
     runStartupRecovery("profile-a", { recover: () => ({ action: "rolled-back", reason: "静态校验未通过" }), log: rolledLog });
     check("回滚路径播报原因", rolledLog.lines.some((line) => line.includes("rolled back") && line.includes("静态校验未通过")));
+
+    // ── 12b. 预检的告警原文必须留在 job 日志里 ──────────────────────────────
+    //
+    // 此前浏览器侧只 push 了一行 verdict，逐条原因走 extras 进风险卡片。卡片
+    // 一关（或点了「继续安装」）那些原因就再也找不回来了，而用户回头想弄清
+    // 「刚才到底警告了什么」只有日志可查。
+    {
+      const log = preflightVerdictLog({
+        verdict: "warning",
+        issues: [
+          { severity: "warn", title: "无法验证宿主依赖", detail: "需要 @deepseek-ai/dsh-client-ui-slots@^0.1.0-rc.8，但预检无法解析宿主版本。" },
+          { severity: "block", title: "重复挂载", detail: "两行指向同一个模块" },
+        ],
+      });
+      check("预检日志带结论", /预检结论：warning/.test(log));
+      check("预检日志逐条带 WARN 原文（含 detail，不是只有标题）",
+        /\[WARN\] 无法验证宿主依赖: .*dsh-client-ui-slots@\^0\.1\.0-rc\.8/.test(log));
+      check("预检日志逐条带 BLOCK 原文", /\[BLOCK\] 重复挂载: 两行指向同一个模块/.test(log));
+      check("没有 issues 时不炸、仍带结论",
+        preflightVerdictLog({ verdict: "safe" }) === "[dsh-plugin-mall] 预检结论：safe\n");
+    }
 
     // ── 13. market_install：整条链跑在 job 里（issue #8）────────────────────
     // 原来 registry 查询 → 防抢注解析 → 隔离预检全在 ctx.jobs.start() 之前 await，
