@@ -1460,8 +1460,43 @@ export function pnpmSpawnPlan({ platform = process.platform, pathEnv = process.e
   return { command: `"${cmd}"`, shell: true, treeKill: true };
 }
 
-function spawnCapture(command, args, options, onOutput) {
+/** Build the cancellation error every caller here recognises by `name`. */
+function abortError(message) {
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
+}
+
+/**
+ * Whether an error is a cancellation rather than a failure. fetch/AbortSignal
+ * throw a DOMException named "AbortError"; abortError() above matches it. The
+ * distinction is load-bearing: a cancellation must never be reported as a
+ * verdict, cached, or turned into a failed install.
+ */
+export function isAbortError(error) {
+  return error?.name === "AbortError";
+}
+
+/**
+ * Spawn, stream, and capture — with an optional cancellation seam.
+ *
+ * `options.signal`/`options.treeKill` (5th argument) make the child killable:
+ * an already-aborted signal spawns nothing at all, and an abort mid-run
+ * terminates the child. `treeKill` mirrors installer.js killProcessTree — on
+ * Windows a shell-wrapped pnpm is a GRANDCHILD of cmd.exe, so killing the
+ * wrapper leaves the real pnpm running and still writing; taskkill /T /F takes
+ * the whole tree. Either way the promise still settles on 'close', never on
+ * the abort itself: the caller must not get control back (and start deleting
+ * the probe directory) while a pnpm process is still writing into it.
+ */
+function spawnCapture(command, args, options, onOutput, { signal, treeKill = false } = {}) {
   return new Promise((resolvePromise) => {
+    if (signal?.aborted === true) {
+      // 已经取消了就一个字节都别做：spawn 之后再杀，probe 目录里会留下半棵
+      // 依赖树，pnpm store 也已经被写过。
+      resolvePromise({ exitCode: 1, output: "", aborted: true });
+      return;
+    }
     let child;
     const chunks = [];
     const push = (value) => {
@@ -1480,12 +1515,30 @@ function spawnCapture(command, args, options, onOutput) {
       resolvePromise({ exitCode: 1, output: "", error });
       return;
     }
+    let aborted = false;
+    const onAbort = () => {
+      aborted = true;
+      if (treeKill === true && process.platform === "win32" && typeof child.pid === "number") {
+        try {
+          spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true, timeout: 10000 });
+        } catch { /* taskkill 不在 PATH 上——退回下面的普通 kill */ }
+      }
+      try { child.kill(); } catch { /* already gone */ }
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const settle = (result) => {
+      signal?.removeEventListener("abort", onAbort);
+      resolvePromise({ ...result, aborted });
+    };
     child.stdout?.on("data", push);
     child.stderr?.on("data", push);
-    child.on("error", (error) => resolvePromise({ exitCode: 1, output: chunks.join(""), error }));
-    child.on("close", (exitCode) => resolvePromise({ exitCode: exitCode ?? 1, output: chunks.join("") }));
+    child.on("error", (error) => settle({ exitCode: 1, output: chunks.join(""), error }));
+    child.on("close", (exitCode) => settle({ exitCode: exitCode ?? 1, output: chunks.join("") }));
   });
 }
+
+/** Exported only so the self-test can drive the cancel path with a real child. */
+export const _spawnCaptureForTests = spawnCapture;
 
 // The install spec is eventually handed to `pnpm add` — through a cmd shell on
 // Windows, where Node joins the args with spaces and does not per-argument
@@ -1521,8 +1574,14 @@ function probeAddArgs(spec) {
 /**
  * Install a candidate into a disposable directory with every lifecycle script
  * disabled, then inspect its actual package manifest and patch files.
+ *
+ * `signal` cancels the probe. Cancellation is reported by THROWING an
+ * AbortError, never as a report: a report is a verdict about the candidate,
+ * and the caller caches and acts on it. "The user pressed cancel" is not a
+ * verdict — folding it into a blocked report would pin a fabricated blocker
+ * into the preflight cache for the rest of its TTL.
  */
-export async function preflightInstall({ profileDir, spec, onOutput }) {
+export async function preflightInstall({ profileDir, spec, onOutput, signal }) {
   try {
     assertSafeSpec(spec);
   } catch (error) {
@@ -1536,6 +1595,7 @@ export async function preflightInstall({ profileDir, spec, onOutput }) {
   }
   const probeDir = mkdtempSync(join(tmpdir(), "dsh-plugin-guard-"));
   try {
+    if (signal?.aborted === true) throw abortError(`preflight of ${spec} was cancelled before it started`);
     writeFileSync(join(probeDir, "package.json"), JSON.stringify({ name: "dsh-plugin-guard-probe", private: true }, undefined, 2) + "\n");
     writeFileSync(join(probeDir, "pnpm-workspace.yaml"), "packages:\n  - .\n\nnodeLinker: hoisted\n");
     // Reuse the profile's registry/auth settings for the probe. The file may
@@ -1545,7 +1605,18 @@ export async function preflightInstall({ profileDir, spec, onOutput }) {
     if (existsSync(profileNpmrc)) copyFileSync(profileNpmrc, join(probeDir, ".npmrc"));
     onOutput?.(`[dsh-plugin-guard] probing ${spec} with install scripts disabled\n`);
     const plan = pnpmSpawnPlan();
-    const result = await spawnCapture(plan.command, probeAddArgs(spec), { cwd: probeDir, env: process.env, shell: plan.shell }, onOutput);
+    const result = await spawnCapture(
+      plan.command,
+      probeAddArgs(spec),
+      { cwd: probeDir, env: process.env, shell: plan.shell },
+      onOutput,
+      { signal, treeKill: plan.treeKill },
+    );
+    // 取消先判：被杀掉的 pnpm 退出码非 0，不先分流就会被报成
+    // "无法在隔离环境解析插件" —— 一条纯属捏造的阻断结论。
+    if (result.aborted === true || signal?.aborted === true) {
+      throw abortError(`preflight of ${spec} was cancelled`);
+    }
     if (result.exitCode !== 0) {
       return {
         ok: false,
@@ -1570,6 +1641,10 @@ export async function preflightInstall({ profileDir, spec, onOutput }) {
     if (candidatePath === undefined) throw new Error(`installed package ${names[0]} has no resolvable package.json`);
     return inspectCandidate({ profileDir, candidateManifestPath: candidatePath, spec });
   } catch (error) {
+    // 取消必须先于这个兜底放行。兜底存在的意义是「任何意外都变成一份可读的
+    // 阻断报告」，而取消不是意外，是用户的指令；混进来就成了一条会被缓存、
+    // 会被当成候选包问题展示的假结论。
+    if (isAbortError(error)) throw error;
     return {
       ok: false,
       verdict: "blocked",
@@ -4573,6 +4648,62 @@ async function selfTest() {
       if (vMismatch.ok !== false || vMismatch.verdict !== "blocked" || !vMismatch.issues.some((e) => e.code === "package-unresolved" && e.package === "expected-name")) {
         throw new Error("validateInstalledProfile must block with package-unresolved when package.json has mismatched name");
       }
+    }
+
+    // ── 取消传播（spawnCapture / preflightInstall）─────────────────────────
+    //
+    // 预检是 market_install 里唯一真正耗时的一段（隔离目录探装）。它此前完全
+    // 不可取消：按下 job_kill 只是标记了记录，pnpm 照跑到底。这三条钉的是
+    // 取消语义本身——不 spawn、等 close、以及「取消不是一份阻断报告」。
+    {
+      const marker = join(root, "child-ran.txt");
+      const writeMarker = `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran")`;
+
+      // 1) 已经取消 → 一个子进程都不该起。
+      const preAborted = await _spawnCaptureForTests(
+        process.execPath,
+        ["-e", writeMarker],
+        { env: process.env },
+        undefined,
+        { signal: AbortSignal.abort() },
+      );
+      if (preAborted.aborted !== true) throw new Error("已 abort 的 signal 必须标记 aborted");
+      if (existsSync(marker)) throw new Error("已 abort 的 signal 仍然 spawn 了子进程");
+      console.log("PASS 取消：已 abort 的 signal 不 spawn 子进程");
+
+      // 2) 飞行中取消 → 杀掉子进程，但仍然等到 'close' 才 resolve。
+      //    （resolve 早于进程退出，调用方就会在 pnpm 还在写的时候删 probe 目录。）
+      const controller = new AbortController();
+      const startedAt = Date.now();
+      let closedAt;
+      const running = _spawnCaptureForTests(
+        process.execPath,
+        ["-e", `process.on("exit", () => {}); setTimeout(() => { ${writeMarker} }, 30000)`],
+        { env: process.env },
+        undefined,
+        { signal: controller.signal, treeKill: false },
+      ).then((result) => { closedAt = Date.now(); return result; });
+      await new Promise((r) => setTimeout(r, 150));
+      controller.abort();
+      const killed = await running;
+      const elapsed = closedAt - startedAt;
+      if (killed.aborted !== true) throw new Error("飞行中取消必须标记 aborted");
+      if (elapsed > 20000) throw new Error(`取消后应立即终止子进程，实测等了 ${elapsed}ms`);
+      if (existsSync(marker)) throw new Error("取消后子进程仍然跑完了它的工作");
+      console.log(`PASS 取消：飞行中取消终止子进程并等到 close 才 resolve（${elapsed}ms）`);
+
+      // 3) preflightInstall 取消 → 抛 AbortError，而不是返回一份 blocked 报告。
+      //    兜底 catch 会把任何异常变成「预检执行失败」的阻断结论；那份结论会
+      //    被上层缓存、展示成候选包的问题，而用户只是按了取消。
+      let cancelOutcome = "<resolved>";
+      try {
+        const report = await preflightInstall({ profileDir, spec: "any-package", signal: AbortSignal.abort() });
+        cancelOutcome = `report:${report.verdict}`;
+      } catch (error) {
+        cancelOutcome = isAbortError(error) ? "abort" : `error:${error?.name}`;
+      }
+      if (cancelOutcome !== "abort") throw new Error(`preflightInstall 取消必须上抛 AbortError，实得 ${cancelOutcome}`);
+      console.log("PASS 取消：preflightInstall 上抛 AbortError（不伪造阻断报告）");
     }
 
     console.log("PASS conflict scan and snapshot/pending/rollback fixtures");

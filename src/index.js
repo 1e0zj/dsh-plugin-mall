@@ -27,7 +27,7 @@ import { tmpdir } from "node:os";
 import { resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
 import { repoInfo, searchPlugins, verifyPlugins, cachedRepoManifest, fetchRawFile, preferNpmSpec, npmPackageInfo, compareVersions, assertSafeToInstall, mapLimit, NETWORK_CONCURRENCY } from "./github.js";
 import { ensureProfile, listInstalled, normalizeSpec, runInstall, runRemove, assertSafeSpec, resolveRegistry, serializeCanonicalProof, persistPluginDisabled } from "./installer.js";
-import { preflightInstall, inspectRemoteCandidate, recoverProfile, describeRollbackRebuild } from "./guard.js";
+import { preflightInstall, inspectRemoteCandidate, recoverProfile, describeRollbackRebuild, isAbortError } from "./guard.js";
 import { createRestartHelperReadyMessage, RESTART_HELPER_READY_TYPE, RESTART_RESPONSE_DRAIN_MS, superviseRestartHelper } from "./restart-protocol.js";
 
 export const name = "@1e0zj/dsh-plugin-mall";
@@ -350,8 +350,15 @@ function pinPreflight(profileDir, spec) {
 /**
  * Run the isolated preflight for a resolved install spec, reusing a fresh
  * cache entry ONLY if the profile fingerprint matches.
+ *
+ * `signal` cancels the probe. Nothing extra is needed to protect the cache:
+ * preflightInstall THROWS an AbortError on cancellation instead of returning a
+ * report, so control never reaches preflightCache.set() below and a cancelled
+ * run leaves the cache exactly as it found it. (Had cancellation come back as
+ * a `blocked` report, that fabricated verdict would have been cached for the
+ * whole TTL and every later install of this spec refused with it.)
  */
-async function runPreflight({ profile, spec, force = false, onOutput }) {
+async function runPreflight({ profile, spec, force = false, onOutput, signal }) {
   let profileDir;
   try {
     profileDir = resolveProfileDir(profile);
@@ -377,7 +384,7 @@ async function runPreflight({ profile, spec, force = false, onOutput }) {
     return { report: validCached.report, profileDir, fingerprint: currentFingerprint };
   }
 
-  const report = await preflightInstall({ profileDir, spec, onOutput });
+  const report = await preflightInstall({ profileDir, spec, onOutput, signal });
   preflightCache.set(key, {
     report,
     fingerprint: currentFingerprint,
@@ -1275,20 +1282,200 @@ function renderPreflightIssue(entry) {
 }
 
 /**
+ * Why this install must not proceed — or undefined when it may.
+ *
+ * Split out of enforcePreflight() because the two call sites need the verdict
+ * in two different shapes. The browser RPC decides BEFORE any job exists, so
+ * an exception is the right carrier: it aborts the request and becomes an
+ * rpcFail. The agent tool now decides INSIDE the job, where an exception is
+ * exactly the wrong carrier — a producer's `done` must never reject, and "the
+ * preflight refused this candidate" is not an internal error but the job's
+ * legitimate outcome, so it has to travel as text on a `failed` outcome.
+ */
+function preflightRefusal(report, acceptWarnings, label) {
+  if (report.verdict === "blocked") {
+    return `${label}: ${report.summary}\n${report.issues.filter((entry) => entry.severity === "block").map(renderPreflightIssue).join("\n")}`;
+  }
+  if (report.verdict === "warning" && acceptWarnings !== true) {
+    return `${label}: ${report.summary}\n${report.issues.filter((entry) => entry.severity === "warn").map(renderPreflightIssue).join("\n")}\n\nTo continue, show these warnings to the user and, after their explicit confirmation, call again with acceptWarnings: true.`;
+  }
+  return undefined;
+}
+
+/**
  * Enforce a preflight verdict for an install. Throws when a blocker exists, or
  * when there are only warnings and acceptWarnings is not true.
  */
 function enforcePreflight(report, acceptWarnings, label) {
-  if (report.verdict === "blocked") {
-    const error = new Error(`${label}: ${report.summary}\n${report.issues.filter((entry) => entry.severity === "block").map(renderPreflightIssue).join("\n")}`);
+  const refusal = preflightRefusal(report, acceptWarnings, label);
+  if (refusal !== undefined) {
+    const error = new Error(refusal);
     error.preflight = report;
     throw error;
   }
-  if (report.verdict === "warning" && acceptWarnings !== true) {
-    const error = new Error(`${label}: ${report.summary}\n${report.issues.filter((entry) => entry.severity === "warn").map(renderPreflightIssue).join("\n")}\n\nTo continue, show these warnings to the user and, after their explicit confirmation, call again with acceptWarnings: true.`);
-    error.preflight = report;
-    throw error;
-  }
+}
+
+/**
+ * The whole agent-side install — registry lookup, spec resolution, host-shadow
+ * check, isolated preflight, approval-token consumption, verdict, and pnpm —
+ * as ONE job producer.
+ *
+ * Why it all lives in here (issue #8): `ctx.jobs.start()` treats `run()` as a
+ * synchronous start boundary, so anything awaited before that call happens
+ * outside the task runtime. The old market_install awaited the registry query,
+ * the anti-squatting resolve and the isolated probe install first — tens of
+ * seconds during which the tool call had not returned, no job id existed, the
+ * work appeared in no job log, and `job_kill` had nothing to kill. The tool's
+ * own description promised the opposite ("ALWAYS runs as a background job:
+ * the call returns a job id immediately"). Moving the chain in here makes that
+ * promise true and, as a side effect, gives every slow phase a kill handle.
+ *
+ * Two invariants this shape has to keep:
+ *  - `done` NEVER rejects. It is the single settlement path the jobs runtime
+ *    consumes, so a refusal, a cancellation and an internal error all come
+ *    back as ordinary outcome objects.
+ *  - `cancel()` is synchronous and idempotent. It aborts the preflight phase
+ *    through the AbortController and, once pnpm owns the profile, hands over
+ *    to the installer's own cancel (which tree-kills and waits for 'close'
+ *    before rolling back).
+ *
+ * The `_`-prefixed parameters are test seams only; production passes none.
+ */
+function createInstallJobProducer({
+  profile,
+  spec: requestedSpec,
+  acceptWarnings: acceptWarningsRequested = false,
+  allowBuildScripts,
+  approvalToken,
+  agentOwner,
+  npmRegistry = "",
+  rawSources = [],
+  _registryFor = registryFor,
+  _preferNpmSpec = preferNpmSpec,
+  _assertSafeToInstall = assertSafeToInstall,
+  _runPreflight = runPreflight,
+  _runInstall = runInstall,
+}) {
+  const controller = new AbortController();
+  const { signal } = controller;
+  let inner; // the runInstall producer — only exists once pnpm is about to run
+  let cancelled = false;
+
+  // 预检阶段没有 inner 可以问，它的输出先攒在这里。
+  const preflightChunks = [];
+  const pushPreflight = (text) => { preflightChunks.push(String(text ?? "")); };
+
+  const cancel = () => {
+    if (cancelled) return; // 幂等：job_kill 可能被按多次，abort 也只该发生一次
+    cancelled = true;
+    controller.abort(); // 预检阶段：掐断 registry 请求与探针 pnpm
+    inner?.cancel(); // 安装阶段：交给 installer 的 tree-kill + 回滚
+  };
+
+  const done = (async () => {
+    const registry = await _registryFor(profile, npmRegistry);
+    signal.throwIfAborted();
+    // 防抢注解析可能把 owner/repo 换成 npm 包名，后面每一步（预检、token
+    // 比对、pnpm）都必须用这个解析后的 spec，否则重试时 token 的 spec 对不上。
+    const spec = await _preferNpmSpec({ spec: requestedSpec, registry, sources: rawSources, signal });
+    signal.throwIfAborted();
+    await _assertSafeToInstall({ spec, registry, sources: rawSources, signal });
+    signal.throwIfAborted();
+
+    pushPreflight(`[dsh-plugin-mall] 预检 ${spec}：隔离目录探装（脚本禁用）\n`);
+    const preflight = await _runPreflight({ profile, spec, onOutput: pushPreflight, signal });
+    signal.throwIfAborted(); // 命中缓存时预检不会自己抛，这里补一次取消检查
+    pushPreflight(`[dsh-plugin-mall] 预检结论：${preflight.report.verdict}\n`);
+
+    let acceptWarnings = false;
+    let acceptWarningsActive = false;
+    let approvedProof;
+    if (approvalToken !== undefined) {
+      const consumeResult = consumeApprovalToken({
+        token: approvalToken,
+        profile,
+        profileDir: preflight.profileDir,
+        spec,
+        preflightReport: preflight.report,
+        allowBuildScripts,
+        surface: "agent",
+        owner: agentOwner,
+      });
+      if (!consumeResult.valid) {
+        return { status: "failed", detail: `market_install: invalid approval token: ${consumeResult.reason}` };
+      }
+      acceptWarnings = consumeResult.warningConsent;
+      acceptWarningsActive = consumeResult.warningConsent;
+      approvedProof = consumeResult.proof;
+    } else {
+      acceptWarnings = acceptWarningsRequested === true;
+      acceptWarningsActive = acceptWarnings;
+    }
+
+    const refusal = preflightRefusal(preflight.report, acceptWarnings, `market_install ${spec}`);
+    if (refusal !== undefined) {
+      // 拒绝是这个 job 的正常结局，不是异常：作为 failed 的 detail 回去，
+      // 模型从 job_output 就能读到逐条 BLOCK/WARN。
+      return { status: "failed", detail: refusal };
+    }
+
+    pinPreflight(preflight.profileDir, spec);
+    signal.throwIfAborted(); // 从这行往后，取消归 installer 管
+    inner = _runInstall({ profile, spec, allowBuildScripts, approvedProof, preflight: preflight.report });
+    if (signal.aborted) inner.cancel(); // 上一行之前就取消过的话，补一次转交
+    const outcome = await inner.done; // installer 的 done 同样永不 reject
+
+    const status = outcome?.status ?? "failed";
+    if (status === "completed") {
+      invalidatePreflightFor(preflight.profileDir);
+      clearApprovalTokensFor(profile, spec);
+    } else if (outcome?.needsApproval && outcome.needsApproval.length > 0) {
+      clearApprovalTokensFor(profile, spec, { surface: "agent", owner: agentOwner });
+      try {
+        const token = issueApprovalToken({
+          profile,
+          profileDir: preflight.profileDir,
+          spec,
+          preflightReport: preflight.report,
+          needsApproval: outcome.needsApproval,
+          proof: outcome.proof,
+          surface: "agent",
+          owner: agentOwner,
+          acceptWarningsActive,
+        });
+        outcome.approvalToken = token;
+        outcome.detail = `${outcome.detail ?? ""}\n\nApproval token (pass to approvalToken on retry): ${token}`;
+      } catch (error) {
+        // 签发会因为凭证不完整（proof 缺失/不匹配）抛错。以前这段跑在 `.then`
+        // 里，抛出去就把 done 变成 rejected —— 官方明说 done 必须不 reject，
+        // 而且那样一来「pnpm 拦下了安装脚本」这条真正的结论会被一条内部错误
+        // 顶掉。改成写进 detail：结论照常送达，同时明说这次没法重试。
+        outcome.detail = `${outcome.detail ?? ""}\n\nNOTE: no approval token could be issued (${error?.message ?? String(error)}), so allowBuildScripts cannot be used to retry this run — start a fresh market_install instead.`;
+      }
+    } else {
+      clearApprovalTokensFor(profile, spec, { surface: "agent", owner: agentOwner });
+    }
+    return outcome;
+  })().catch((error) => {
+    if (isAbortError(error)) {
+      // 取消发生在预检阶段：profile 一个字节都没被动过（探装在临时目录里）。
+      return { status: "killed", detail: `install of ${requestedSpec} was cancelled during preflight — the profile was never modified` };
+    }
+    return { status: "failed", detail: `install of ${requestedSpec} hit an error: ${error?.message ?? String(error)}` };
+  });
+
+  return {
+    cancel,
+    done,
+    // 顺序依赖：预检阶段与安装阶段严格先后，上面的 async 体在 _runInstall
+    // 之前不会再往 preflightChunks 里写。所以「先排空缓冲、再问 inner」得到的
+    // 就是真实时间顺序；两个阶段若哪天并行了，这里必须改成带时间戳的合并。
+    readOutput: () => {
+      const buffered = preflightChunks.length === 0 ? "" : preflightChunks.splice(0).join("");
+      const live = typeof inner?.readOutput === "function" ? inner.readOutput() : "";
+      return buffered + live;
+    },
+  };
 }
 
 /** Clip long strings for compact model-facing output. */
@@ -1873,7 +2060,7 @@ export function apply(ctx, config = {}) {
   ctx.systemPrompt.section({
     name: "tool:market",
     order: 120,
-    text: "The dsh plugin marketplace tools are available: market_search discovers plugins on the GitHub dsh-plugin topic, market_info inspects one repository, market_install installs a plugin into a dsh profile as a background job (poll with job_output), market_uninstall removes an installed plugin from a dsh profile as a background job, and market_installed lists a profile's plugins. A successful market_install or market_uninstall only takes effect after the dsh process restarts — remind the user to restart. Prefer plugins with meaningful stars and a dsh.bundle declaration (market_info shows both). market_install runs an isolated preflight before installing (the candidate is probed with install scripts disabled and scanned for conflicts); a blocker refuses the install and warnings require acceptWarnings: true after the user confirms them — never set it on the user's behalf. If market_install stops for install-script approval, that decision is also the user's: show them the reported package names and commands and wait for an answer — never approve on their behalf.",
+    text: "The dsh plugin marketplace tools are available: market_search discovers plugins on the GitHub dsh-plugin topic, market_info inspects one repository, market_install installs a plugin into a dsh profile as a background job (poll with job_output), market_uninstall removes an installed plugin from a dsh profile as a background job, and market_installed lists a profile's plugins. A successful market_install or market_uninstall only takes effect after the dsh process restarts — remind the user to restart. Prefer plugins with meaningful stars and a dsh.bundle declaration (market_info shows both). market_install runs an isolated preflight before installing (the candidate is probed with install scripts disabled and scanned for conflicts); that preflight runs inside the background job, so its verdict — including a refusal — arrives through job_output rather than as an immediate error from the call. A blocker refuses the install and warnings require acceptWarnings: true after the user confirms them — never set it on the user's behalf. If market_install stops for install-script approval, that decision is also the user's: show them the reported package names and commands and wait for an answer — never approve on their behalf.",
   });
 
   ctx.tools.register(defineTool({
@@ -1951,7 +2138,7 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register(defineTool({
     name: "market_install",
-    description: "Install a plugin into a local dsh profile by running `pnpm add` in that profile's directory, reconciling the profile's bundle layer list, and — for browser-side UI plugins (`dsh.client`) — registering a loader row in the profile's cordis.patch.yml. Same flow as `dsh plugin --profile <name> add <spec>`. ALWAYS runs as a background job: the call returns a job id immediately; poll with job_output and cancel with job_kill. The install is gated by an isolated preflight (the candidate is installed with scripts disabled into a throwaway directory and scanned for manifest/patch conflicts, host-module shadowing, and version/OS incompatibilities). A blocker refuses the install outright; a warning requires the USER's explicit consent via `acceptWarnings: true` — show the reported warnings verbatim and get their answer first, never consent on their behalf. If pnpm blocks a dependency's install scripts, the job STOPS and reports which packages want to run install-time code, what those commands are, whether each is the plugin itself or a transitive dependency, and issues a one-shot approval token. Relay that list to the user verbatim, and only call again with `allowBuildScripts` naming the packages they approved along with `approvalToken`. A successful install only takes effect after the dsh process restarts.",
+    description: "Install a plugin into a local dsh profile by running `pnpm add` in that profile's directory, reconciling the profile's bundle layer list, and — for browser-side UI plugins (`dsh.client`) — registering a loader row in the profile's cordis.patch.yml. Same flow as `dsh plugin --profile <name> add <spec>`. ALWAYS runs as a background job, and the call itself does almost nothing: it validates the profile name, the spec and the approval arguments, then returns a job id. Everything slow happens INSIDE the job — resolving the spec against the npm registry, the host-module shadowing check, the isolated preflight (the candidate is installed with scripts disabled into a throwaway directory and scanned for manifest/patch conflicts and version/OS incompatibilities), and pnpm itself. Poll with job_output; cancel with job_kill (a cancel during the preflight leaves the profile untouched). Because the preflight runs inside the job, ITS VERDICT ARRIVES AS THE JOB'S OUTCOME, not as an error from this call: a blocker, or a warning the user has not confirmed, ends the job as `failed` with the individual issues in its detail — read them there and relay them verbatim. A warning is cleared by calling again with `acceptWarnings: true`, and only after the USER has explicitly confirmed it; never consent on their behalf. If pnpm blocks a dependency's install scripts, the job STOPS and reports which packages want to run install-time code, what those commands are, whether each is the plugin itself or a transitive dependency, and issues a one-shot approval token. Relay that list to the user verbatim, and only call again with `allowBuildScripts` naming the packages they approved along with `approvalToken`. A successful install only takes effect after the dsh process restarts.",
     parameters: {
       spec: {
         type: "string",
@@ -1984,16 +2171,23 @@ export function apply(ctx, config = {}) {
       },
       render: (args, value) => [{
         type: "text",
-        text: `started background job ${value.jobId} (${args.spec} → profile "${args.profile ?? defaultProfile}"); poll with job_output, cancel with job_kill. Restart dsh after a successful install.`,
+        text: `started background job ${value.jobId} (${args.spec} → profile "${args.profile ?? defaultProfile}"); the preflight runs inside it, so poll job_output for the verdict and cancel with job_kill. Restart dsh after a successful install.`,
       }],
     },
+    // 只做本地、同步、必须在返回 job id 之前失败的检查。任何需要 await 的
+    // 步骤都在 createInstallJobProducer 里（见那里的注释）：在这里 await，
+    // 等于让工具在没有 job id、没有日志、job_kill 够不着的状态下干几十秒活。
     async execute(args, exec) {
       const profile = String(args.profile ?? defaultProfile).trim();
-      const normalized = normalizeSpec(args.spec);
-      assertSafeSpec(normalized);
-      const registry = await registryFor(profile, npmRegistry);
-      const spec = await preferNpmSpec({ spec: normalized, registry, sources: rawSources });
-      await assertSafeToInstall({ spec, registry, sources: rawSources });
+      // profile 名非法要当场报错，而不是变成一个注定失败的后台 job——
+      // 与 market_uninstall 一致。
+      try {
+        resolveProfileDir(profile);
+      } catch (error) {
+        throw new Error(`market_install: invalid profile: ${error.message}`);
+      }
+      const spec = normalizeSpec(args.spec);
+      assertSafeSpec(spec);
       const allowBuildScripts = Array.isArray(args.allowBuildScripts)
         ? args.allowBuildScripts.map((name) => String(name))
         : undefined;
@@ -2001,77 +2195,27 @@ export function apply(ctx, config = {}) {
         ? args.approvalToken.trim()
         : undefined;
       assertValidApprovalInvocation(allowBuildScripts, approvalToken);
-
-      const preflight = await runPreflight({ profile, spec });
-      let acceptWarnings = false;
-      let acceptWarningsActive = false;
-      let approvedProof = undefined;
+      // 审批归属必须在这里取：exec 是本次调用的门面，producer 里已经拿不到。
       const agentOwner = requireAgentApprovalOwner(exec);
-      if (approvalToken !== undefined) {
-        const consumeResult = consumeApprovalToken({
-          token: approvalToken,
-          profile,
-          profileDir: preflight.profileDir,
-          spec,
-          preflightReport: preflight.report,
-          allowBuildScripts,
-          surface: "agent",
-          owner: agentOwner,
-        });
-        if (!consumeResult.valid) {
-          throw new Error(`market_install: invalid approval token: ${consumeResult.reason}`);
-        }
-        acceptWarnings = consumeResult.warningConsent;
-        acceptWarningsActive = consumeResult.warningConsent;
-        approvedProof = consumeResult.proof;
-      } else {
-        acceptWarnings = args.acceptWarnings === true;
-        acceptWarningsActive = acceptWarnings;
-      }
 
-      enforcePreflight(preflight.report, acceptWarnings, `market_install ${spec}`);
-      pinPreflight(preflight.profileDir, spec);
-
-      const runProducer = () => {
-        const producer = runInstall({ profile, spec, allowBuildScripts, approvedProof, preflight: preflight.report });
-        const done = Promise.resolve(producer.done)
-          .catch((error) => ({
-            status: "failed",
-            detail: `install of ${spec} hit an internal error: ${error?.message ?? String(error)}`,
-          }))
-          .then((outcome) => {
-            const status = outcome?.status ?? "failed";
-            if (status === "completed") {
-              invalidatePreflightFor(preflight.profileDir);
-              clearApprovalTokensFor(profile, spec);
-            } else if (outcome?.needsApproval && outcome.needsApproval.length > 0) {
-              clearApprovalTokensFor(profile, spec, { surface: "agent", owner: agentOwner });
-              const token = issueApprovalToken({
-                profile,
-                profileDir: preflight.profileDir,
-                spec,
-                preflightReport: preflight.report,
-                needsApproval: outcome.needsApproval,
-                proof: outcome.proof,
-                surface: "agent",
-                owner: agentOwner,
-                acceptWarningsActive,
-              });
-              outcome.approvalToken = token;
-              outcome.detail = `${outcome.detail ?? ""}\n\nApproval token (pass to approvalToken on retry): ${token}`;
-            } else {
-              clearApprovalTokensFor(profile, spec, { surface: "agent", owner: agentOwner });
-            }
-            return outcome;
-          });
-        return { cancel: producer.cancel, done, readOutput: producer.readOutput };
-      };
-
+      // 刻意不把 exec.signal 接进 producer：它是这一次工具调用的取消信号，
+      // 而这个调用马上就返回了。接上去等于 job 刚起就被 abort。后台任务的
+      // 取消句柄是 job_kill → producer.cancel()。
       const jobId = ctx.jobs.start({
         kind: "dsh-plugin-install",
+        // label 用归一后的 spec：防抢注解析要联网，属于 job 内部的事。
         label: `dsh plugin --profile ${profile} add ${spec}`,
         ...exec.agent ? { owner: exec.agent } : {},
-        run: runProducer,
+        run: () => createInstallJobProducer({
+          profile,
+          spec,
+          acceptWarnings: args.acceptWarnings === true,
+          allowBuildScripts,
+          approvalToken,
+          agentOwner,
+          npmRegistry,
+          rawSources,
+        }),
       });
       return { kind: "background", jobId };
     },
@@ -3042,6 +3186,186 @@ export async function runSelfTests() {
     const rolledLog = quietLog();
     runStartupRecovery("profile-a", { recover: () => ({ action: "rolled-back", reason: "静态校验未通过" }), log: rolledLog });
     check("回滚路径播报原因", rolledLog.lines.some((line) => line.includes("rolled back") && line.includes("静态校验未通过")));
+
+    // ── 13. market_install：整条链跑在 job 里（issue #8）────────────────────
+    // 原来 registry 查询 → 防抢注解析 → 隔离预检全在 ctx.jobs.start() 之前 await，
+    // 于是几十秒里没有 job id、没有日志、job_kill 够不着，而工具描述写的是
+    // "returns a job id immediately"。这一组钉的是搬进 producer 之后的三条语义：
+    // 拒绝是 job 的结局（不是异常）、通过才跑 pnpm、进行中能真的取消。
+    // 注意：done 永不 reject 是硬约束，所以下面每条都直接 await done 拿结果。
+    {
+      // done 永不 reject 是这组的前提，所以每条都直接 await 它——可一旦回归让
+      // done 干脆不结算，await 就会永远挂住，而挂住的 Node 是「事件循环空了」
+      // 正常退出：退出码 0，`finished with N failures` 那行压根不打印，CI 全绿。
+      // 所以每个 await 都套上超时，把「没结算」变成一条会红的断言。
+      const settleWithin = async (promise, ms, label) => {
+        let timer;
+        const timeout = new Promise((resolveTimeout) => {
+          timer = setTimeout(() => resolveTimeout({ status: `<${label}：${ms}ms 内没有结算>` }), ms);
+        });
+        try {
+          return await Promise.race([promise, timeout]);
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+      const cleanReport = { verdict: "clean", summary: "无冲突", issues: [] };
+      const seams = (overrides) => ({
+        _registryFor: async () => "https://registry.npmjs.org",
+        _preferNpmSpec: async ({ spec }) => spec,
+        _assertSafeToInstall: async () => {},
+        ...overrides,
+      });
+      const neverInstall = (counter) => () => {
+        counter.calls++;
+        return { cancel: () => {}, done: Promise.resolve({ status: "completed" }), readOutput: () => "" };
+      };
+
+      // 13a. 预检 blocker → failed 的 job，逐条 BLOCK 落在 detail 里，pnpm 不跑。
+      const blockedInstalls = { calls: 0 };
+      const blockedProducer = createInstallJobProducer({
+        profile: "web",
+        spec: "bad-pkg",
+        agentOwner: "agent-selftest",
+        ...seams({
+          _runPreflight: async ({ onOutput }) => {
+            onOutput?.("probe log line\n");
+            return {
+              report: {
+                verdict: "blocked",
+                summary: "候选包会改坏这个 profile",
+                issues: [{ severity: "block", title: "重复挂载", detail: "两行指向同一个模块" }],
+              },
+              profileDir,
+              fingerprint: "fp-blocked",
+            };
+          },
+          _runInstall: neverInstall(blockedInstalls),
+        }),
+      });
+      const blockedOutcome = await settleWithin(blockedProducer.done, 5000, "blocker job");
+      check("预检 blocker → job 结算为 failed（不是抛异常）", blockedOutcome?.status === "failed");
+      check("预检 blocker → detail 带上逐条 BLOCK", /\[BLOCK\] 重复挂载/.test(blockedOutcome?.detail ?? ""));
+      check("预检 blocker → pnpm 一次都不跑", blockedInstalls.calls === 0);
+      const blockedLog = blockedProducer.readOutput();
+      check("预检输出进入 job 日志（此前它根本不存在于任何 job）",
+        blockedLog.includes("probe log line") && blockedLog.includes("预检结论：blocked"));
+
+      // 13a2. warning 未获用户确认，等价于拒绝——并且指明补 acceptWarnings。
+      const warnInstalls = { calls: 0 };
+      const warnOutcome = await settleWithin(createInstallJobProducer({
+        profile: "web",
+        spec: "warn-pkg",
+        agentOwner: "agent-selftest",
+        ...seams({
+          _runPreflight: async () => ({
+            report: {
+              verdict: "warning",
+              summary: "有需要确认的改动",
+              issues: [{ severity: "warn", title: "替换整块 config", detail: "sandbox-policy" }],
+            },
+            profileDir,
+            fingerprint: "fp-warn",
+          }),
+          _runInstall: neverInstall(warnInstalls),
+        }),
+      }).done, 5000, "warning job");
+      check("预检 warning 未确认 → failed 且提示 acceptWarnings",
+        warnOutcome?.status === "failed" && /acceptWarnings: true/.test(warnOutcome?.detail ?? "") && warnInstalls.calls === 0);
+
+      // 13b. 预检通过 → 进入安装。同时钉两件事：pnpm 拿到的是防抢注解析后的
+      // spec（label 用的是归一 spec，两者可以不同），以及 readOutput 的顺序。
+      let preflightSpec;
+      let installedWith;
+      const cleanProducer = createInstallJobProducer({
+        profile: "web",
+        spec: "owner/repo",
+        agentOwner: "agent-selftest",
+        ...seams({
+          _preferNpmSpec: async () => "resolved-pkg",
+          _runPreflight: async ({ spec, onOutput }) => {
+            preflightSpec = spec;
+            onOutput?.("probe ok\n");
+            return { report: cleanReport, profileDir, fingerprint: "fp-clean" };
+          },
+          _runInstall: (options) => {
+            installedWith = options;
+            const chunks = ["pnpm add output\n"];
+            return {
+              cancel: () => {},
+              done: Promise.resolve({ status: "completed", detail: "installed" }),
+              readOutput: () => chunks.splice(0).join(""),
+            };
+          },
+        }),
+      });
+      const cleanOutcome = await settleWithin(cleanProducer.done, 5000, "clean job");
+      check("预检通过 → 进入安装并结算 completed", cleanOutcome?.status === "completed");
+      check("预检与 pnpm 都用防抢注解析后的 spec",
+        preflightSpec === "resolved-pkg" && installedWith?.spec === "resolved-pkg");
+      const cleanLog = cleanProducer.readOutput();
+      check("readOutput 先排空预检缓冲、再接 install 输出",
+        cleanLog.includes("pnpm add output")
+        && cleanLog.indexOf("probe ok") < cleanLog.indexOf("pnpm add output"));
+
+      // 13c. 进行中取消：预检还在跑就按 job_kill。预检必须收到 AbortSignal，
+      // 结算为 killed 且明说 profile 没被动过，pnpm 阶段一步都不许进。
+      const cancelInstalls = { calls: 0 };
+      let preflightSignal;
+      const cancelProducer = createInstallJobProducer({
+        profile: "web",
+        spec: "slow-pkg",
+        agentOwner: "agent-selftest",
+        ...seams({
+          _runPreflight: ({ signal }) => new Promise((_resolve, rejectPreflight) => {
+            preflightSignal = signal;
+            // 真实的 preflightInstall 在取消时抛 AbortError（guard.js），照抄。
+            signal.addEventListener("abort", () => {
+              const error = new Error("preflight cancelled");
+              error.name = "AbortError";
+              rejectPreflight(error);
+            }, { once: true });
+          }),
+          _runInstall: neverInstall(cancelInstalls),
+        }),
+      });
+      await new Promise((resolveTick) => setImmediate(resolveTick)); // 跑到预检那一步
+      cancelProducer.cancel();
+      cancelProducer.cancel(); // 幂等：面板/模型都可能连按两次
+      const cancelOutcome = await settleWithin(cancelProducer.done, 5000, "取消后的 job");
+      check("进行中取消 → 预检确实收到了 AbortSignal", preflightSignal?.aborted === true);
+      check("进行中取消 → 结算为 killed", cancelOutcome?.status === "killed");
+      check("进行中取消 → 明说 profile 未被改动", /never modified/.test(cancelOutcome?.detail ?? ""));
+      check("进行中取消 → 不进入 pnpm 阶段", cancelInstalls.calls === 0);
+
+      // 13d. 审批 token 签发失败（这里用缺失的 proof 触发）。以前这段跑在
+      // .then 里，一抛就把 done 变成 rejected —— 违反「done 必须不 reject」，
+      // 而且会把「pnpm 拦下了安装脚本」这条真结论顶掉。
+      let approvalRejected = false;
+      const approvalOutcome = await settleWithin(createInstallJobProducer({
+        profile: "web",
+        spec: "scripty-pkg",
+        agentOwner: "agent-selftest",
+        ...seams({
+          _runPreflight: async () => ({ report: cleanReport, profileDir, fingerprint: "fp-scripty" }),
+          _runInstall: () => ({
+            cancel: () => {},
+            done: Promise.resolve({
+              status: "failed",
+              detail: "installing scripty-pkg requires running install-time code — approval needed.",
+              needsApproval: [{ name: "scripty-pkg", version: "1.0.0", scripts: { install: "node install.js" } }],
+              // proof 缺失 → issueApprovalToken 必抛
+            }),
+            readOutput: () => "",
+          }),
+        }),
+      }).done.catch(() => { approvalRejected = true; return undefined; }), 5000, "审批 token 签发失败的 job");
+      check("token 签发失败不会把 done 变成 rejected", !approvalRejected && approvalOutcome !== undefined);
+      check("token 签发失败 → 原结论保留", /requires running install-time code/.test(approvalOutcome?.detail ?? ""));
+      check("token 签发失败 → detail 明说这次没法用 allowBuildScripts 重试",
+        /no approval token could be issued/.test(approvalOutcome?.detail ?? ""));
+      check("token 签发失败 → 不对外交出 approvalToken", approvalOutcome?.approvalToken === undefined);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -3051,10 +3375,20 @@ export async function runSelfTests() {
 
 if (process.argv.includes("--self-test")) {
   console.log("index.js self-test:");
+  // 挂住的 suite 不会失败，会「成功」：await 一个永不结算的 promise 之后事件
+  // 循环就空了，Node 正常退出，退出码 0，而 `finished with N failures` 那行
+  // 根本没打印——CI 看到的是全绿。这个看门狗刻意不 unref（unref 掉就拦不住
+  // 那次正常退出了），跑完由下面 clearTimeout 收掉。
+  const watchdog = setTimeout(() => {
+    console.error("index.js self-test: 超时未跑完——有 fixture 挂住了（producer 的 done 从未结算？）");
+    process.exit(1);
+  }, 120000);
   runSelfTests().then((failed) => {
+    clearTimeout(watchdog);
     console.log(`index.js tests finished with ${failed} failures.`);
     process.exit(failed === 0 ? 0 : 1);
   }).catch((err) => {
+    clearTimeout(watchdog);
     console.error("Self-test threw:", err);
     process.exit(1);
   });

@@ -172,9 +172,11 @@ function normalizeRegistry(registry) {
  * Look up a package's `latest` manifest on an npm registry.
  * @param name - the npm package name.
  * @param options - `registry` defaults to npmjs; pass what pnpm installs from.
+ *   `signal` cancels the request (and, critically, keeps the cancellation out
+ *   of the cache — see below).
  * @returns `{latest, repositoryUrl, hostDeps}`, or null when unknown/unreachable.
  */
-export async function npmPackageInfo(name, { registry } = {}) {
+export async function npmPackageInfo(name, { registry, signal } = {}) {
   const clean = String(name ?? "").trim();
   if (clean.length === 0 || !/^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/i.test(clean)) return null;
   const base = normalizeRegistry(registry);
@@ -188,6 +190,7 @@ export async function npmPackageInfo(name, { registry } = {}) {
     // 镜像（npmmirror 等）的同名端点响应格式一致，两个字段都保留。
     const response = await fetch(`${base}/${clean.replace("/", "%2F")}/latest`, {
       headers: { "User-Agent": "dsh-plugin-mall", Accept: "application/json" },
+      signal,
     });
     if (response.ok) {
       const body = await response.json();
@@ -201,7 +204,11 @@ export async function npmPackageInfo(name, { registry } = {}) {
         };
       }
     }
-  } catch {
+  } catch (error) {
+    // 取消不是「查不到」。若把 AbortError 也吞成 null，下面的 npmCache.set 会把
+    // 这个空答案钉住整个 TTL——用户取消一次，接下来 5 分钟里防抢注永远不匹配、
+    // 宿主影子检查看不到清单，而且完全无声。取消一律上抛，不进缓存。
+    if (error?.name === "AbortError") throw error;
     info = null; // registry unreachable — caller falls back
   }
   npmCache.set(key, { info, at: Date.now() });
@@ -213,7 +220,7 @@ export async function npmPackageInfo(name, { registry } = {}) {
  * that package exists on npm AND its repository URL points back at the repo
  * (anti-squatting). Anything else passes through untouched.
  */
-export async function preferNpmSpec({ spec, registry, sources }) {
+export async function preferNpmSpec({ spec, registry, sources, signal }) {
   const raw = String(spec ?? "");
   // A scoped npm name ("@scope/name", "@scope/name@1.2.3") is shaped exactly
   // like owner/repo and matches the regex below, sending every such install
@@ -223,10 +230,10 @@ export async function preferNpmSpec({ spec, registry, sources }) {
   const githubMatch = /^(?:github:)?([^/\s]+\/[^/\s]+?)(?:\.git)?$/i.exec(raw);
   if (githubMatch === null) return raw;
   const repo = githubMatch[1];
-  const { results } = await verifyPlugins({ repos: [repo], sources }); // cache hit after first verify
+  const { results } = await verifyPlugins({ repos: [repo], sources, signal }); // cache hit after first verify
   const declaredName = results[repo]?.name;
   if (typeof declaredName !== "string") return raw;
-  const info = await npmPackageInfo(declaredName, { registry });
+  const info = await npmPackageInfo(declaredName, { registry, signal });
   if (info === null || info.repositoryUrl === undefined) return raw;
   const pointsBack = new RegExp(`github\\.com[/:]${repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(/|\\.git|$)`, "i").test(info.repositoryUrl);
   return pointsBack ? declaredName : raw;
@@ -254,7 +261,7 @@ export function npmNameOf(raw) {
   return match === null ? null : match[1];
 }
 
-export async function assertSafeToInstall({ spec, registry, sources }) {
+export async function assertSafeToInstall({ spec, registry, sources, signal }) {
   const raw = String(spec ?? "");
   let hostDeps;
   if (/^(?:file:|link:)/i.test(raw)) {
@@ -268,7 +275,7 @@ export async function assertSafeToInstall({ spec, registry, sources }) {
     }
   } else if (/^github:([^/\s]+\/[^/\s]+?)(?:\.git)?(?:#.+)?$/i.test(raw)) {
     const repo = /^github:([^/\s]+\/[^/\s]+?)(?:\.git)?(?:#.+)?$/i.exec(raw)[1];
-    const { results } = await verifyPlugins({ repos: [repo], sources });
+    const { results } = await verifyPlugins({ repos: [repo], sources, signal });
     hostDeps = results[repo]?.hostDeps;
   } else if (/^https?:\/\//i.test(raw)) {
     return; // 远程 tarball 下载前无法廉价检查；罕见路径，放行
@@ -279,7 +286,7 @@ export async function assertSafeToInstall({ spec, registry, sources }) {
       // 无法识别形状的 spec 一律拒绝，而不是静默跳过检查。
       throw new Error(`cannot analyze install spec ${JSON.stringify(raw)} for host-shadow dependencies — refusing to install`);
     }
-    const info = await npmPackageInfo(name, { registry });
+    const info = await npmPackageInfo(name, { registry, signal });
     hostDeps = info?.hostDeps;
   }
   if (hostDeps !== undefined && hostDeps !== null && hostDeps.length > 0) {
