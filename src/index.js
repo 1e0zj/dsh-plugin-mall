@@ -345,6 +345,12 @@ function pinPreflight(profileDir, spec) {
   const key = preflightCacheKey(profileDir, spec);
   const cached = preflightCache.get(key);
   if (cached === undefined) return;
+  // blocked 一律不 pin（ok === true 的只有 safe/warning）。探装失败的
+  // blocker 最要命：网络抖一下就是一份 ok:false 的 blocked，而 spec 若是
+  // 精确版本这类不可变形态，身份再校验也不会拦——钉住等于把一次临时失败
+  // 固化 10 分钟，网络恢复也不再重试。真正的冲突 blocker 也没有「用户
+  // 读完再继续」的后继流程，pin 本就没有服务对象。
+  if (cached.report?.ok !== true) return;
   const currentFingerprint = computeProfileFingerprint(profileDir);
   if (cached.fingerprint !== currentFingerprint) {
     preflightCache.delete(key);
@@ -3444,13 +3450,13 @@ export async function runSelfTests() {
       const pinSpec = "pin-me";
       const pinKey = preflightCacheKey(profileDir, pinSpec);
       preflightCache.set(pinKey, {
-        report: { verdict: "warning", summary: "", issues: [] },
+        report: { ok: true, verdict: "warning", summary: "", issues: [] },
         fingerprint: computeProfileFingerprint(profileDir),
         at: Date.now(),
         pinnedAt: undefined,
       });
       pinPreflight(profileDir, pinSpec);
-      check("预检结算后 pin 生效", isPinned(preflightCache.get(pinKey)) === true);
+      check("预检结算后 pin 生效（warning 是可行动结论）", isPinned(preflightCache.get(pinKey)) === true);
 
       // 把落库时间推到 TTL 之外——没有 pin 的话这条已经该重跑了。
       preflightCache.get(pinKey).at = Date.now() - (PREFLIGHT_TTL + 5000);
@@ -3466,6 +3472,39 @@ export async function runSelfTests() {
       pinPreflight(profileDir, pinSpec);
       check("profile 一变 → pin 拒绝钉住并丢弃缓存", preflightCache.get(pinKey) === undefined);
       writeFileSync(patchPath, patchBefore);
+
+      // blocked 不 pin。探装失败（网络抖动）产出的是 ok:false 的 blocked，
+      // 而 immutable spec 的身份再校验不设防——钉住等于把一次临时失败固化
+      // 10 分钟，网络恢复也不会再试。真冲突的 blocked 同样没有「用户读完
+      // 再继续」的后继流程。落库时间推到 TTL 外之后必须重跑探装。
+      const failSpec = "immutable-fail@1.0.0";
+      const failKey = preflightCacheKey(profileDir, failSpec);
+      const failReport = {
+        ok: false,
+        verdict: "blocked",
+        candidate: { name: undefined, version: undefined, kind: "unknown", rows: [] },
+        issues: [{ severity: "block", title: "预检执行失败", detail: "network unreachable" }],
+        summary: "预检执行失败，正式 profile 未被修改",
+      };
+      preflightCache.set(failKey, {
+        report: failReport,
+        fingerprint: computeProfileFingerprint(profileDir),
+        at: Date.now(),
+        pinnedAt: undefined,
+      });
+      pinPreflight(profileDir, failSpec);
+      check("blocked（探装失败）不被 pin", isPinned(preflightCache.get(failKey)) === false);
+      preflightCache.get(failKey).at = Date.now() - (PREFLIGHT_TTL + 5000); // 落库时间推出 TTL
+      let failProbes = 0;
+      const failOutcome = await runPreflight({
+        profile: "unused-by-fixture",
+        spec: failSpec,
+        _profileDir: profileDir,
+        _preflightInstall: async () => { failProbes++; return { ok: true, verdict: "safe", summary: "", issues: [], candidate: { name: "immutable-fail", version: "1.0.0", kind: "bundle", rows: [] } }; },
+      });
+      check("blocked 超过 TTL → 重新探装（临时失败不会被钉 10 分钟）",
+        failProbes === 1 && failOutcome.report.verdict === "safe",
+        `probes=${failProbes} verdict=${failOutcome.report.verdict}`);
     }
 
     // ── 12b1. spec 形态判定：不可变可复用 / 可核验须再核 / 其余不可复用 ──────
