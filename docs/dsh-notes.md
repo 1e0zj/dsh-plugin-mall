@@ -726,10 +726,19 @@ config.failOnStartupError: true 时，stdio transport 的初始连接或工具�
 事故（bundle patch 插入的 MCP 行指向不存在的 dist 文件）就是这条路径的实测。
 
 推论（已进实现，guard.js fatalMcpEntry / mcpEntryAuditForInstall）：
-- 预检探装与正式安装有个结构性不对称：探装禁 lifecycle 脚本，正式安装经用户审批可以
-  执行。所以「入口文件缺失」对带安装期脚本的候选不是可静态判定的砖——预检只
-  warn，硬闸设在安装事务完成前（finalizeSuccess 里对照真树终检，缺了就 failed +
-  回滚）。无脚本的候选缺失即必砖，预检直接 block。
+- 预检探装与正式安装有个结构性不对称：探装禁构建，正式安装经用户审批可以执行。
+  「可能由构建生成入口」的判据不用自己发明——pnpm 自己的 requiresBuild 就是
+  权威清单（worker.js: pkgRequiresBuild + filesIncludeInstallScripts，逐字核对过
+  本机 pnpm 11.21.0 源码）：**manifest 声明 preinstall/install/postinstall/
+  prepublish/prepare 任一脚本，或包根有 binding.gyp，或 .hooks/ 下有任何文件**。
+  命中任一条的候选，入口缺失在预检只 warn（binding.gyp/.hooks 不需要任何
+  scripts 也算）；硬闸设在安装事务完成前（finalizeSuccess 里对照真树终检，
+  缺了就 failed + 回滚）。三类标记都不沾的候选，缺失即必砖，预检直接 block。
 - existsSync 不等价于 Node 入口解析（node src/guard 能跑、existsSync("src/guard")
   是 false）。判定收窄到「末段带 .js/.mjs/.cjs 的普通文件」：无扩展名一律不判，
   存在但非普通文件按缺失论。
+- 路径与包名的 Windows 语义：dshHomePath 字面量里的成对反斜杠（JS 源码里
+  Windows 分隔符的合法写法，求值后是单个 \）折成 / 再判；不成对的单个反斜杠是
+  转义序列，求值结果静态不可知，整个形态不判。profiles/<名>/node_modules 前缀
+  与**包名**在 win32 上都按大小写折叠比较（node_modules/MCP-BRICK 与 manifest
+  的 mcp-brick 是同一个包）；posix 上照字面比较。

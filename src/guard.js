@@ -938,6 +938,16 @@ function fatalMcpEntry(row, profileName) {
   return { pkgName, fileSegments };
 }
 
+/**
+ * Package-name equality with the platform's own semantics: Windows resolves
+ * node_modules case-insensitively, so a row written as node_modules/MCP-BRICK
+ * targets the same package as manifest name mcp-brick — comparing strictly
+ * there would let a missing entry slip past both preflight and the audit.
+ */
+function samePackageName(left, right) {
+  return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+
 function mcpStartupFileIssues(mountedRows, candidateManifest, candidateName, candidateDir, profileDir) {
   if (candidateName.length === 0 || typeof candidateDir !== "string") return [];
   const profileName = basename(profileDir);
@@ -945,7 +955,7 @@ function mcpStartupFileIssues(mountedRows, candidateManifest, candidateName, can
   const issues = [];
   for (const row of mountedRows) {
     const fatal = fatalMcpEntry(row, profileName);
-    if (fatal === undefined || fatal.pkgName !== candidateName) continue; // 只判候选自己的包：探针树里只有它
+    if (fatal === undefined || !samePackageName(fatal.pkgName, candidateName)) continue; // 只判候选自己的包：探针树里只有它
     if (isPlainFile(join(candidateDir, ...fatal.fileSegments))) continue;
     const fileRel = fatal.fileSegments.join("/");
     if (hasInstallScripts) {
@@ -994,7 +1004,8 @@ export function mcpEntryAuditForInstall({ profileDir, candidateName }) {
   const issues = [];
   for (const row of current.composedRows) {
     const fatal = fatalMcpEntry(row, profileName);
-    if (fatal === undefined || fatal.pkgName !== candidateName) continue;
+    if (fatal === undefined || !samePackageName(fatal.pkgName, candidateName)) continue;
+    // Windows 文件系统本身不区分大小写，行里写 MCP-BRICK 也能落到同一目录。
     if (isPlainFile(join(profileDir, "node_modules", ...fatal.pkgName.split("/"), ...fatal.fileSegments))) continue;
     issues.push(issue(
       "block",
@@ -3800,6 +3811,26 @@ async function selfTest() {
         throw new Error(`binding.gyp 候选应降为 warn，实得 ${gyp.verdict}: ${JSON.stringify(gyp.issues.map((e) => e.code))}`);
       }
       console.log("PASS MCP 入口：binding.gyp（无 scripts）→ warn 不 block");
+
+      // 13c) 包名大小写变体：manifest 是 mcp-brick，行里写 MCP-BRICK。
+      //      win32 上 node_modules 解析不区分大小写——同一个包，照判；
+      //      posix 上那是另一个名字，不判。两平台各自的判定才是正确语义。
+      const cased = inspect(candidate("cased", "mcp-brick", `
+- insert:
+    - id: mcp-x
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        command: node
+        args:
+          - !!js dshHomePath('profiles/mcpcheck/node_modules/MCP-BRICK/dist/none.js')
+        failOnStartupError: true
+`), "mcp-brick");
+      const casedBlocked = cased.issues.some((e) => e.code === "mcp-entry-missing");
+      if (process.platform === "win32" ? !casedBlocked : casedBlocked) {
+        throw new Error(`包名大小写变体在 ${process.platform} 上判定错误: ${JSON.stringify(cased.issues.map((e) => e.code))}`);
+      }
+      console.log(`PASS MCP 入口：包名大小写变体按平台语义判定（${process.platform} → ${casedBlocked ? "检出" : "不判"}）`);
 
       // 14) 装后终检：真树里入口仍缺 → issue；存在 → 空；别人的包 → 不判。
       {
