@@ -337,6 +337,11 @@ function invalidatePreflightFor(profileDir) {
  * never caches warning consent.
  */
 function pinPreflight(profileDir, spec) {
+  // pin 只给核得住的引用：不可变（精确版本/钉死的 sha）或可再校验的
+  // （npm tag/range，读取路径会重新核）。file:/link:/URL/未钉 sha 的
+  // github 拿不到可信身份，pin 了也只是把一条注定要丢弃的缓存钉在
+  // 那里——读取路径对它们一律重跑，这里就别给「已核过」的假象。
+  if (specIdentityKind(spec) === null) return;
   const key = preflightCacheKey(profileDir, spec);
   const cached = preflightCache.get(key);
   if (cached === undefined) return;
@@ -361,58 +366,79 @@ function pinPreflight(profileDir, spec) {
  */
 
 /**
- * What a cache-reuse staleness check has to watch for this spec shape.
+ * The "owner/repo" part of a github: spec, or null. Anchored end-to-end: an
+ * earlier version let the lazy repo group stop early (`github:owner/repo`
+ * came out as `owner/r`) because the `.git` alternative was optional and
+ * nothing forced the match to run to the end — every identity lookup then
+ * keyed on a repo that does not exist and quietly failed open.
+ */
+export function githubSpecRepo(raw) {
+  const match = /^github:([^/\s]+\/[^/\s]+?)(?:\.git)?(?:#.+)?$/i.exec(String(raw ?? ""));
+  return match === null ? null : match[1];
+}
+
+/**
+ * What a cache-reuse staleness check can rely on for this spec shape.
  *
- *   "npm-tag"    bare name / @latest / @* — resolves to whatever `latest` is now
- *   "npm-range"  pkg@^1.2.0 — a new in-range release changes what pnpm picks
- *   "github"     github:owner/repo without a pinned 40-hex commit — HEAD moves
- *   null         immutable shapes: exact npm version (npm forbids overwriting
- *                a published version), github:...#<full sha>, file:/link:/URL.
- *                Nothing can drift, so no check is needed.
+ *   "immutable"  exact npm version (npm forbids overwriting a published
+ *                version) or github:...#<full 40-hex sha>. Nothing can
+ *                drift; reuse unconditionally.
+ *   "npm-tag"    bare name / @latest / @* — resolves to whatever `latest`
+ *                is now; verifiable against the install registry.
+ *   "npm-range"  pkg@^1.2.0 — an in-range release changes what pnpm picks;
+ *                verifiable via the packument.
+ *   null         UNVERIFIABLE, not immutable: file:/link:/URL tarballs (the
+ *                content can change in place), github without a pinned sha
+ *                (same version can point at different code — comparing
+ *                name/version proves nothing), owner/repo, anything else.
+ *                No trusted identity is obtainable cheaply, so the cache is
+ *                never reused for these — see runPreflight.
  */
 export function specIdentityKind(raw) {
   const spec = String(raw ?? "");
   if (/^(?:file:|link:|https?:\/\/)/i.test(spec)) return null;
-  const gh = /^github:([^/\s]+\/[^/\s]+?)(?:\.git)?(?:#(.+))?$/i.exec(spec);
-  if (gh !== null) {
-    return /^[0-9a-f]{40}$/i.test(gh[2] ?? "") ? null : "github";
+  if (/^github:/i.test(spec)) {
+    const pinned = /^github:[^/\s]+\/[^/\s]+?(?:\.git)?#([0-9a-f]{40})$/i.exec(spec);
+    return pinned !== null ? "immutable" : null;
   }
-  if (!/^@/.test(spec) && spec.includes("/")) return null; // owner/repo 形状交给 preferNpmSpec 之后再说
+  if (!/^@/.test(spec) && spec.includes("/")) return null; // owner/repo：不可核验
   const name = npmNameOf(spec);
   if (name === null) return null;
   // 注意 scoped 裸名（@scope/name）没有 range：判定依据是「名字之后还有没有
   // 东西」，不是字符串里有没有 @——scope 前缀本身就带 @。
   const range = spec.length > name.length ? spec.slice(name.length + 1) : undefined;
   if (range === undefined || range === "latest" || range === "*") return "npm-tag";
-  return validExactVersion(range) === null ? "npm-range" : null;
+  return validExactVersion(range) === null ? "npm-range" : "immutable";
 }
 
 /**
- * What this spec resolves to RIGHT NOW ({name, version}), for the mutable
- * shapes above — the cheap half of "reuse equals rerun". The expensive half
- * is the probe itself; this is one registry/CDN read per cache hit.
+ * What this spec resolves to RIGHT NOW ({name, version}), for the verifiable
+ * shapes — the cheap half of "reuse equals rerun". The expensive half is the
+ * probe itself; this is one registry read per cache hit.
  *
- * Returns undefined when the shape is immutable, the resolution is
- * unreachable, or the answer is not confident — the caller then keeps the
- * cache entry rather than burning a full re-probe on a network hiccup. A
- * reachable-and-different answer is the only thing that invalidates.
+ * `fresh` is the point: the registry helpers cache for minutes, and a cached
+ * "current version" is exactly the staleness this check exists to detect —
+ * the candidate published 2.0.0 five minutes into the cache TTL would sail
+ * through as "still 1.0.0". Queries here bypass the read cache (they still
+ * populate it). The registry is the one pnpm will install from (mirrors
+ * included), so whatever lag it has applies to the install equally —
+ * verifying against npmjs while installing from npmmirror would be the
+ * wrong kind of fresh.
+ *
+ * Returns undefined when the resolution is unreachable — the caller treats
+ * that as "could not verify", which invalidates, never as "verified".
  */
 async function resolveSpecIdentity({ spec, registry, sources, signal }) {
   const kind = specIdentityKind(spec);
-  if (kind === null) return undefined;
-  if (kind === "github") {
-    const repo = /^github:([^/\s]+\/[^/\s]+?)(?:\.git)?/i.exec(String(spec))[1];
-    const { results } = await verifyPlugins({ repos: [repo], sources, signal });
-    const entry = results[repo];
-    return typeof entry?.name === "string" ? { name: entry.name, version: typeof entry.version === "string" ? entry.version : null } : undefined;
-  }
+  if (kind !== "npm-tag" && kind !== "npm-range") return undefined;
   const name = npmNameOf(String(spec));
+  if (name === null) return undefined;
   if (kind === "npm-tag") {
-    const info = await npmPackageInfo(name, { registry, signal });
+    const info = await npmPackageInfo(name, { registry, signal, fresh: true });
     return info === null || typeof info.latest !== "string" ? undefined : { name, version: info.latest };
   }
   const range = String(spec).slice(name.length + 1);
-  const versions = await npmPackageVersions(name, { registry, signal });
+  const versions = await npmPackageVersions(name, { registry, signal, fresh: true });
   if (versions === null || versions.length === 0) return undefined;
   const best = maxSatisfying(versions, range);
   return best === null ? undefined : { name, version: best };
@@ -441,31 +467,38 @@ async function runPreflight({ profile, spec, force = false, onOutput, signal, re
     && (isPinned(validCached) || Date.now() - validCached.at < PREFLIGHT_TTL);
 
   if (!force && fresh) {
-    // 缓存复用的前提是「重跑会得到同一份结论」。profile 指纹管住了 profile
-    // 一侧；spec 若是可变引用（裸名、@latest、range、无 sha 的 github），
-    // 候选那一侧还必须再核一次——探测时装的是 1.0.0、现在 latest 是 2.0.0
-    // 的话，这份缓存喂给安装的就是从未预检过的内容。核不上（不可达、
-    // 形状不可判定）不强行作废：探针用的同一个 registry 都够不着，重跑也
-    // 只会失败。核得上且对不上 → 丢弃重跑。
+    // 缓存复用的前提是「重跑必然得到同一份结论」，缺一側都不算数：
+    //   profile 一侧 —— 指纹一致（上面已查）；
+    //   候选一侧 —— spec 是不可变引用（精确版本/钉死的 sha），或者能重新
+    //               解析出与缓存报告一致的身份。
+    // 除此之外一律丢弃重跑：file:/link:/URL 的内容能原地变；未钉 sha 的
+    // github 同版本能换代码，name/version 比对证明不了任何事；registry
+    // 查不到「当前值」同样是没核住。以前这里 fail-open（核不上就沿用旧
+    // 报告），等于给所有核不住的形态开了永久通道。
     const candidate = validCached.report?.candidate;
-    if (typeof candidate?.name !== "string" || typeof candidate?.version !== "string") {
+    const kind = specIdentityKind(spec);
+    if (kind === "immutable") {
       return { report: validCached.report, profileDir, fingerprint: currentFingerprint };
     }
-    let current;
-    try {
-      current = await _resolveSpecIdentity({ spec, registry, sources, signal });
-    } catch (error) {
-      if (isAbortError(error)) throw error; // 取消不是「核不上」，照旧上抛、不落缓存
-      current = undefined;
+    let verified = false;
+    if ((kind === "npm-tag" || kind === "npm-range")
+      && typeof candidate?.name === "string" && typeof candidate?.version === "string") {
+      let current;
+      try {
+        current = await _resolveSpecIdentity({ spec, registry, sources, signal });
+      } catch (error) {
+        if (isAbortError(error)) throw error; // 取消不是「核不上」，照旧上抛
+        current = undefined;
+      }
+      verified = current !== undefined
+        && typeof current.version === "string"
+        && current.name === candidate.name
+        && current.version === candidate.version;
     }
-    // 版本核不出来（清单没写 version、registry 不含该包）视同「核不上」，
-    // 不作废——否则一个没写 version 的仓库会让缓存永远命不中，每次都白跑
-    // 一整轮隔离探装。
-    if (current === undefined || typeof current.version !== "string"
-      || (current.name === candidate.name && current.version === candidate.version)) {
+    if (verified) {
       return { report: validCached.report, profileDir, fingerprint: currentFingerprint };
     }
-    preflightCache.delete(key); // 身份漂了：缓存里这份结论作废，下面重跑探装
+    preflightCache.delete(key); // 核不住或对不上：作废，下面重跑探装
   }
 
   const report = await _preflightInstall({ profileDir, spec, onOutput, signal });
@@ -3435,7 +3468,7 @@ export async function runSelfTests() {
       writeFileSync(patchPath, patchBefore);
     }
 
-    // ── 12b1. spec 形态判定：哪些引用是可变的，复用前必须重新核 ──────────────
+    // ── 12b1. spec 形态判定：不可变可复用 / 可核验须再核 / 其余不可复用 ──────
     {
       const cases = [
         ["pkg", "npm-tag"],
@@ -3444,89 +3477,142 @@ export async function runSelfTests() {
         ["@scope/pkg", "npm-tag"], // scoped 裸名没有 range——判定看名字后有没有东西，不看 @
         ["pkg@^1.2.0", "npm-range"],
         ["@scope/pkg@~2.0.0", "npm-range"],
-        ["pkg@1.2.3", null], // 精确版本：npm 禁止覆盖已发布版本，不可变
-        ["pkg@1.2.3-beta.1", null],
-        ["github:owner/repo", "github"],
-        ["github:owner/repo#main", "github"],
-        ["github:owner/repo#a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", null], // 40 位 sha 钉死
-        ["file:../local.tgz", null],
+        ["pkg@1.2.3", "immutable"], // 精确版本：npm 禁止覆盖已发布版本
+        ["pkg@1.2.3-beta.1", "immutable"],
+        ["github:owner/repo", null], // 未钉 sha：同版本能换代码，name/version 证明不了任何事
+        ["github:owner/repo#main", null], // 分支名不是身份
+        ["github:owner/repo.git", null],
+        ["github:owner/repo#a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", "immutable"], // 40 位 sha 钉死
+        ["file:../local.tgz", null], // 内容能原地变
         ["link:../pkg", null],
         ["https://example.com/pkg.tgz", null],
-        ["owner/repo", null], // 到 runPreflight 时已被 preferNpmSpec 改写过，防御性放行
+        ["owner/repo", null],
       ];
       let kindOk = true;
       for (const [spec, expected] of cases) {
         if (specIdentityKind(spec) !== expected) { kindOk = false; console.error(`  specIdentityKind(${JSON.stringify(spec)}) = ${JSON.stringify(specIdentityKind(spec))}，预期 ${JSON.stringify(expected)}`); }
       }
-      check("spec 形态判定表（可变/不可变）", kindOk);
+      check("spec 形态判定表（immutable/npm-tag/npm-range/不可核验）", kindOk);
+
+      // github repo 提取的正则回归：懒匹配 + 可选后缀曾把 owner/repo 截成
+      // owner/r，身份查询全部打在不存在的仓库上、无声 fail-open。
+      const repoCases = [
+        ["github:owner/repo", "owner/repo"],
+        ["github:owner/repo.git", "owner/repo"],
+        ["github:owner/repo#main", "owner/repo"],
+        ["github:owner/repo#a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", "owner/repo"],
+        ["github:owner-with-dash/repo.with.dots", "owner-with-dash/repo.with.dots"],
+        ["owner/repo", null],
+        ["github:owner", null],
+      ];
+      let repoOk = true;
+      for (const [spec, expected] of repoCases) {
+        if (githubSpecRepo(spec) !== expected) { repoOk = false; console.error(`  githubSpecRepo(${JSON.stringify(spec)}) = ${JSON.stringify(githubSpecRepo(spec))}，预期 ${JSON.stringify(expected)}`); }
+      }
+      check("github spec 的 repo 提取不截断", repoOk);
     }
 
-    // ── 12b2. 缓存复用的候选身份再校验：复用 ≡ 重跑，差在这里补齐 ──────────
+    // ── 12b2. 缓存复用的候选身份再校验：fail-closed ─────────────────────────
     //
-    // pin 的时长里 profile 可以不动而候选包发新版（裸名/@latest/range/无 sha
-    // 的 github）。指纹只管 profile 一侧；候选一侧靠复用前重新解析。核不上
-    // 不作废（探针用的同一个 registry 也够不着，重跑只会失败），核得上且对
-    // 不上才丢弃重跑。
+    // 复用必须同时核住两侧：profile 指纹 + 候选身份。核不住的形态
+    // （file:/link:/URL、未钉 sha 的 github）没有可信身份可言，registry
+    // 查不到「当前值」同样算没核住——一律丢弃缓存重跑。这里曾把「核不上
+    // 就沿用旧报告」当正确答案（fail-open），等于给所有核不住的形态开了
+    // 永久通道；fixture 一并翻转。
     {
       const idSpec = "mutable-pkg";
       const idKey = preflightCacheKey(profileDir, idSpec);
       const probeCalls = { count: 0 };
-      const probeReport = (version) => ({
+      const probeReport = (name, version) => ({
         verdict: "safe", summary: "", issues: [],
-        candidate: { name: "mutable-pkg", version, kind: "bundle", rows: [] },
+        candidate: { name, version, kind: "bundle", rows: [] },
       });
-      const seedCache = (version) => {
-        preflightCache.set(idKey, {
-          report: probeReport(version),
+      const seedCache = (spec, name, version) => {
+        preflightCache.set(preflightCacheKey(profileDir, spec), {
+          report: probeReport(name, version),
           fingerprint: computeProfileFingerprint(profileDir),
           at: Date.now(),
           pinnedAt: Date.now(),
         });
       };
-      const run = (resolve) => runPreflight({
+      let resolveCalls = 0;
+      const run = (spec, resolve) => runPreflight({
         profile: "unused-by-fixture",
-        spec: idSpec,
+        spec,
         _profileDir: profileDir,
         registry: "https://registry.npmjs.org",
         sources: [],
-        _resolveSpecIdentity: resolve,
-        _preflightInstall: async () => { probeCalls.count++; return probeReport("2.0.0"); },
+        _resolveSpecIdentity: typeof resolve === "function" ? async (args) => { resolveCalls++; return resolve(args); } : undefined,
+        _preflightInstall: async () => { probeCalls.count++; return probeReport("mutable-pkg", "2.0.0"); },
       });
+      const probesBefore = () => probeCalls.count;
 
-      // a) 身份一致 → 复用缓存，探装一次都不跑
-      seedCache("1.0.0");
-      const same = await run(async () => ({ name: "mutable-pkg", version: "1.0.0" }));
+      // a) 可核验形态 + 身份一致 → 复用缓存，探装不跑。
+      seedCache(idSpec, "mutable-pkg", "1.0.0");
+      const probesBeforeA = probeCalls.count;
+      const same = await run(idSpec, async () => ({ name: "mutable-pkg", version: "1.0.0" }));
       check("身份一致 → 复用缓存不重跑探装",
-        same.report.candidate.version === "1.0.0" && probeCalls.count === 0,
+        same.report.candidate.version === "1.0.0" && probeCalls.count === probesBeforeA,
         `version=${same.report.candidate.version} probes=${probeCalls.count}`);
 
-      // b) latest 漂了 → 缓存作废、重跑、新报告落缓存。重跑装的正是新版
-      //    2.0.0，新报告的 digest 也随之变化——上一条修的同意绑定由此接上。
-      const drifted = await run(async () => ({ name: "mutable-pkg", version: "2.0.0" }));
+      // b) latest 漂了 → 缓存作废、重跑、新报告落缓存。重跑装的正是新版，
+      //    新报告的 digest 随之变化——同意绑定由此接上。
+      const drifted = await run(idSpec, async () => ({ name: "mutable-pkg", version: "2.0.0" }));
       check("候选漂移 → 丢弃缓存重跑探装",
         drifted.report.candidate.version === "2.0.0" && probeCalls.count === 1,
         `version=${drifted.report.candidate.version} probes=${probeCalls.count}`);
       check("漂移重跑后缓存里存的是新报告",
         preflightCache.get(idKey)?.report?.candidate?.version === "2.0.0");
 
-      // c) 核不上（registry 不可达 / 清单没写 version）→ 保留缓存。否则一个
-      //    网络抖动就把所有 pin 打废，用户又要白等一轮探装。
-      seedCache("1.0.0");
-      const unreachable = await run(async () => undefined);
-      check("身份核不上 → 保留缓存",
-        unreachable.report.candidate.version === "1.0.0" && probeCalls.count === 1,
+      // c) 核不上（registry 不可达）→ 丢弃缓存重跑，不再沿用旧报告。
+      seedCache(idSpec, "mutable-pkg", "1.0.0");
+      const unreachable = await run(idSpec, async () => undefined);
+      check("身份核不上 → 丢弃缓存重跑（fail-closed）",
+        unreachable.report.candidate.version === "2.0.0" && probeCalls.count === 2,
         `version=${unreachable.report.candidate.version} probes=${probeCalls.count}`);
-      const noVersion = await run(async () => ({ name: "mutable-pkg", version: null }));
-      check("解析结果没有 version → 视同核不上，保留缓存",
-        noVersion.report.candidate.version === "1.0.0" && probeCalls.count === 1);
 
-      // d) 取消上抛，且缓存保持原样——取消不是「核不上」，不许走复用分支。
+      // d) 解析结果没有 version → 同样没核住，丢弃重跑。
+      seedCache(idSpec, "mutable-pkg", "1.0.0");
+      const noVersion = await run(idSpec, async () => ({ name: "mutable-pkg", version: null }));
+      check("解析结果没有 version → 丢弃缓存重跑",
+        noVersion.report.candidate.version === "2.0.0" && probeCalls.count === 3);
+
+      // e) 不可核验形态（未钉 sha 的 github）→ 身份查询根本不发起，直接重跑。
+      const ghSpec = "github:owner/repo";
+      seedCache(ghSpec, "some-pkg", "1.0.0");
+      const resolvesBefore = resolveCalls;
+      const ghRun = await run(ghSpec, async () => ({ name: "some-pkg", version: "1.0.0" }));
+      check("未钉 sha 的 github → 不发起身份查询，直接丢弃重跑",
+        resolveCalls === resolvesBefore && ghRun.report.candidate.version === "2.0.0" && probeCalls.count === 4,
+        `resolves=${resolveCalls - resolvesBefore} probes=${probeCalls.count}`);
+      const fileRun = await run("file:../local.tgz", async () => ({ name: "x", version: "1.0.0" }));
+      check("file: 路径 → 同样不可核验，直接重跑",
+        fileRun.report.candidate.version === "2.0.0" && probeCalls.count === 5);
+
+      // f) 不可变形态（精确版本）→ 不发起查询，无条件复用。
+      const exactSpec = "fixed-pkg@1.2.3";
+      seedCache(exactSpec, "fixed-pkg", "1.2.3");
+      const resolvesBeforeExact = resolveCalls;
+      const exactRun = await run(exactSpec, async () => { throw new Error("不可变形态不该发起身份查询"); });
+      check("精确版本 → 不发起身份查询，复用缓存",
+        resolveCalls === resolvesBeforeExact && exactRun.report.candidate.version === "1.2.3",
+        `resolves=${resolveCalls - resolvesBeforeExact}`);
+
+      // g) 取消上抛，且缓存保持原样——取消不是「核不上」，不许走丢弃分支。
+      seedCache(idSpec, "mutable-pkg", "1.0.0");
       let aborted = false;
       try {
-        await run(async () => { const error = new Error("cancelled"); error.name = "AbortError"; throw error; });
+        await run(idSpec, async () => { const error = new Error("cancelled"); error.name = "AbortError"; throw error; });
       } catch (error) { aborted = error?.name === "AbortError"; }
       check("身份再校验中取消 → 上抛 AbortError 且缓存原样",
-        aborted && preflightCache.get(idKey)?.report?.candidate?.version === "1.0.0" && probeCalls.count === 1);
+        aborted && preflightCache.get(idKey)?.report?.candidate?.version === "1.0.0" && probeCalls.count === 5);
+
+      // h) 不可核验的形态不 pin——pin 了也只是把注定要丢弃的缓存钉在原地。
+      seedCache("github:owner/pin-test", "some-pkg", "1.0.0");
+      const pinGuardKey = preflightCacheKey(profileDir, "github:owner/pin-test");
+      preflightCache.get(pinGuardKey).pinnedAt = undefined; // 种子不带 pin
+      pinPreflight(profileDir, "github:owner/pin-test");
+      check("不可核验形态 → pinPreflight 拒绝钉住", isPinned(preflightCache.get(pinGuardKey)) === false);
     }
 
     // ── 12b. 预检的告警原文必须留在 job 日志里 ──────────────────────────────

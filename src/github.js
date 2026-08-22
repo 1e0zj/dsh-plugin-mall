@@ -173,16 +173,19 @@ function normalizeRegistry(registry) {
  * @param name - the npm package name.
  * @param options - `registry` defaults to npmjs; pass what pnpm installs from.
  *   `signal` cancels the request (and, critically, keeps the cancellation out
- *   of the cache — see below).
+ *   of the cache — see below). `fresh` skips the read side of the cache: a
+ *   cached "current version" is stale by construction, and the preflight
+ *   staleness check exists precisely to compare against what the registry
+ *   says NOW (the write side still populates the cache for other callers).
  * @returns `{latest, repositoryUrl, hostDeps}`, or null when unknown/unreachable.
  */
-export async function npmPackageInfo(name, { registry, signal } = {}) {
+export async function npmPackageInfo(name, { registry, signal, fresh = false } = {}) {
   const clean = String(name ?? "").trim();
   if (clean.length === 0 || !/^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/i.test(clean)) return null;
   const base = normalizeRegistry(registry);
   const key = `${base}|${clean}`;
   const cached = npmCache.get(key);
-  if (cached !== undefined && Date.now() - cached.at < NPM_CACHE_TTL) return cached.info;
+  if (fresh !== true && cached !== undefined && Date.now() - cached.at < NPM_CACHE_TTL) return cached.info;
   let info = null;
   try {
     // 单版本端点返回 latest 的完整 manifest（dependencies + repository 都在）。
@@ -226,13 +229,13 @@ const npmVersionsCache = new Map();
  * cancellation rule: AbortError is rethrown, never cached as an empty answer.
  * @returns string[], or null when unreachable/unknown.
  */
-export async function npmPackageVersions(name, { registry, signal } = {}) {
+export async function npmPackageVersions(name, { registry, signal, fresh = false } = {}) {
   const clean = String(name ?? "").trim();
   if (clean.length === 0 || !/^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/i.test(clean)) return null;
   const base = normalizeRegistry(registry);
   const key = `${base}|${clean}`;
   const cached = npmVersionsCache.get(key);
-  if (cached !== undefined && Date.now() - cached.at < NPM_CACHE_TTL) return cached.versions;
+  if (fresh !== true && cached !== undefined && Date.now() - cached.at < NPM_CACHE_TTL) return cached.versions;
   let versions = null;
   try {
     const response = await fetch(`${base}/${clean.replace("/", "%2F")}`, {
