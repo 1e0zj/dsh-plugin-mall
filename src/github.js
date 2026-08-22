@@ -64,7 +64,25 @@ async function requestJson(path, { apiBase, token, signal }) {
     }
     const remaining = response.headers.get("x-ratelimit-remaining");
     const resetAt = response.headers.get("x-ratelimit-reset");
-    const body = await response.json().catch(() => undefined);
+    // 读体阶段的三种失败必须分开，不能一把 catch 成 undefined：
+    //   调用方取消（响应头已到、body 读到一半浏览器断开）→ AbortError 上抛；
+    //   内部超时打断读体 → 与请求阶段超时同待遇，退避后重试；
+    //   响应体根本不是 JSON（镜像的 HTML 错误页等）→ 维持 undefined，交给
+    //   下面的状态码分支。
+    // 此前这里是无差别 .catch(() => undefined)：mid-body 取消被吞掉，200 响应
+    // 返回 undefined，search 拿到的是 TypeError 而不是取消；4xx 路径则把一次
+    // 取消谎报成 not found。
+    let body;
+    try {
+      body = await response.json();
+    } catch (error) {
+      if (error?.name === "AbortError" && signal?.aborted) throw error;
+      if (error?.name === "TimeoutError") {
+        lastError = new Error(`GitHub API response body timed out after ${REQUEST_TIMEOUT / 1000}s (attempt ${attempt + 1})`);
+        continue;
+      }
+      body = undefined;
+    }
     if (response.status === 403 && remaining === "0" && resetAt !== null) {
       const reset = new Date(Number(resetAt) * 1000).toISOString();
       throw new Error(`GitHub API rate limit exceeded; resets at ${reset} (UTC). Set GITHUB_TOKEN or DSH_MARKET_GITHUB_TOKEN for a higher limit.`);
@@ -731,6 +749,48 @@ if (process.argv[1]?.endsWith("github.js") && process.argv.includes("--self-test
       else console.log("  PASS 合法路径通过钳制（网络不可达按预期失败）");
     }
     if (clampFailed > 0) process.exit(1);
+  }
+  // requestJson 读体阶段取消：响应头已到、body 读到一半调用方断开（分段
+  // HTTP 稳定触发）。打桩 fetch——离线、确定性，只有 json() 抛 AbortError。
+  // 修复前这里是 .catch(() => undefined)：200 响应返回 undefined，search 拿
+  // 到 TypeError 而不是取消；4xx 则把取消谎报成 not found。
+  {
+    const realFetch = globalThis.fetch;
+    const makeError = (name) => { const error = new Error("synthetic"); error.name = name; return error; };
+    globalThis.fetch = async () => ({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      headers: new Headers(),
+      json: async () => { throw makeError("AbortError"); },
+    });
+    let abortFailed = 0;
+    try {
+      const controller = new AbortController();
+      controller.abort();
+      let threw;
+      try {
+        await requestJson("/repos/owner/repo", { signal: controller.signal });
+      } catch (error) { threw = error; }
+      if (threw?.name === "AbortError") console.log("  PASS 读体期间取消 → AbortError 上抛（不吞成 undefined）");
+      else { abortFailed++; console.log(`  FAIL 读体期间取消应抛 AbortError，实得 ${threw ? `${threw.name}: ${threw.message}` : "未抛（body 变 undefined）"}`); }
+
+      // 内部超时打断读体 → 归类为一次失败尝试，退避重试（重试轮换成成功）。
+      let attempts = 0;
+      globalThis.fetch = async () => ({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: new Headers(),
+        json: async () => { attempts++; if (attempts === 1) throw makeError("TimeoutError"); return { ok: true }; },
+      });
+      const retried = await requestJson("/repos/owner/repo", {});
+      if (retried?.ok === true && attempts === 2) console.log("  PASS 读体超时 → 记一次失败并重试成功");
+      else { abortFailed++; console.log(`  FAIL 读体超时应重试，实得 attempts=${attempts} result=${JSON.stringify(retried)}`); }
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    if (abortFailed > 0) process.exit(1);
   }
   if (process.argv.includes("--offline")) process.exit(0);
   const apiBase = "https://api.github.com";
