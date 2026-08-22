@@ -745,3 +745,41 @@ config.failOnStartupError: true 时，stdio transport 的初始连接或工具�
   转义序列，求值结果静态不可知，整个形态不判。profiles/<名>/node_modules 前缀
   与**包名**在 win32 上都按大小写折叠比较（node_modules/MCP-BRICK 与 manifest
   的 mcp-brick 是同一个包）；posix 上照字面比较。
+
+### 2026-08-22：任务、错误、日志与决策 UI 规范
+
+全文检索官方中文文档后，相关命中为 `web-styling.zh.md`、
+`subsystems/jobs.zh.md`、`subsystems/approval.zh.md`、
+`subsystems/user-questions.zh.md`、`subsystems/client-modules.zh.md`、
+`cookbook/adding-a-settings-card.zh.md`、`testing.zh.md` 与
+`postmortem/0003-web-agent-gui-feedback-loop.zh.md`；另核对官方
+`ui-primitives`、`ui-jobs`、`ApprovalPanel` 和 `PlanReviewPanel` 源码。
+
+官方没有一份规定完整页面排版的总 UI 规范。设置卡片文档明确由插件自己拥有外观、
+控件和文案；但以下语义与交互契约是明确的：
+
+- 颜色和状态只消费 `--dsw-alias-*` 语义 token，功能组件不写主题分支或字面量色板。
+- job 状态词固定为 `running | stopping | completed | killed | failed`；生产者的具体
+  进展和失败原因放 `detail`，输出保持可访问。官方 `ui-jobs` 把 `killed` / `stopping`
+  映射为 warning，把 `failed` 映射为 error，并让已结算任务继续留在历史中。
+- 审批是 fail-closed 的一次性决定；按钮提交后锁住，发送失败才重新开放。官方审批与
+  plan review 都使用 warning 语义、可滚动正文和固定操作区，失败显示在操作区内，
+  而不是漂到页面顶部。
+- `Toast` 是短暂、无需用户处理的通知，使用 `role=alert`；需要用户修正或重试的错误
+  留在对应控件或任务附近。官方 `TerminalBlock` 保留原始空白与横向滚动，显示明确
+  终态，默认截取约 16 行并允许展开。
+- `user-questions` 的 `question`、`detail`、`header`、option label/description 各有
+  独立职责；展示形式不能改变协议语义，批准项按 label 识别，不能靠数组位置猜测。
+- 非平凡可见改动除自动测试外还要走真实 Web 路径并留快照；明暗主题和各个失败/决策
+  状态都属于应覆盖的可见状态。
+
+调研时 `src/client.js` 的差异：build approval 在 job 内，preflight decision 在 job
+外，全局错误又位于页面顶部；同一种任务被拆成三种信息位置。`failed` 和 `killed`
+都染成 error，缺少 `stopping`；日志使用 `pre-wrap`，会破坏终端列；失败文案与日志
+提示重复。更严重的是“清空”会 dismiss 运行中 job 并立刻从本地列表移除，但不会调用
+`jobCancel`，造成任务继续执行却失去观察和取消入口。
+
+2026-08-22 已先修生命周期，再整理任务 UI：Host 拒绝 dismiss 未结算记录，页面只清
+终态并为活动任务提供 Stop；`stopping` / `killed` 使用 warning。两类决策已归入对应
+job 并共用 DecisionPanel，失败直接显示 `detail`，日志保留终端列且失败自动展开。
+页面级 RPC 错误和原生重启确认仍是独立问题，不计入这次任务面板整理。

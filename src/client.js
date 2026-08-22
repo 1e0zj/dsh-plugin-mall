@@ -43,7 +43,7 @@ window.__ModuleLoader__.load({
       ".mkt_panelTitle{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary);margin:0}",
       ".mkt_panelRow{display:flex;align-items:center;gap:8px}",
       ".mkt_panelRow .mkt_link{margin-left:auto}",
-      ".mkt_pre{font-family:Consolas,Monaco,monospace;font-size:11.5px;line-height:16px;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-markdown-code-block);border-radius:6px;padding:8px;max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-all}",
+      ".mkt_pre{font-family:Consolas,Monaco,monospace;font-size:11.5px;line-height:16px;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-markdown-code-block);border-radius:6px;padding:8px;max-height:280px;overflow:auto;white-space:pre;word-break:normal}",
       ".mkt_ok{color:var(--dsw-alias-state-success-primary)}",
       ".mkt_warn{color:var(--dsw-alias-state-warn-label)}",
       ".mkt_badge{display:inline-block;border-radius:999px;padding:1px 8px;font-size:11px;border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-tertiary)}",
@@ -58,13 +58,31 @@ window.__ModuleLoader__.load({
       ".mkt_depList{display:flex;flex-direction:column;gap:6px;margin-top:8px}",
       ".mkt_depRow{display:flex;justify-content:space-between;align-items:center;gap:8px}",
       ".mkt_depActions{display:flex;align-items:center;gap:6px;flex-wrap:wrap}",
-      ".mkt_approve{display:flex;flex-direction:column;gap:8px;border:1px solid var(--dsw-alias-state-error-primary);border-radius:8px;padding:10px 12px;margin:4px 0}",
-      ".mkt_approveHead{font-size:13px;font-weight:600;color:var(--dsw-alias-state-error-primary)}",
+      ".mkt_decision{display:flex;flex-direction:column;border:1px solid var(--dsw-alias-state-warn-secondary);border-radius:6px;overflow:hidden;margin-top:4px}",
+      ".mkt_decisionError{border-color:var(--dsw-alias-state-error-primary)}",
+      ".mkt_decisionHead{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;padding:8px 10px;background:var(--dsw-alias-state-warn-tertiary);color:var(--dsw-alias-state-warn-label)}",
+      ".mkt_decisionError .mkt_decisionHead{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-state-error-primary)}",
+      ".mkt_decisionTitle{font-size:13px;font-weight:600}",
+      ".mkt_decisionBody{display:flex;flex-direction:column;gap:8px;padding:10px;max-height:300px;overflow:auto}",
+      ".mkt_decisionActions{display:flex;justify-content:flex-end;align-items:center;gap:8px;padding:8px 10px;border-top:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-3)}",
       ".mkt_approvePkg{display:flex;flex-direction:column;gap:4px}",
       ".mkt_approveName{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary);margin-right:8px;overflow-wrap:anywhere}",
       ".mkt_approveCmd{max-height:none;margin:0}",
       ".mkt_jobDone{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:2px}",
       ".mkt_logBlock{display:flex;flex-direction:column;gap:4px;align-items:flex-start}",
+      ".mkt_linkButton{border:0;background:none;padding:0;color:var(--dsw-alias-state-business-primary);font:inherit;font-size:12px;cursor:pointer}",
+      ".mkt_job{display:flex;flex-direction:column;gap:6px;padding-top:10px;border-top:1px solid var(--dsw-alias-border-l2)}",
+      ".mkt_panelRow + .mkt_job{padding-top:0;border-top:0}",
+      ".mkt_jobHead{display:flex;align-items:center;gap:8px;min-width:0}",
+      ".mkt_jobIdentity{display:flex;align-items:center;gap:7px;min-width:0;font-size:12px;color:var(--dsw-alias-label-tertiary)}",
+      ".mkt_jobHead .mkt_btn{margin-left:auto;flex:none}",
+      ".mkt_stateDot{width:7px;height:7px;border-radius:50%;background:var(--dsw-alias-label-caption);flex:none}",
+      ".mkt_stateRunning{background:var(--dsw-alias-state-business-primary);animation:mktPulse 1.6s ease-in-out infinite}",
+      ".mkt_stateDone{background:var(--dsw-alias-state-success-primary)}",
+      ".mkt_stateWarn{background:var(--dsw-alias-state-warn-primary)}",
+      ".mkt_stateError{background:var(--dsw-alias-state-error-primary)}",
+      "@keyframes mktPulse{0%,100%{opacity:.45}50%{opacity:1}}",
+      "@media (prefers-reduced-motion:reduce){.mkt_stateRunning{animation:none}.mkt_switch,.mkt_switchKnob{transition:none}}",
       ".mkt_depOff{opacity:.5;text-decoration:line-through}",
       ".mkt_switch{position:relative;width:34px;height:18px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-platform);cursor:pointer;padding:0;transition:background .15s,border-color .15s}",
       ".mkt_switch:disabled{opacity:.55;cursor:default}",
@@ -72,7 +90,7 @@ window.__ModuleLoader__.load({
       ".mkt_switchKnob{position:absolute;top:1px;left:1px;width:14px;height:14px;border-radius:50%;background:var(--dsw-alias-label-primary-foreground);transition:transform .15s;box-shadow:var(--dsw-shadow-lv1)}",
       ".mkt_switchOn .mkt_switchKnob{transform:translateX(16px)}",
       ".mkt_issueList{list-style:none;display:flex;flex-direction:column;gap:8px;margin:0;padding:0}",
-      ".mkt_issue{border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:8px 10px;background:var(--dsw-alias-bg-layer-3)}",
+      ".mkt_issue{border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:8px 10px;background:var(--dsw-alias-bg-layer-3)}",
       ".mkt_issueBlock{border-color:var(--dsw-alias-state-error-primary)}",
       ".mkt_issueWarn{border-color:var(--dsw-alias-state-warn-primary)}",
       ".mkt_issueTitle{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary)}",
@@ -353,11 +371,34 @@ window.__ModuleLoader__.load({
       );
     }
 
+    function DecisionPanel(props) {
+      var tone = props.tone === "error" ? " mkt_decisionError" : "";
+      return h("div", { className: "mkt_decision" + tone },
+        h("div", { className: "mkt_decisionHead" },
+          h("span", { className: "mkt_decisionTitle" }, props.title),
+          props.meta ? h("span", { className: "mkt_meta" }, props.meta) : null),
+        h("div", { className: "mkt_decisionBody" }, props.children),
+        h("div", { className: "mkt_decisionActions" }, props.actions));
+    }
+
     // ── install-script approval ─────────────────────────────────────────────
     function ApprovalRequest(props) {
       var pkgs = props.needsApproval || [];
-      return h("div", { className: "mkt_approve" },
-        h("div", { className: "mkt_approveHead" }, "需要你确认：这次安装会执行安装期代码"),
+      var actions = [
+        h("button", { key: "cancel", className: "mkt_btn mkt_btnSm", disabled: props.busy === true, onClick: props.onDismiss }, "取消"),
+        h("button", {
+          key: "allow",
+          className: "mkt_btn mkt_btnPrimary mkt_btnSm",
+          disabled: props.busy === true,
+          onClick: function () { props.onApprove(pkgs.map(function (p) { return p.name; })); },
+        }, props.busy ? "继续中…" : "允许并继续"),
+      ];
+      return h(DecisionPanel, {
+        title: "安装期代码需要确认",
+        meta: clip(props.spec || "", 50),
+        actions: actions,
+      },
+        props.detail ? h("div", { className: "mkt_desc" }, props.detail) : null,
         pkgs.map(function (p, index) {
           var facts = [];
           if (typeof p.weeklyDownloads === "number") facts.push("周下载 " + p.weeklyDownloads.toLocaleString());
@@ -377,16 +418,7 @@ window.__ModuleLoader__.load({
             h("div", { className: "mkt_meta" }, facts.join(" · "))
           );
         }),
-        h("div", { className: "mkt_meta" }, "这些命令会以你的权限在你的机器上运行，早于任何插件代码加载。"),
-        h("div", { className: "mkt_row" },
-          h("button", {
-            className: "mkt_btn mkt_btnPrimary mkt_btnSm",
-            disabled: props.busy === true,
-            onClick: function () { props.onApprove(pkgs.map(function (p) { return p.name; })); },
-          }, props.busy ? "继续中…" : "允许并继续"),
-          h("button", { className: "mkt_btn mkt_btnSm", onClick: props.onDismiss }, "取消")
-        )
-      );
+        h("div", { className: "mkt_meta" }, "这些命令会以你的权限在你的机器上运行，早于任何插件代码加载。"));
     }
 
     // ── preflight result card ────────────────────────────────────────────────
@@ -398,11 +430,23 @@ window.__ModuleLoader__.load({
       var blocked = report.verdict === "blocked";
       var title = blocked ? "安装被阻止" : "安装存在风险";
       var issues = report.issues || [];
-      return h("div", { className: "mkt_card" },
-        h("div", { className: "mkt_panelRow" },
-          h("p", { className: "mkt_panelTitle" + (blocked ? " mkt_error" : "") }, title),
-          h("span", { className: "mkt_meta" }, clip(props.spec, 50))
-        ),
+      var actions = blocked
+        ? h("button", { className: "mkt_btn mkt_btnSm", onClick: props.onClose }, "关闭")
+        : [
+          h("button", { key: "cancel", className: "mkt_btn mkt_btnSm", disabled: props.busy === true, onClick: props.onClose }, "取消"),
+          h("button", {
+            key: "confirm",
+            className: "mkt_btn mkt_btnPrimary mkt_btnSm",
+            disabled: props.busy === true,
+            onClick: props.onConfirm,
+          }, props.busy ? "安装中…" : "了解风险并继续"),
+        ];
+      return h(DecisionPanel, {
+        tone: blocked ? "error" : "warning",
+        title: title,
+        meta: clip(props.spec, 50),
+        actions: actions,
+      },
         report.summary ? h("div", { className: "mkt_desc" }, report.summary) : null,
         issues.length > 0 ? h("ul", { className: "mkt_issueList" },
           issues.map(function (issue) {
@@ -413,21 +457,7 @@ window.__ModuleLoader__.load({
               h("div", { className: "mkt_issueTitle" }, issue.title),
               issue.detail ? h("div", { className: "mkt_issueDetail" }, issue.detail) : null);
           })
-        ) : null,
-        h("div", { className: "mkt_row" },
-          blocked
-            ? h("button", { className: "mkt_btn mkt_btnSm", onClick: props.onClose }, "关闭")
-            : [
-              h("button", { key: "cancel", className: "mkt_btn mkt_btnSm", onClick: props.onClose }, "取消"),
-              h("button", {
-                key: "confirm",
-                className: "mkt_btn mkt_btnPrimary mkt_btnSm",
-                disabled: props.busy === true,
-                onClick: props.onConfirm,
-              }, props.busy ? "安装中…" : "我已了解风险，继续安装"),
-            ]
-        )
-      );
+        ) : null);
     }
 
     var MARKET_PACKAGE = "@1e0zj/dsh-plugin-mall";
@@ -453,30 +483,46 @@ window.__ModuleLoader__.load({
       return "";
     }
 
+    function jobStateDotClass(status, awaitingDecision) {
+      if (awaitingDecision || status === "killed" || status === "stopping") return "mkt_stateWarn";
+      if (status === "completed") return "mkt_stateDone";
+      if (status === "failed") return "mkt_stateError";
+      return "mkt_stateRunning";
+    }
+
     // 任务日志：跑的时候只露尾部几行（够看进度，不霸屏），落定后默认折叠
     // ——成功的日志没人回头读，失败的才需要，点开即可。
-    var LOG_TAIL_LINES = 8;
+    var LOG_TAIL_LINES = 12;
     function JobLog(props) {
       var _open = useState(false);
       var open = _open[0];
       var setOpen = _open[1];
       var text = String(props.output || "").trimEnd();
+      var failed = props.status === "failed";
+      useEffect(function () {
+        if (failed) setOpen(true);
+      }, [failed]);
       if (text.length === 0) return null;
       var lines = text.split("\n");
-      var collapsed = props.done && !open;
-      var shown = (props.done || lines.length <= LOG_TAIL_LINES) ? lines : lines.slice(-LOG_TAIL_LINES);
+      var settled = !isJobActive(props.status);
+      var collapsed = settled && !open;
+      var shown = settled || lines.length <= LOG_TAIL_LINES ? lines : lines.slice(-LOG_TAIL_LINES);
+      var rendered = shown.join("\n");
+      if (rendered.length > 64000) rendered = "…前部日志已截断…\n" + rendered.slice(-64000);
       // 展开/收起始终在日志块上方：放在下方的话，点开后按钮会被推到长长的
       // 日志末尾，想收起还得先滚回去。
       return h("div", { className: "mkt_logBlock" },
-        props.done
-          ? h("span", {
-            className: "mkt_link",
+        settled
+          ? h("button", {
+            type: "button",
+            className: "mkt_linkButton",
+            "aria-expanded": open ? "true" : "false",
             onClick: function () { setOpen(!open); },
           }, open ? "收起日志" : "查看日志（" + lines.length + " 行）")
           : lines.length > LOG_TAIL_LINES
             ? h("div", { className: "mkt_meta" }, "只显示最后 " + LOG_TAIL_LINES + " 行")
             : null,
-        collapsed ? null : h("pre", { className: "mkt_pre" }, shown.join("\n").slice(-4000))
+        collapsed ? null : h("pre", { className: "mkt_pre", "aria-label": "任务日志" }, rendered)
       );
     }
 
@@ -484,7 +530,12 @@ window.__ModuleLoader__.load({
     function JobsPanel(props) {
       var ids = Object.keys(props.jobs);
       if (ids.length === 0) return null;
-      var hasSettled = ids.some(function (id) { return !isJobActive(props.jobs[id].status); });
+      var hasSettled = ids.some(function (id) {
+        var job = props.jobs[id];
+        var hasDecision = (props.preflight && props.preflight.jobId === id)
+          || (job.needsApproval && job.needsApproval.length > 0);
+        return !isJobActive(job.status) && !hasDecision;
+      });
       return h("div", { className: "mkt_card" },
         h("div", { className: "mkt_panelRow" },
           h("p", { className: "mkt_panelTitle" }, "任务"),
@@ -493,14 +544,17 @@ window.__ModuleLoader__.load({
         ids.map(function (id) {
           var job = props.jobs[id];
           var done = job.status === "completed" || job.status === "failed" || job.status === "killed";
-          return h("div", { key: id, style: { display: "flex", flexDirection: "column", gap: "4px" } },
+          var preflightDecision = props.preflight && props.preflight.jobId === id ? props.preflight : null;
+          var awaitingDecision = preflightDecision !== null || (job.needsApproval && job.needsApproval.length > 0);
+          return h("div", { key: id, className: "mkt_job" },
             // 不再显示 market-N 这种内部 id——对用户没有意义，反而让人以为
             // 自己点了两次。只说清「在做什么 · 到哪一步了」。
-            // 状态词单独上色（完成绿、失败/取消红），前半段保持灰——整行
-            // 都染色会喧宾夺主，只有结论需要一眼看见。
-            h("div", { className: "mkt_meta" },
-              jobKindLabel(job.kind) + clip(job.spec || "", 44) + " · ",
-              h("span", { className: jobStatusClass(job.status) }, jobStatusLabel(job.status)),
+            // 状态词和状态点表达结论，任务类型与目标保持次要色。
+            h("div", { className: "mkt_jobHead" },
+              h("div", { className: "mkt_jobIdentity" },
+                h("span", { className: "mkt_stateDot " + jobStateDotClass(job.status, awaitingDecision), "aria-hidden": "true" }),
+                h("span", null, jobKindLabel(job.kind) + clip(job.spec || "", 44) + " · "),
+                h("span", { className: awaitingDecision ? "mkt_warn" : jobStatusClass(job.status) }, awaitingDecision ? "待确认" : jobStatusLabel(job.status))),
               isJobActive(job.status) ? h("button", {
                 className: "mkt_btn mkt_btnSm",
                 disabled: job.status === "stopping",
@@ -508,6 +562,8 @@ window.__ModuleLoader__.load({
               }, job.status === "stopping" ? "停止中…" : "停止") : null),
             job.needsApproval && job.needsApproval.length > 0
               ? h(ApprovalRequest, {
+                spec: job.spec,
+                detail: job.detail,
                 needsApproval: job.needsApproval,
                 busy: props.approving === job.spec,
                 onApprove: function (names) {
@@ -520,7 +576,15 @@ window.__ModuleLoader__.load({
                 },
                 onDismiss: function () { props.onDismiss(id); },
               })
-              : job.detail ? h("div", { className: "mkt_desc" }, job.detail) : null,
+              : preflightDecision
+                ? h(PreflightCard, {
+                  spec: preflightDecision.spec,
+                  report: preflightDecision.report,
+                  busy: props.preflightBusy === true,
+                  onConfirm: props.onConfirmPreflight,
+                  onClose: props.onClosePreflight,
+                })
+                : job.detail ? h("div", { className: job.status === "failed" ? "mkt_error" : "mkt_desc" }, job.detail) : null,
             // 预检完成不提示重启——它没有改动任何东西，接下来才是安装。
             // 也不再重复一个绿色「完成」：状态行已经写了「· 完成」。
             done && job.status === "completed" && job.kind !== "dsh-plugin-preflight"
@@ -535,10 +599,8 @@ window.__ModuleLoader__.load({
                     disabled: props.restarting === true,
                     onClick: props.onRestart,
                   }, props.restarting ? "重启中…" : "重启 dsh 生效"))
-              : job.status === "failed" && !(job.needsApproval && job.needsApproval.length > 0)
-                ? h("div", { className: "mkt_error" }, "失败，见下方输出")
-                : null,
-            h(JobLog, { output: job.output, done: done })
+              : null,
+            h(JobLog, { output: job.output, status: job.status })
           );
         })
       );
@@ -1033,10 +1095,14 @@ window.__ModuleLoader__.load({
         }),
         h(JobsPanel, {
           jobs: jobs,
+          preflight: preflight,
+          preflightBusy: preflight ? installing[preflight.spec] === true : false,
           onClear: function () {
             Object.keys(jobs).forEach(function (id) {
               var job = jobs[id];
-              if (!job || isJobActive(job.status)) return;
+              var hasDecision = job && ((preflight && preflight.jobId === id)
+                || (job.needsApproval && job.needsApproval.length > 0));
+              if (!job || isJobActive(job.status) || hasDecision) return;
               var token = job && job.approvalToken ? job.approvalToken : (job && job.spec ? approvalTokensRef.current[job.spec] : undefined);
               call("jobDismiss", { jobId: id, token: token }).catch(function () {});
               if (job.spec) delete approvalTokensRef.current[job.spec];
@@ -1053,6 +1119,21 @@ window.__ModuleLoader__.load({
             });
           },
           onApprove: doApprove,
+          onConfirmPreflight: function () {
+            if (!preflight) return;
+            var spec = preflight.spec;
+            var carry = preflight.jobId;
+            var report = preflight.report;
+            setPreflight(null);
+            // consentDigest 来自预检 job 的 extras，装的时候与当前报告比对：
+            // 用户点「继续」到安装真正开跑之间候选包或 profile 变了，
+            // 布尔同意不得沿用，要重新看新的警告。
+            doRawInstall(spec, { acceptWarnings: true, acceptedReportDigest: report.consentDigest }, carry);
+          },
+          onClosePreflight: function () {
+            if (preflight && preflight.spec) delete approvalTokensRef.current[preflight.spec];
+            setPreflight(null);
+          },
           onDismiss: function (id) {
             var job = jobs[id];
             var token = job && job.approvalToken ? job.approvalToken : (job && job.spec ? approvalTokensRef.current[job.spec] : undefined);
@@ -1066,24 +1147,6 @@ window.__ModuleLoader__.load({
           hostStartedAt: hostStartedAt,
           approving: Object.keys(installing).filter(function (s) { return installing[s]; })[0],
         }),
-        preflight ? h(PreflightCard, {
-          spec: preflight.spec,
-          report: preflight.report,
-          busy: installing[preflight.spec] === true,
-          onConfirm: function () {
-            var spec = preflight.spec;
-            var carry = preflight.jobId;
-            setPreflight(null);
-            // consentDigest 来自预检 job 的 extras，装的时候与当前报告比对：
-            // 用户点「继续」到安装真正开跑之间候选包或 profile 变了，
-            // 布尔同意不得沿用，要重新看新的警告。
-            doRawInstall(spec, { acceptWarnings: true, acceptedReportDigest: preflight.report.consentDigest }, carry);
-          },
-          onClose: function () {
-            if (preflight && preflight.spec) delete approvalTokensRef.current[preflight.spec];
-            setPreflight(null);
-          },
-        }) : null,
         h("div", { className: "mkt_list" },
           results == null
             ? h("div", { className: "mkt_meta mkt_listHead" }, loading ? "正在加载最热插件…" : "—")
