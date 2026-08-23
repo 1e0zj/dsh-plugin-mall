@@ -2037,7 +2037,7 @@ async function selfTest() {
       watcher.noteChild(fakeChild);
       process.emit("SIGINT");
       if (!watcher.interrupted()) throw new Error("the first Ctrl+C must mark the watcher interrupted (and not kill yet)");
-      if (fakeChild.killCalls !== 0 && treeKills.length !== 0) throw new Error("the first Ctrl+C must give the child its own chance to exit");
+      if (fakeChild.killCalls !== 0 || treeKills.length !== 0) throw new Error("the first Ctrl+C must give the child its own chance to exit");
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 60));
       if (treeKills.length !== 1 || treeKills[0] !== 31337) throw new Error("the force-deadline must tear down the tree of a child that ignored Ctrl+C");
       process.emit("SIGINT");
