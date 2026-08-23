@@ -859,6 +859,15 @@ successor 抢端口安全。**凡是「写给将来某个时刻被读」的哨�
 代码时先写一个模拟「立即执行+登记返回值」语义的 fake ctx fixture**；带副作用
 的 lifecycle 接线要抽成可单测的函数，别内联在 RPC case 里。
 
+**真机第一轮（2026-08-23）：tee 链把 TTY 信号丢了**。交互终端的首次重启是
+可见的，但新窗口里的 dsh 的 stdout 是 tee 的**管道**（`isTTY === false`），
+它自己的重启判定读成「非交互」→ 第二次起退化回后台、不再弹窗（正是验收项
+「连续重启始终一套 guard/DSH、旧窗口关新窗口开」要防的）。修法：tee 拉起
+dsh 时打 `DSH_PLUGIN_MALL_VISIBLE_CONSOLE=1`（env 经 cmd→start→guard→dsh
+全程继承），可见性判定认「TTY stdout **或** 该标志」。**凡「进程属性」型
+判定（isTTY）跨 spawn 边界传播，都要显式带状态——stdio 形状在链条里必然
+改变**。
+
 生态普查补充：awesome 列表里 `anweat/dsh-restart` 最接近，但其 Node 路径同为
 detached 纯日志（无可见窗口/tee），legacy 路径是 PowerShell `taskkill /F /T`
 硬杀——本 feature 无先例可抄；它的 watchdog 用端口探测（`net.connect`）避免
