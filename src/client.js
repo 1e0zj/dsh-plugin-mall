@@ -443,7 +443,7 @@ window.__ModuleLoader__.load({
         meta: clip(props.spec || "", 50),
         actions: actions,
       },
-        props.detail ? h("div", { className: "mkt_desc" }, props.detail) : null,
+        h("div", { className: "mkt_desc" }, "pnpm 已拦截下列安装脚本，尚未执行任何插件代码。允许后会先复核制品再运行；暂不允许时，重启 dsh 会自动撤回这次安装。"),
         pkgs.map(function (p, index) {
           var facts = [];
           if (typeof p.weeklyDownloads === "number") facts.push("周下载 " + p.weeklyDownloads.toLocaleString());
@@ -609,7 +609,6 @@ window.__ModuleLoader__.load({
             job.needsApproval && job.needsApproval.length > 0
               ? h(ApprovalRequest, {
                 spec: job.spec,
-                detail: job.detail,
                 needsApproval: job.needsApproval,
                 busy: props.approving === job.spec,
                 onApprove: function (names) {

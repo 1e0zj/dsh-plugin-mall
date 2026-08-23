@@ -1571,10 +1571,11 @@ function pendingMarkerPath(profileDir) {
 function renderApprovalNeeded(spec, disclosure) {
   const lines = [
     `installing ${spec} requires running install-time code — approval needed.`,
-    "No install script ran and no plugin code loaded. The profile was restored",
-    "to its pre-install state. On approval, pnpm resolves again with scripts",
-    "blocked; the materialized bytes and commands must match this disclosure",
-    "before the verified tree is rebuilt. Nothing is left behind if you cancel.",
+    "No install script ran and no plugin code loaded. The candidate is staged",
+    "with its scripts blocked, and the original profile snapshot is retained.",
+    "On approval, the materialized bytes and commands must match this disclosure",
+    "before the verified tree is rebuilt. If you do not approve, restart dsh or",
+    "run `dsh-plugin-guard guard recover` to roll the paused transaction back.",
     "",
   ];
   for (const entry of disclosure) {
@@ -2753,6 +2754,8 @@ async function runTransactionFixtures() {
             && entry.weeklyDownloads === 123)
           && calls.length === 1
           && existsSync(markerBefore)
+          && /candidate is staged/.test(outcome.detail ?? "")
+          && !/profile was restored/.test(outcome.detail ?? "")
           && /paused for build-script approval/.test(output)
           && /Ignored build scripts: node-pty@1\.0\.0/.test(output)
           && !output.includes("\u001b["),
