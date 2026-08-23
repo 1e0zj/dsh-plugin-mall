@@ -29,7 +29,10 @@ import { resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
 import { repoInfo, searchPlugins, verifyPlugins, cachedRepoManifest, fetchRawFile, preferNpmSpec, npmPackageInfo, npmPackageVersions, npmNameOf, compareVersions, assertSafeToInstall, mapLimit, NETWORK_CONCURRENCY } from "./github.js";
 import { ensureProfile, listInstalled, normalizeSpec, runInstall, runRemove, assertSafeSpec, resolveRegistry, serializeCanonicalProof, persistPluginDisabled } from "./installer.js";
 import { preflightInstall, inspectRemoteCandidate, recoverProfile, describeRollbackRebuild, isAbortError } from "./guard.js";
-import { createRestartHelperReadyMessage, RESTART_HELPER_READY_TYPE, RESTART_RESPONSE_DRAIN_MS, superviseRestartHelper } from "./restart-protocol.js";
+import {
+  createRestartHelperReadyMessage, RESTART_HELPER_READY_TYPE, RESTART_RESPONSE_DRAIN_MS, superviseRestartHelper,
+  RESTART_PLAN_TYPE, readRestartHelperReadyFile, superviseRestartHelperFile, validateRestartPlanPayload, writeRestartHelperReadyFile,
+} from "./restart-protocol.js";
 
 export const name = "@1e0zj/dsh-plugin-mall";
 // `loader` 用来读装配树、并对单个 entry 做热开关（entry.update）。读法照抄
@@ -3307,6 +3310,158 @@ export async function runSelfTests() {
         Number.isFinite(hostProcessStartedAt)
           && hostProcessStartedAt > 0 && hostProcessStartedAt <= Date.now(),
       );
+    }
+
+    // File-channel handoff (the visible-console path): the ready file replaces
+    // the IPC message while the phase machine must stay equivalent — including
+    // the accepted-phase liveness watch that keeps a post-RPC death from
+    // costing the old Host its exit.
+    {
+      const fileRoot = mkdtempSync(join(tmpdir(), "dsh-mall-restart-file-"));
+      try {
+        const awaitPid = 4711;
+        const pause = (ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+        const basePlan = {
+          version: 1,
+          type: RESTART_PLAN_TYPE,
+          profile: "web",
+          awaitExitPid: awaitPid,
+          logPath: "C:/l/restart-web.log",
+          readyFile: join(fileRoot, "r1.json"),
+          cwd: "C:/w",
+          command: "C:/node/node.exe",
+          args: ["C:/dsh/index.js", "web", "--no-open"],
+        };
+        check("plan payload 校验通过", validateRestartPlanPayload(basePlan).ok === true);
+        for (const [override, needle] of [
+          [{ version: 2 }, "version"],
+          [{ type: "someone-elses-plan" }, "type"],
+          [{ args: ["C:/dsh/index.js", 3] }, "args"],
+          [{ awaitExitPid: 0 }, "awaitExitPid"],
+          [{ logPath: "" }, "logPath"],
+          [{ command: 42 }, "command"],
+        ]) {
+          const badResult = validateRestartPlanPayload({ ...basePlan, ...override });
+          check(
+            `plan payload 拒绝坏 ${needle}`,
+            badResult.ok === false && new RegExp(needle).test(badResult.error),
+          );
+        }
+        check("plan payload 拒绝非对象", validateRestartPlanPayload("nope").ok === false);
+        check(
+          "readRestartHelperReadyFile 对缺失/坏文件读作未就绪",
+          readRestartHelperReadyFile(join(fileRoot, "missing.json")) === undefined
+            && (() => {
+              writeFileSync(join(fileRoot, "garbage.json"), "{ half-written");
+              return readRestartHelperReadyFile(join(fileRoot, "garbage.json")) === undefined;
+            })(),
+        );
+
+        const mkFileSupervise = (name, overrides = {}) => {
+          let hostExits = 0;
+          const failures = [];
+          const kills = [];
+          const handoff = superviseRestartHelperFile({
+            readyFile: join(fileRoot, name),
+            awaitExitPid: awaitPid,
+            handshakeTimeoutMs: 80,
+            stabilityMs: 60,
+            responseDelayMs: 120,
+            pollMs: 2,
+            probe: () => true,
+            kill: (pid) => { kills.push(pid); },
+            onHostExit: () => { hostExits++; },
+            onFailure: (message, meta) => { failures.push({ message, meta }); },
+            ...overrides,
+          });
+          return { handoff, kills, failures, hostExits: () => hostExits };
+        };
+
+        const good = mkFileSupervise("good.json", { stabilityMs: 8, responseDelayMs: 8 });
+        writeRestartHelperReadyFile(join(fileRoot, "good.json"), { awaitExitPid: awaitPid, guardPid: 31337 });
+        const goodReady = await good.handoff.ready;
+        await pause(60);
+        check(
+          "文件握手成功 → ready 文件被父删除、旧 Host 恰退出一次、不 kill",
+          goodReady.ok === true && good.hostExits() === 1
+            && !existsSync(join(fileRoot, "good.json"))
+            && good.kills.length === 0 && good.failures.length === 0,
+        );
+
+        const mismatch = mkFileSupervise("mismatch.json");
+        writeFileSync(join(fileRoot, "mismatch.json"), JSON.stringify({
+          type: RESTART_HELPER_READY_TYPE, protocol: 99, awaitExitPid: awaitPid, guardPid: 31338,
+        }));
+        const mismatchReady = await mismatch.handoff.ready;
+        check(
+          "文件握手协议不匹配 → kill 该 helper 恰一次、旧 Host 不退",
+          mismatchReady.ok === false && /protocol mismatch/.test(mismatchReady.error)
+            && mismatch.kills.length === 1 && mismatch.hostExits() === 0
+            && !existsSync(join(fileRoot, "mismatch.json")),
+        );
+
+        const wrongPid = mkFileSupervise("wrongpid.json");
+        writeRestartHelperReadyFile(join(fileRoot, "wrongpid.json"), { awaitExitPid: 9999, guardPid: 31339 });
+        const wrongPidReady = await wrongPid.handoff.ready;
+        check(
+          "ready 文件 awaitExitPid 不匹配 → fail closed 且 kill 一次",
+          wrongPidReady.ok === false && /protocol mismatch/.test(wrongPidReady.error)
+            && wrongPid.kills.length === 1 && wrongPid.hostExits() === 0,
+        );
+
+        const garbage = mkFileSupervise("garbage2.json", { handshakeTimeoutMs: 30 });
+        writeFileSync(join(fileRoot, "garbage2.json"), "{ still not json");
+        const garbageReady = await garbage.handoff.ready;
+        check(
+          "半截/无关 ready 文件 → 容忍到握手超时、绝不 kill 未知 pid",
+          garbageReady.ok === false && /did not write/.test(garbageReady.error)
+            && garbage.kills.length === 0 && garbage.hostExits() === 0,
+        );
+
+        let midAlive = true;
+        const mid = mkFileSupervise("mid.json", { probe: (pid) => midAlive });
+        writeRestartHelperReadyFile(join(fileRoot, "mid.json"), { awaitExitPid: awaitPid, guardPid: 31340 });
+        await pause(20);
+        midAlive = false;
+        const midReady = await mid.handoff.ready;
+        check(
+          "稳定窗口内 helper 消失 → 取消旧 Host 退出",
+          midReady.ok === false && /stability window/.test(midReady.error) && mid.hostExits() === 0,
+        );
+
+        let lateAlive = true;
+        const late = mkFileSupervise("late.json", { probe: (pid) => lateAlive, responseDelayMs: 150 });
+        writeRestartHelperReadyFile(join(fileRoot, "late.json"), { awaitExitPid: awaitPid, guardPid: 31341 });
+        const lateReady = await late.handoff.ready; // resolves at accepted
+        lateAlive = false;
+        await pause(60);
+        check(
+          "RPC 应答后 helper 死亡 → 仍取消旧 Host 退出（accepted 持续探活）",
+          lateReady.ok === true && late.hostExits() === 0
+            && late.failures.length === 1 && late.failures[0].meta.afterReady === true,
+        );
+
+        const disposed = mkFileSupervise("disp.json", { responseDelayMs: 150 });
+        writeRestartHelperReadyFile(join(fileRoot, "disp.json"), { awaitExitPid: awaitPid, guardPid: 31342 });
+        const disposedReady = await disposed.handoff.ready;
+        disposed.handoff.dispose(); // mirrors the disposer returned from ctx.effect()
+        await pause(200);
+        check(
+          "插件卸载 dispose → 清理 timer、kill helper、旧 Host 不退",
+          disposedReady.ok === true && disposed.hostExits() === 0
+            && disposed.kills.length === 1 && disposed.handoff.state() === "disposed",
+        );
+
+        const fast = mkFileSupervise("fast.json", { handshakeTimeoutMs: 5000 });
+        fast.handoff.failFast("cmd exited with code 1 before the guard started");
+        const fastReady = await fast.handoff.ready;
+        check(
+          "failFast（cmd 先死）→ 提前失败，不等握手超时",
+          fastReady.ok === false && /cmd exited/.test(fastReady.error) && fast.hostExits() === 0,
+        );
+      } finally {
+        rmSync(fileRoot, { recursive: true, force: true });
+      }
     }
 
     // ── 7. Tracker isolation: producer.done rejection handling ───────────────
