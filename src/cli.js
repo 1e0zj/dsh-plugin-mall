@@ -39,6 +39,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
+import { EventEmitter } from "node:events";
 import { Writable } from "node:stream";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -671,9 +672,12 @@ const delay = (ms) => new Promise((resolvePromise) => { setTimeout(resolvePromis
  * and named itself. It can still be recycled in principle; the bounded wait
  * and the refusal on timeout keep that from turning into a hang.
  *
- * @returns true when the process is gone, false on timeout.
+ * `shouldAbort` (the Ctrl+C watcher's flag) cuts the wait short: the caller
+ * reads it and refuses the launch instead of outwaiting a cancelled restart.
+ *
+ * @returns true when the process is gone, false on timeout or abort.
  */
-async function waitForProcessExit(pid, timeoutMs, pollMs = 100) {
+async function waitForProcessExit(pid, timeoutMs, pollMs = 100, shouldAbort = undefined) {
   const target = Number(pid);
   if (!Number.isInteger(target) || target <= 0) return true; // nothing to wait for
   const deadline = Date.now() + timeoutMs;
@@ -684,6 +688,7 @@ async function waitForProcessExit(pid, timeoutMs, pollMs = 100) {
       if (error?.code === "ESRCH") return true;
       if (error?.code !== "EPERM") return true; // unprobeable: do not block the restart on it
     }
+    if (shouldAbort !== undefined && shouldAbort()) return false;
     if (Date.now() >= deadline) return false;
     await delay(pollMs);
   }
@@ -885,6 +890,99 @@ const classicIO = {
   waitFor: waitForExit,
   say: (text, level) => { console[level === "error" ? "error" : "log"](text); },
 };
+
+// ── console Ctrl handling (visible restart, Windows) ─────────────────────────
+
+// NTSTATUS 0xC000013A: how a console process exits when it honored
+// CTRL_C_EVENT. Depending on the libuv version Node reports it as exit code
+// or maps it to SIGINT — both spellings are honored below.
+const STATUS_CONTROL_C_EXIT = 3221225786;
+
+/**
+ * Ctrl+C on a console reaches every attached process: the wrapped dsh gets
+ * the event directly. This watcher's job is only on the GUARD's side —
+ *
+ *  - keep it alive (a Node process without a SIGINT handler exits at once,
+ *    orphaning nothing but losing the log flush and the exit-code report);
+ *  - remember the run was interrupted. On Windows a killed child reports
+ *    code 1 / no signal, which probation would otherwise read as "the
+ *    pending install crashed dsh" and roll back a perfectly good install;
+ *  - escalate: if the child has not quit on its own within forceGraceMs,
+ *    terminate it so the listening port is released; a second Ctrl+C
+ *    terminates at once;
+ *  - SIGHUP (the window's close button): the OS is about to kill the whole
+ *    console unconditionally — hold the handler open only so the normal
+ *    cleanup path (log close) can finish before that lands.
+ */
+function createInterruptWatcher({ forceGraceMs = 5000 } = {}) {
+  let interrupted = false;
+  let child;
+  let forceTimer;
+  const abortListeners = new Set();
+  const signal = () => {
+    for (const listener of abortListeners) {
+      try { listener(); } catch { /* best effort */ }
+    }
+    if (interrupted) {
+      if (child !== undefined) { try { child.kill(); } catch { /* already gone */ } }
+      return;
+    }
+    interrupted = true;
+    if (child !== undefined) armForceKill();
+  };
+  function armForceKill() {
+    if (forceTimer !== undefined || child === undefined) return;
+    forceTimer = setTimeout(() => {
+      try { child.kill(); } catch { /* already gone */ }
+    }, forceGraceMs);
+    if (typeof forceTimer.unref === "function") forceTimer.unref();
+  }
+  const onHup = () => { /* see the doc comment: let cleanup run, OS decides */ };
+  process.on("SIGINT", signal);
+  process.on("SIGBREAK", signal);
+  process.on("SIGHUP", onHup);
+  return {
+    interrupted: () => interrupted,
+    noteChild(nextChild) {
+      child = nextChild;
+      if (interrupted) armForceKill(); // defensive: a spawn after a cancel
+    },
+    onAbort(listener) { abortListeners.add(listener); },
+    offAbort(listener) { abortListeners.delete(listener); },
+    unlisten() {
+      process.removeListener("SIGINT", signal);
+      process.removeListener("SIGBREAK", signal);
+      process.removeListener("SIGHUP", onHup);
+      if (forceTimer !== undefined) clearTimeout(forceTimer);
+    },
+  };
+}
+
+/** Sleep for inspection pauses; any further Ctrl+C (via the watcher) ends it. */
+function waitForSignalOrTimeout(ms, watcher) {
+  return new Promise((resolvePromise) => {
+    const timer = setTimeout(finish, ms);
+    const onAbort = () => { finish(); };
+    function finish() {
+      clearTimeout(timer);
+      if (watcher !== undefined) watcher.offAbort(onAbort);
+      resolvePromise();
+    }
+    if (watcher !== undefined) watcher.onAbort(onAbort);
+  });
+}
+
+/**
+ * Was the wrapped command interrupted from outside rather than crashed?
+ * POSIX says SIGINT/SIGTERM; Windows says "killed" (code 1, no signal) or
+ * STATUS_CONTROL_C_EXIT — there the watcher's flag is the reliable spelling
+ * and the NTSTATUS is belt-and-braces.
+ */
+function isInterruptedOutcome(outcome, watcher) {
+  if (outcome.signal === "SIGINT" || outcome.signal === "SIGTERM") return true;
+  if (outcome.code === STATUS_CONTROL_C_EXIT) return true;
+  return watcher !== undefined && watcher.interrupted();
+}
 
 function waitForExit(child) {
   return new Promise((resolvePromise) => {
@@ -1118,6 +1216,7 @@ async function cmdLaunch({
   awaitExitPid,
   plan,
   tee,
+  interrupt,
   _waitForExit = waitForProcessExit,
   _onAwaitExit = plan === undefined ? announceRestartHelperReady : (pid) => announceRestartHandoffViaFile(plan, pid),
 }) {
@@ -1130,6 +1229,16 @@ async function cmdLaunch({
   // console.log/console.error split (stdout vs stderr) is unchanged behavior.
   const io = tee ?? classicIO;
   const say = io.say;
+  // The Ctrl watcher needs to know the live child (second Ctrl+C escalates
+  // to a kill) — wrap attach so every spawn, probation's retry included,
+  // registers it.
+  const watchedIO = interrupt === undefined ? io : {
+    ...io,
+    attach(child) {
+      interrupt.noteChild(child);
+      return io.attach(child);
+    },
+  };
 
   // A restart hands us the pid of the host that is on its way out. Starting
   // the successor while it still holds the listening port is not a race worth
@@ -1146,8 +1255,13 @@ async function cmdLaunch({
     // for this acknowledgement — over IPC on the background path, or through
     // the ready file on the visible-console path — before it allows itself to
     // exit. A failed announcement rejects here and nothing starts.
+    if (tee !== undefined) tee.say(`[guard] waiting for outgoing dsh (pid ${awaitExitPid}) to exit (Ctrl+C cancels)…`);
     await _onAwaitExit(awaitExitPid);
-    if (!await _waitForExit(awaitExitPid, AWAIT_EXIT_TIMEOUT_MS)) {
+    const gone = await _waitForExit(awaitExitPid, AWAIT_EXIT_TIMEOUT_MS, 100, interrupt === undefined ? undefined : interrupt.interrupted);
+    if (!gone) {
+      if (interrupt !== undefined && interrupt.interrupted()) {
+        throw new Error(`interrupted while waiting for the outgoing dsh (pid ${awaitExitPid}) — no successor was started`);
+      }
       throw new Error(`process ${awaitExitPid} was still running after ${AWAIT_EXIT_TIMEOUT_MS}ms — refusing to start a second host that would collide with it on the listening port (the old one is still up; nothing was changed)`);
     }
     await delay(PORT_SETTLE_MS);
@@ -1186,17 +1300,20 @@ async function cmdLaunch({
   }
 
   if (!pending) {
-    const result = await runPlain(command, args, io);
+    const result = await runPlain(command, args, watchedIO);
     if (result.error !== undefined) say(`[guard] failed to start ${command}: ${result.error.message}`, "error");
+    if (isInterruptedOutcome(result, interrupt)) return result.signal === "SIGTERM" ? 143 : 130;
     return exitCodeOf(result);
   }
 
-  const outcome = await runProbation({ profileDir, command, args, graceMs: grace, io });
+  const outcome = await runProbation({ profileDir, command, args, graceMs: grace, io: watchedIO });
   if (outcome.phase === "after-grace") return exitCodeOf(outcome);
-  if (outcome.signal === "SIGINT" || outcome.signal === "SIGTERM") {
-    // Interrupted from outside (Ctrl+C / service stop): not an install failure —
-    // leave the marker pending for the next launch, propagate the convention.
-    return exitCodeOf(outcome);
+  if (isInterruptedOutcome(outcome, interrupt)) {
+    // Interrupted from outside (Ctrl+C / service stop): not an install
+    // failure — leave the marker pending for the next launch and keep the
+    // 130/143 convention. This check precedes the exit-0 commit on purpose:
+    // a dsh that exits 0 after a Ctrl+C has proven nothing about loading.
+    return outcome.signal === "SIGTERM" ? 143 : 130;
   }
   if (outcome.error === undefined && outcome.code === 0) {
     // One-shot command that finished successfully inside the grace window.
@@ -1216,8 +1333,9 @@ async function cmdLaunch({
     throw new Error(`the command ${why} within the grace period, but rollback failed — refusing to restart: ${error.message}`);
   }
   say(`[guard] the command ${why} within the ${grace}ms grace period — profile "${profile}" rolled back, restarting once with the restored state`, "error");
-  const retry = await runPlain(command, args, io);
+  const retry = await runPlain(command, args, watchedIO);
   if (retry.error !== undefined) say(`[guard] failed to restart ${command}: ${retry.error.message}`, "error");
+  if (isInterruptedOutcome(retry, interrupt)) return retry.signal === "SIGTERM" ? 143 : 130;
   return exitCodeOf(retry);
 }
 
@@ -1320,8 +1438,11 @@ async function main(argv) {
   const home = parsed.home !== undefined ? resolve(parsed.home) : resolveDshHome();
   // The visible-restart tee outlives cmdLaunch: main's catch can still write
   // the failure into the restart log (the window would otherwise flash away)
-  // before the log is closed and flushed.
+  // before the log is closed and flushed. The Ctrl watcher belongs to the
+  // same lifetime — Windows only, so every other platform's signal behavior
+  // stays exactly as it was.
   let launchTee;
+  let launchInterrupt;
   try {
     switch (parsed.command) {
       case "validate": {
@@ -1369,8 +1490,9 @@ async function main(argv) {
         const invocation = resolveLaunchInvocation(parsed);
         if (invocation.plan !== undefined) {
           launchTee = createTeeRunner({ logPath: invocation.plan.logPath, cwd: invocation.plan.cwd });
+          if (process.platform === "win32") launchInterrupt = createInterruptWatcher();
         }
-        process.exitCode = await cmdLaunch({ ...invocation, home, graceMs, tee: launchTee });
+        process.exitCode = await cmdLaunch({ ...invocation, home, graceMs, tee: launchTee, interrupt: launchInterrupt });
         return;
       }
       case "self-test": {
@@ -1384,7 +1506,14 @@ async function main(argv) {
     if (launchTee !== undefined) launchTee.say(`error: ${error.message}`, "error");
     console.error(`error: ${error.message}`);
     process.exitCode = error instanceof UsageError ? 2 : 1;
+    // A visible window that vanishes takes its diagnosis with it: hold it for
+    // a beat, cut short by another Ctrl+C.
+    if (launchTee !== undefined) {
+      launchTee.say("[guard] this window stays open for 10s for inspection (Ctrl+C closes it now)…");
+      await waitForSignalOrTimeout(10000, launchInterrupt);
+    }
   } finally {
+    if (launchInterrupt !== undefined) launchInterrupt.unlisten();
     if (launchTee !== undefined) await launchTee.close();
   }
 }
@@ -1725,12 +1854,19 @@ async function selfTest() {
       if (brokenResult.code !== 5 || !brokenRunner.broken) throw new Error("a failed log must be console-only and must not affect the child");
       if (!consoleText.includes("STILL-HERE") || !consoleText.includes("disk on fire")) throw new Error("a failed log must warn on the console and keep showing output");
 
-      let releaseWrite = null;
+      // The slow target is a plain EventEmitter, not a Writable: _write is a
+      // serialization point (queued writes never run once the releaser stops),
+      // which would lose TAIL bytes here and misblame the tee. write() always
+      // reports saturated, every drain is hand-released — the strictest
+      // pause/resume cycle the runner can be put through.
       const slowChunks = [];
-      const slowOut = new Writable({
-        highWaterMark: 16,
-        write(chunk, encoding, callback) { slowChunks.push(Buffer.from(chunk)); releaseWrite = callback; },
-      });
+      const pendingDrains = [];
+      const slowOut = new EventEmitter();
+      slowOut.write = (chunk) => {
+        slowChunks.push(Buffer.from(chunk));
+        pendingDrains.push(() => slowOut.emit("drain"));
+        return false;
+      };
       const slowRunner = createTeeRunner({ logPath: join(teeDir, "slow.log"), cwd: root, _stdout: slowOut });
       // The child paces itself on its own backpressure and exits naturally —
       // process.exit() would truncate its in-flight stdout, which is a child
@@ -1748,7 +1884,7 @@ async function selfTest() {
       `]);
       const slowCleanup = slowRunner.attach(slowChild);
       const slowDone = slowRunner.waitFor(slowChild);
-      const releaser = setInterval(() => { const callback = releaseWrite; releaseWrite = null; if (callback !== null) callback(); }, 1);
+      const releaser = setInterval(() => { const release = pendingDrains.shift(); if (release !== undefined) release(); }, 1);
       const slowResult = await slowDone;
       clearInterval(releaser);
       if (typeof slowCleanup === "function") await slowCleanup();
@@ -1759,6 +1895,130 @@ async function selfTest() {
       if (slowResult.code !== 0 || slowSeen !== total || slowLogged.length !== total) {
         throw new Error(`backpressure must not lose data (console ${slowSeen}, log ${slowLogged.length}, expected ${total})`);
       }
+    }
+
+    // Console Ctrl watcher: the first Ctrl+C only marks the run interrupted;
+    // after forceGraceMs (or a second Ctrl+C) the child is terminated so the
+    // listening port cannot stay hostage. waitForProcessExit honors the flag.
+    {
+      const fakeChild = { killCalls: 0, kill() { this.killCalls += 1; } };
+      const watcher = createInterruptWatcher({ forceGraceMs: 25 });
+      watcher.noteChild(fakeChild);
+      process.emit("SIGINT");
+      if (!watcher.interrupted()) throw new Error("the first Ctrl+C must mark the watcher interrupted (and not kill yet)");
+      if (fakeChild.killCalls !== 0) throw new Error("the first Ctrl+C must give the child its own chance to exit");
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 60));
+      if (fakeChild.killCalls !== 1) throw new Error("the force-deadline must terminate a child that ignored Ctrl+C");
+      process.emit("SIGINT");
+      if (fakeChild.killCalls !== 2) throw new Error("a second Ctrl+C must terminate immediately");
+      let aborted = false;
+      watcher.onAbort(() => { aborted = true; });
+      process.emit("SIGBREAK");
+      if (!aborted) throw new Error("inspection pauses must be cut short by any further console signal");
+      watcher.unlisten();
+      if (await waitForProcessExit(process.pid, 5000, 10, () => true) !== false) throw new Error("waitForProcessExit must abort on shouldAbort instead of waiting out the timeout");
+      if (!await waitForProcessExit(0x7ffffff1, 500, 20, () => false)) throw new Error("waitForProcessExit without an abort keeps its liveness semantics");
+    }
+
+    // The anti-misrollback pin: a Ctrl+C during the grace window is NOT a
+    // crash. On Windows the killed child reports code 1 / no signal — without
+    // the watcher's flag probation would roll back a healthy install and
+    // restart dsh in a window the user just tried to close.
+    {
+      const mkInterruptProfile = (homeName) => {
+        const ihome = join(root, homeName);
+        const iprofile = join(ihome, "profiles", "web");
+        const goodDir = join(iprofile, "node_modules", "good");
+        mkdirSync(goodDir, { recursive: true });
+        writeFileSync(join(iprofile, "package.json"), JSON.stringify({
+          dependencies: { good: "1.0.0" },
+          dsh: { profile: { bundles: ["good"] } },
+        }));
+        writeFileSync(join(iprofile, "cordis.patch.yml"), "[]\n");
+        writeFileSync(join(goodDir, "package.json"), JSON.stringify({ name: "good", version: "1.0.0", dsh: { bundle: { patch: "./cordis.patch.yml" } } }));
+        writeFileSync(join(goodDir, "cordis.patch.yml"), "- insert:\n    - id: good-row\n      name: good\n");
+        const ipending = createProfileSnapshot(iprofile, { spec: "good" });
+        markPendingSnapshot(ipending, { spec: "good@1.0.0", preflight: { candidate: { name: "good", version: "1.0.0", kind: "bundle" } } });
+        if (!validateInstalledProfile(iprofile).ok) throw new Error("interrupt fixture prerequisite: the profile must pass static validation");
+        return { ihome, iprofile };
+      };
+
+      // interrupted: exit 130, marker stays pending, nothing rolls back
+      const { ihome } = mkInterruptProfile("interrupt-home");
+      const interruptedWatcher = createInterruptWatcher({ forceGraceMs: 60000 });
+      process.emit("SIGINT");
+      const interruptedCode = await cmdLaunch({
+        profile: "web",
+        home: ihome,
+        graceMs: 4000,
+        commandArgv: [process.execPath, "-e", "process.exit(1)"],
+        interrupt: interruptedWatcher,
+      });
+      interruptedWatcher.unlisten();
+      if (interruptedCode !== 130) throw new Error(`an interrupted run must exit 130, got ${interruptedCode}`);
+      if (readPendingSnapshot(join(ihome, "profiles", "web")) === undefined) throw new Error("an interrupted run must leave the pending marker for the next launch");
+      if (!existsSync(join(ihome, "profiles", "web", "node_modules", "good", "package.json"))) throw new Error("an interrupted run must not roll the install back");
+
+      // The same crash WITHOUT an interrupt must not read as 130: offline the
+      // rollback-and-restart may legitimately fail (no pnpm to reconcile
+      // node_modules), which throws — both spellings prove the interrupt
+      // branch was NOT taken. A marker-free run pins the pure exit-code split.
+      const plain = mkInterruptProfile("interrupt-control-home");
+      let plainReturned;
+      let plainCode;
+      try {
+        plainCode = await cmdLaunch({
+          profile: "web",
+          home: plain.ihome,
+          graceMs: 4000,
+          commandArgv: [process.execPath, "-e", "process.exit(1)"],
+        });
+        plainReturned = true;
+      } catch {
+        plainReturned = false; // offline rollback limits, not the pin under test
+      }
+      if (plainReturned && plainCode === 130) throw new Error("a genuine grace-window crash must not report the interrupt convention 130");
+
+      const bareHome = join(root, "interrupt-bare-home");
+      const bareProfile = join(bareHome, "profiles", "web");
+      mkdirSync(bareProfile, { recursive: true });
+      writeFileSync(join(bareProfile, "package.json"), JSON.stringify({ dependencies: {} }));
+      writeFileSync(join(bareProfile, "cordis.patch.yml"), "[]\n");
+      const barePlain = await cmdLaunch({
+        profile: "web",
+        home: bareHome,
+        commandArgv: [process.execPath, "-e", "process.exit(1)"],
+      });
+      if (barePlain !== 1) throw new Error(`a plain crash without an interrupt keeps the child's code, got ${barePlain}`);
+      const bareWatcher = createInterruptWatcher({ forceGraceMs: 60000 });
+      process.emit("SIGINT");
+      const bareInterrupted = await cmdLaunch({
+        profile: "web",
+        home: bareHome,
+        commandArgv: [process.execPath, "-e", "process.exit(1)"],
+        interrupt: bareWatcher,
+      });
+      bareWatcher.unlisten();
+      if (bareInterrupted !== 130) throw new Error(`an interrupted plain run reports 130, got ${bareInterrupted}`);
+
+      // interrupted while waiting for the outgoing pid: refuse, don't outwait
+      const waitingWatcher = createInterruptWatcher({ forceGraceMs: 60000 });
+      process.emit("SIGINT");
+      let cancelled = false;
+      try {
+        await cmdLaunch({
+          profile: "web",
+          home: plain.ihome,
+          commandArgv: [process.execPath, "-e", "process.exit(0)"],
+          awaitExitPid: 999999,
+          interrupt: waitingWatcher,
+          _waitForExit: async (pid, timeoutMs, pollMs, shouldAbort) => (shouldAbort?.() === true ? false : true),
+        });
+      } catch (error) {
+        cancelled = /interrupted while waiting/.test(error.message);
+      }
+      waitingWatcher.unlisten();
+      if (!cancelled) throw new Error("a Ctrl+C during the await-exit wait must cancel the launch with a clear message");
     }
 
     // quoteCmdArg: strict MSVCRT/CommandLineToArgvW quoting; cmd metacharacters
