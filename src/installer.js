@@ -2165,7 +2165,7 @@ function runRemoveInner({ profile, packageName, _profileDir, _spawn, _corepack =
   }
   const deltaQueue = [];
   const push = (text) => {
-    deltaQueue.push(text);
+    deltaQueue.push(stripTerminalControlSequences(text));
   };
   let current = undefined;
   let cancelRequested = false; // see endedByCancel: exit codes cannot tell us this on Windows
@@ -2232,7 +2232,7 @@ function runRemoveInner({ profile, packageName, _profileDir, _spawn, _corepack =
   try {
     proc = (_spawn ?? spawn)(plan.command, ["remove", packageName, "--reporter=append-only"], {
       cwd: profileDir,
-      env: process.env,
+      env: pnpmGuardEnv(process.env),
       shell: plan.shell,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
@@ -3216,7 +3216,7 @@ async function runTransactionFixtures() {
       materializeFakePackage(profileDir, "some-plugin", "1.0.0");
       const { spawnFn } = scriptedSpawn([{
         code: 0,
-        out: "Done\n",
+        out: "\u001b[32mDone\u001b[39m\n",
         beforeExit: () => writeFileSync(join(profileDir, "package.json"), "{ broken json"),
       }]);
       const producer = runInstall({ profile: "p", spec: "some-plugin", preflight: preflightStub("some-plugin"), _profileDir: profileDir, _spawn: spawnFn, _describe: describeStub });
@@ -3441,14 +3441,17 @@ async function runTransactionFixtures() {
           rmSync(join(profileDir, "node_modules", "pkg-f"), { recursive: true, force: true });
         },
       }]);
-      const outcome = await runRemove({ profile: "p", packageName: "pkg-f", _profileDir: profileDir, _spawn: spawnFn }).done;
+      const producer = runRemove({ profile: "p", packageName: "pkg-f", _profileDir: profileDir, _spawn: spawnFn });
+      const outcome = await producer.done;
+      const output = producer.readOutput();
       const snapshotsLeft = listSnapshots();
       check(
         "卸载成功 → marker 与 snapshot 都被提交清理（且快照确实创建过）",
         outcome.status === "completed"
           && snapshotsWhileRunning.length === 1
           && !existsSync(pendingMarkerPath(profileDir))
-          && snapshotsLeft.length === 0,
+          && snapshotsLeft.length === 0
+          && output === "Done\n",
         `status=${outcome.status} 运行中快照=${snapshotsWhileRunning.join(",")} marker=${existsSync(pendingMarkerPath(profileDir))} 残留快照=${snapshotsLeft.join(",")} detail=${JSON.stringify(outcome.detail)}`,
       );
     } finally {
