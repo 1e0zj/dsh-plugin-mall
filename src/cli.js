@@ -26,6 +26,7 @@
 
 import { spawn } from "node:child_process";
 import {
+  createWriteStream,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -38,6 +39,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
+import { Writable } from "node:stream";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -739,6 +741,151 @@ function forwardSignals(child) {
   };
 }
 
+// ── tee runner (visible-console restart) ─────────────────────────────────────
+
+/**
+ * The tee pipes the child's stdout away from the console, so color/TTY
+ * detection inside dsh would dim itself. Nudge it back unless the user opted
+ * out with NO_COLOR.
+ */
+function teeEnv(base) {
+  if (base.NO_COLOR !== undefined) return base;
+  return { ...base, FORCE_COLOR: "1" };
+}
+
+/**
+ * The visible-console spawn: the child keeps THIS guard's console for stdin
+ * (a Ctrl+C in the window reaches it) while stdout/stderr are piped to the
+ * tee runner. Never detached, never hidden — the whole point of this mode is
+ * the window the user can watch and interrupt.
+ */
+function spawnTeeCommand(command, args, { cwd }) {
+  const resolved = process.platform === "win32" ? resolveWindowsCommand(command) : command;
+  const env = teeEnv(process.env);
+  const stdio = ["inherit", "pipe", "pipe"];
+  if (process.platform === "win32" && /\.(?:cmd|bat)$/i.test(resolved)) {
+    const comspec = process.env.ComSpec ?? "cmd.exe";
+    const line = [resolved, ...args].map(quoteCmdArg).join(" ");
+    return spawn(comspec, ["/d", "/s", "/c", `"${line}"`], { shell: false, stdio, cwd, env, windowsVerbatimArguments: true, windowsHide: false });
+  }
+  return spawn(resolved, args, { shell: false, stdio, cwd, env, windowsHide: false });
+}
+
+function defaultOpenTeeLog(logPath) {
+  mkdirSync(dirname(logPath), { recursive: true });
+  return createWriteStream(logPath, { flags: "a" });
+}
+
+/**
+ * Tee runner for the visible-console restart: everything the wrapped command
+ * prints is mirrored to BOTH this guard's console (the window `cmd /c start`
+ * allocated) and the restart log. A log that cannot be opened, or that fails
+ * mid-run, only costs the log — the window keeps showing output and the
+ * child's exit code is untouched.
+ *
+ * Backpressure: while EITHER target is saturated BOTH source pipes stay
+ * paused (pausing just one would leave the other free to keep filling the
+ * saturated target); each target resumes the pair once it drains.
+ */
+function createTeeRunner({ logPath, cwd, _stdout = process.stdout, _openLog = defaultOpenTeeLog }) {
+  let logStream;
+  let broken = false;
+  try {
+    logStream = _openLog(logPath);
+  } catch (error) {
+    broken = true;
+    _stdout.write(`[guard] warning: cannot open restart log ${logPath} (${error.message}) — continuing without it\n`);
+  }
+  let consoleSaturated = false;
+  let logSaturated = false;
+  let paused = false;
+  const activeStreams = new Set();
+  const onConsoleDrain = () => { consoleSaturated = false; maybeResume(); };
+  const onLogDrain = () => { logSaturated = false; maybeResume(); };
+  _stdout.on("drain", onConsoleDrain);
+  if (logStream !== undefined) {
+    logStream.on("drain", onLogDrain);
+    logStream.on("error", (error) => {
+      if (broken) return;
+      broken = true;
+      _stdout.write(`[guard] warning: restart log ${logPath} failed (${error.message}) — continuing without it\n`);
+    });
+  }
+  function maybeResume() {
+    if (!paused || consoleSaturated || logSaturated) return;
+    paused = false;
+    for (const stream of activeStreams) stream.resume();
+  }
+  function onData(chunk) {
+    const consoleOk = _stdout.write(chunk);
+    const logOk = broken || logStream === undefined ? true : logStream.write(chunk);
+    if (consoleOk && logOk) return;
+    if (!consoleOk) consoleSaturated = true;
+    if (!logOk) logSaturated = true;
+    if (!paused) {
+      paused = true;
+      for (const stream of activeStreams) stream.pause();
+    }
+  }
+  let closed = false;
+  return {
+    get broken() { return broken; },
+    spawn(command, args) { return spawnTeeCommand(command, args, { cwd }); },
+    attach(child) {
+      const streams = [child.stdout, child.stderr].filter((stream) => stream !== null && stream !== undefined);
+      for (const stream of streams) {
+        activeStreams.add(stream);
+        stream.on("data", onData);
+      }
+      return () => {
+        for (const stream of streams) {
+          stream.removeListener("data", onData);
+          activeStreams.delete(stream);
+        }
+        maybeResume();
+      };
+    },
+    // tee waits for `close`, not `exit`: the pipes still carry in-flight
+    // output after exit, and ending the log before they drain would lose it.
+    waitFor(child) {
+      return new Promise((resolvePromise) => {
+        child.once("error", (error) => resolvePromise({ error }));
+        child.once("close", (code, signal) => resolvePromise({ code, signal }));
+      });
+    },
+    // Guard's own [guard] lines share the same two targets. The classic IO
+    // path routes by level (stdout/stderr); in a console window both land on
+    // the same screen, so the tee keeps a single stream.
+    say(text) {
+      const line = `${text}\n`;
+      _stdout.write(line);
+      if (!broken && logStream !== undefined) logStream.write(line);
+    },
+    async close() {
+      if (closed) return;
+      closed = true;
+      _stdout.removeListener("drain", onConsoleDrain);
+      if (logStream === undefined) return;
+      logStream.removeListener("drain", onLogDrain);
+      await new Promise((resolvePromise) => {
+        try {
+          logStream.end(() => resolvePromise());
+        } catch {
+          resolvePromise();
+        }
+      });
+    },
+  };
+}
+
+/** The launch IO every run shares: spawn, attach signals, wait for exit. */
+const classicIO = {
+  spawn: spawnCommand,
+  attach: (child) => forwardSignals(child),
+  waitFor: waitForExit,
+  say: (text, level) => { console[level === "error" ? "error" : "log"](text); },
+};
+
 function waitForExit(child) {
   return new Promise((resolvePromise) => {
     child.on("error", (error) => resolvePromise({ error }));
@@ -754,13 +901,24 @@ function exitCodeOf(result) {
   return 1;
 }
 
-/** Run the command once with no probation; resolve with its exit result. */
-async function runPlain(command, args) {
-  const child = spawnCommand(command, args);
-  const unforward = forwardSignals(child);
-  const result = await waitForExit(child);
-  unforward();
+/**
+ * Run the wrapped command once and resolve with its exit result. Every launch
+ * mode routes through here — the plain terminal, the detached background
+ * restart, and the tee'd visible console — so probation's rollback-and-restart
+ * keeps whatever IO the launch started with (the retried dsh must be teed
+ * exactly like the first one).
+ */
+async function runCommand(command, args, io = classicIO) {
+  const child = io.spawn(command, args);
+  const cleanup = io.attach(child);
+  const result = await io.waitFor(child);
+  if (typeof cleanup === "function") await cleanup();
   return result;
+}
+
+/** Run the command once with no probation; resolve with its exit result. */
+async function runPlain(command, args, io = classicIO) {
+  return runCommand(command, args, io);
 }
 
 /**
@@ -773,7 +931,7 @@ async function runPlain(command, args) {
  * Roll it back to the pre-install snapshot instead (a rollback failure keeps
  * the marker for the next attempt, same as recoverProfile).
  */
-function commitLaunchSnapshot(profileDir) {
+function commitLaunchSnapshot(profileDir, say = (text, level) => { console[level === "error" ? "error" : "log"](text); }) {
   try {
     let pending;
     try {
@@ -783,13 +941,13 @@ function commitLaunchSnapshot(profileDir) {
     }
     if (pending !== undefined && pendingApprovalPaused(pending) !== undefined) {
       rollbackPendingSnapshot(profileDir);
-      console.log(`[guard] startup probation passed, but the install was abandoned at the approval gate — profile rolled back for ${profileDir}`);
+      say(`[guard] startup probation passed, but the install was abandoned at the approval gate — profile rolled back for ${profileDir}`);
       return;
     }
     commitPendingSnapshot(profileDir);
-    console.log(`[guard] startup probation passed — pending snapshot committed for ${profileDir}`);
+    say(`[guard] startup probation passed — pending snapshot committed for ${profileDir}`);
   } catch (error) {
-    console.error(`[guard] warning: could not commit the pending snapshot for ${profileDir}: ${error.message} — the marker stays pending`);
+    say(`[guard] warning: could not commit the pending snapshot for ${profileDir}: ${error.message} — the marker stays pending`, "error");
   }
 }
 
@@ -799,10 +957,10 @@ function commitLaunchSnapshot(profileDir) {
  * means it stayed alive through it (the snapshot is committed at that point)
  * and the wrapper kept waiting for it.
  */
-async function runProbation({ profileDir, command, args, graceMs }) {
-  const child = spawnCommand(command, args);
-  const unforward = forwardSignals(child);
-  const exited = waitForExit(child);
+async function runProbation({ profileDir, command, args, graceMs, io = classicIO }) {
+  const child = io.spawn(command, args);
+  const cleanup = io.attach(child);
+  const exited = io.waitFor(child);
   let timer;
   const grace = new Promise((resolvePromise) => { timer = setTimeout(() => resolvePromise("grace"), graceMs); });
   const first = await Promise.race([
@@ -811,12 +969,12 @@ async function runProbation({ profileDir, command, args, graceMs }) {
   ]);
   clearTimeout(timer);
   if (first.phase === "before-grace") {
-    unforward();
+    if (typeof cleanup === "function") await cleanup();
     return first;
   }
-  commitLaunchSnapshot(profileDir);
+  commitLaunchSnapshot(profileDir, io.say);
   const result = await exited;
-  unforward();
+  if (typeof cleanup === "function") await cleanup();
   return { phase: "after-grace", ...result };
 }
 
@@ -959,12 +1117,19 @@ async function cmdLaunch({
   commandArgv,
   awaitExitPid,
   plan,
+  tee,
   _waitForExit = waitForProcessExit,
   _onAwaitExit = plan === undefined ? announceRestartHelperReady : (pid) => announceRestartHandoffViaFile(plan, pid),
 }) {
   const profileDir = profileDirOf(home, profile);
   const grace = graceMs ?? DEFAULT_GRACE_MS;
   const [command, ...args] = commandArgv;
+  // The visible-console launch passes its tee runner: spawns pipe through it,
+  // [guard] lines are mirrored to the window and the log, and probation's
+  // retry-once reuses the same tee. The classic launch keeps classicIO — its
+  // console.log/console.error split (stdout vs stderr) is unchanged behavior.
+  const io = tee ?? classicIO;
+  const say = io.say;
 
   // A restart hands us the pid of the host that is on its way out. Starting
   // the successor while it still holds the listening port is not a race worth
@@ -1013,20 +1178,20 @@ async function cmdLaunch({
       } catch (error) {
         throw new Error(`profile "${profile}" failed static validation and rollback failed — refusing to launch: ${error.message}`);
       }
-      console.error(`[guard] profile "${profile}" failed static validation — rolled back before launch:`);
-      for (const entry of [...validation.issues, ...removeValidation.issues]) console.error(renderIssue(entry));
+      say(`[guard] profile "${profile}" failed static validation — rolled back before launch:`, "error");
+      for (const entry of [...validation.issues, ...removeValidation.issues]) say(renderIssue(entry), "error");
     } else {
       pending = true;
     }
   }
 
   if (!pending) {
-    const result = await runPlain(command, args);
-    if (result.error !== undefined) console.error(`[guard] failed to start ${command}: ${result.error.message}`);
+    const result = await runPlain(command, args, io);
+    if (result.error !== undefined) say(`[guard] failed to start ${command}: ${result.error.message}`, "error");
     return exitCodeOf(result);
   }
 
-  const outcome = await runProbation({ profileDir, command, args, graceMs: grace });
+  const outcome = await runProbation({ profileDir, command, args, graceMs: grace, io });
   if (outcome.phase === "after-grace") return exitCodeOf(outcome);
   if (outcome.signal === "SIGINT" || outcome.signal === "SIGTERM") {
     // Interrupted from outside (Ctrl+C / service stop): not an install failure —
@@ -1035,7 +1200,7 @@ async function cmdLaunch({
   }
   if (outcome.error === undefined && outcome.code === 0) {
     // One-shot command that finished successfully inside the grace window.
-    commitLaunchSnapshot(profileDir);
+    commitLaunchSnapshot(profileDir, say);
     return 0;
   }
 
@@ -1050,9 +1215,9 @@ async function cmdLaunch({
   } catch (error) {
     throw new Error(`the command ${why} within the grace period, but rollback failed — refusing to restart: ${error.message}`);
   }
-  console.error(`[guard] the command ${why} within the ${grace}ms grace period — profile "${profile}" rolled back, restarting once with the restored state`);
-  const retry = await runPlain(command, args);
-  if (retry.error !== undefined) console.error(`[guard] failed to restart ${command}: ${retry.error.message}`);
+  say(`[guard] the command ${why} within the ${grace}ms grace period — profile "${profile}" rolled back, restarting once with the restored state`, "error");
+  const retry = await runPlain(command, args, io);
+  if (retry.error !== undefined) say(`[guard] failed to restart ${command}: ${retry.error.message}`, "error");
   return exitCodeOf(retry);
 }
 
@@ -1153,6 +1318,10 @@ async function main(argv) {
     return;
   }
   const home = parsed.home !== undefined ? resolve(parsed.home) : resolveDshHome();
+  // The visible-restart tee outlives cmdLaunch: main's catch can still write
+  // the failure into the restart log (the window would otherwise flash away)
+  // before the log is closed and flushed.
+  let launchTee;
   try {
     switch (parsed.command) {
       case "validate": {
@@ -1198,7 +1367,10 @@ async function main(argv) {
           if (!Number.isFinite(graceMs) || graceMs < 0) throw usageError(`--grace-ms must be a non-negative number, got ${JSON.stringify(parsed.graceMs)}`);
         }
         const invocation = resolveLaunchInvocation(parsed);
-        process.exitCode = await cmdLaunch({ ...invocation, home, graceMs });
+        if (invocation.plan !== undefined) {
+          launchTee = createTeeRunner({ logPath: invocation.plan.logPath, cwd: invocation.plan.cwd });
+        }
+        process.exitCode = await cmdLaunch({ ...invocation, home, graceMs, tee: launchTee });
         return;
       }
       case "self-test": {
@@ -1209,8 +1381,11 @@ async function main(argv) {
         throw usageError(`unknown command ${JSON.stringify(parsed.command)} (see --help)`);
     }
   } catch (error) {
+    if (launchTee !== undefined) launchTee.say(`error: ${error.message}`, "error");
     console.error(`error: ${error.message}`);
     process.exitCode = error instanceof UsageError ? 2 : 1;
+  } finally {
+    if (launchTee !== undefined) await launchTee.close();
   }
 }
 
@@ -1488,6 +1663,101 @@ async function selfTest() {
         }
       } finally {
         Object.defineProperty(process.stdout, "isTTY", { value: realIsTty, configurable: true });
+      }
+    }
+
+    // Tee runner (visible restart): the wrapped command's output must reach
+    // BOTH the console target and the log byte-for-byte, the exit code must
+    // pass through, everything must be flushed before close() settles, a
+    // broken log must not change the outcome, and backpressure must not lose
+    // data. Classic IO keeps its exact behavior (existing fixtures above).
+    {
+      const teeDir = join(root, "tee");
+      mkdirSync(teeDir, { recursive: true });
+
+      const generate = "const lines = []; for (let i = 0; i < 20000; i++) lines.push('line-' + i + '-' + 'x'.repeat(20)); process.stdout.write(lines.join('\\n') + '\\n'); process.exit(7);";
+      const expected = `${Array.from({ length: 20000 }, (_, index) => `line-${index}-${"x".repeat(20)}`).join("\n")}\n`;
+      const fastChunks = [];
+      const fastOut = new Writable({
+        write(chunk, encoding, callback) { fastChunks.push(Buffer.from(chunk)); callback(); },
+      });
+      const runner = createTeeRunner({ logPath: join(teeDir, "restart-tee.log"), cwd: root, _stdout: fastOut });
+      const child = runner.spawn(process.execPath, ["-e", generate]);
+      const cleanup = runner.attach(child);
+      const result = await runner.waitFor(child);
+      if (typeof cleanup === "function") await cleanup();
+      await runner.close();
+      if (result.code !== 7) throw new Error("tee must preserve the child's exit code");
+      const logged = readFileSync(join(teeDir, "restart-tee.log"), "utf8");
+      const seen = Buffer.concat(fastChunks).toString("utf8");
+      if (logged !== expected || seen !== expected) throw new Error(`tee must be byte-identical on both targets (log ${logged.length}, console ${seen.length}, expected ${expected.length})`);
+      if (runner.broken) throw new Error("a healthy tee log must not be marked broken");
+
+      const errRunner = createTeeRunner({
+        logPath: join(teeDir, "restart-err.log"),
+        cwd: root,
+        _stdout: new Writable({ write(chunk, encoding, callback) { callback(); } }),
+      });
+      const errChild = errRunner.spawn(process.execPath, ["-e", "process.stderr.write('ERR-OUT\\n'); process.stdout.write('OUT\\n'); process.exit(0)"]);
+      const errCleanup = errRunner.attach(errChild);
+      await errRunner.waitFor(errChild);
+      if (typeof errCleanup === "function") await errCleanup();
+      await errRunner.close();
+      const errLogged = readFileSync(join(teeDir, "restart-err.log"), "utf8");
+      if (!errLogged.includes("ERR-OUT") || !errLogged.includes("OUT")) throw new Error("tee must mirror stderr as well as stdout");
+
+      const consoleChunks = [];
+      const captureOut = new Writable({
+        write(chunk, encoding, callback) { consoleChunks.push(Buffer.from(chunk)); callback(); },
+      });
+      const brokenRunner = createTeeRunner({
+        logPath: join(teeDir, "never.log"),
+        cwd: root,
+        _stdout: captureOut,
+        _openLog: () => { throw new Error("disk on fire"); },
+      });
+      const brokenChild = brokenRunner.spawn(process.execPath, ["-e", "process.stdout.write('STILL-HERE\\n'); process.exit(5)"]);
+      const brokenCleanup = brokenRunner.attach(brokenChild);
+      const brokenResult = await brokenRunner.waitFor(brokenChild);
+      if (typeof brokenCleanup === "function") await brokenCleanup();
+      await brokenRunner.close();
+      const consoleText = Buffer.concat(consoleChunks).toString("utf8");
+      if (brokenResult.code !== 5 || !brokenRunner.broken) throw new Error("a failed log must be console-only and must not affect the child");
+      if (!consoleText.includes("STILL-HERE") || !consoleText.includes("disk on fire")) throw new Error("a failed log must warn on the console and keep showing output");
+
+      let releaseWrite = null;
+      const slowChunks = [];
+      const slowOut = new Writable({
+        highWaterMark: 16,
+        write(chunk, encoding, callback) { slowChunks.push(Buffer.from(chunk)); releaseWrite = callback; },
+      });
+      const slowRunner = createTeeRunner({ logPath: join(teeDir, "slow.log"), cwd: root, _stdout: slowOut });
+      // The child paces itself on its own backpressure and exits naturally —
+      // process.exit() would truncate its in-flight stdout, which is a child
+      // bug the tee must not be blamed for.
+      const slowChild = slowRunner.spawn(process.execPath, ["-e", `
+        const chunk = 'y'.repeat(4096) + '\\n';
+        let index = 0;
+        function pump() {
+          while (index < 100) {
+            index += 1;
+            if (!process.stdout.write(chunk)) { process.stdout.once('drain', pump); return; }
+          }
+        }
+        pump();
+      `]);
+      const slowCleanup = slowRunner.attach(slowChild);
+      const slowDone = slowRunner.waitFor(slowChild);
+      const releaser = setInterval(() => { const callback = releaseWrite; releaseWrite = null; if (callback !== null) callback(); }, 1);
+      const slowResult = await slowDone;
+      clearInterval(releaser);
+      if (typeof slowCleanup === "function") await slowCleanup();
+      await slowRunner.close();
+      const total = 100 * (4096 + 1);
+      const slowSeen = slowChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+      const slowLogged = readFileSync(join(teeDir, "slow.log"), "utf8");
+      if (slowResult.code !== 0 || slowSeen !== total || slowLogged.length !== total) {
+        throw new Error(`backpressure must not lose data (console ${slowSeen}, log ${slowLogged.length}, expected ${total})`);
       }
     }
 
