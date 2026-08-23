@@ -862,12 +862,25 @@ function createTeeRunner({ logPath, cwd, _stdout = process.stdout, _openLog = de
         maybeResume();
       };
     },
-    // tee waits for `close`, not `exit`: the pipes still carry in-flight
-    // output after exit, and ending the log before they drain would lose it.
+    // ChildProcess `close` only says the OS handles have closed. A paused
+    // Readable can still have bytes buffered in userland at that point: on
+    // Linux CI the log stream applied backpressure, `close` won the race, and
+    // cleanup removed the data listeners with ~480 KiB still unread. Wait for
+    // BOTH source pipes to emit `end` before cleanup is allowed to detach them.
     waitFor(child) {
-      return new Promise((resolvePromise) => {
+      const streams = [child.stdout, child.stderr].filter((stream) => stream !== null && stream !== undefined);
+      const ended = streams.map((stream) => stream.readableEnded
+        ? Promise.resolve()
+        : new Promise((resolveEnd) => stream.once("end", resolveEnd)));
+      const closed = new Promise((resolvePromise) => {
         child.once("error", (error) => resolvePromise({ error }));
         child.once("close", (code, signal) => resolvePromise({ code, signal }));
+      });
+      return closed.then(async (result) => {
+        // A spawn error may never produce normal readable `end` events. There
+        // is no child output to preserve in that branch, so return it directly.
+        if (result.error === undefined) await Promise.all(ended);
+        return result;
       });
     },
     // Guard's own [guard] lines share the same two targets. The classic IO
