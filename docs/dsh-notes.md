@@ -895,3 +895,25 @@ README 文案均已对齐这一真实行为（不再承诺 Ctrl+C）。SIGINT �
 detached 纯日志（无可见窗口/tee），legacy 路径是 PowerShell `taskkill /F /T`
 硬杀——本 feature 无先例可抄；它的 watchdog 用端口探测（`net.connect`）避免
 pid 过期双启动，思路与本插件的 await-exit + 端口 settle 相映。
+
+### 重启回滚误归因：既有 blocker 与 `--no-open` 兼容性（2026-08-23）
+
+用户真实日志钉死了「商城更新显示成功、重启后回到旧版本」的一条具体链路：pending
+安装在启动前跑整份 profile 静态校验，两个早已存在的第三方插件声明了
+`@deepseek-ai/*` 宿主依赖，于是 guard 把历史 blocker 误归因给商城更新并恢复快照；
+随后重启代码额外注入 `--no-open`，用户所用宿主不认识该参数，恢复后的旧版本也没
+拉起来。
+
+官方中文文档全文检索（当前 107 篇）中，浏览器打开命中
+`capability-seams.zh.md`、`postmortem/0003-web-agent-gui-feedback-loop.zh.md`、
+`subsystems/client-modules.zh.md`，宿主依赖命中 `cookbook/adding-a-package.zh.md`、
+`cookbook/adding-a-vendored-package.zh.md`、`module-graph.zh.md`；已读完全部命中文档。
+结论：官方没有把 `--no-open` 写成稳定 launcher 契约；本机 DSH `0.1.1-rc.2` 的
+`dsh web --help` 虽支持它，用户日志证明旧宿主不支持，插件不得凭当前版本替别的
+宿主发明 argv。重启只逐字复用原始 DSH 参数，用户自己传的参数照常保留。
+
+`module-graph.zh.md` 明确以 `peerDependencies` 作为规范运行时依赖信号；
+`adding-a-package.zh.md` 要求每个 DSH peer 同时镜像进开发依赖。因此宿主模块复制仍是
+真实 blocker，不能删除检查。正确的事务语义是：快照时记录 blocker 基线，提交/回滚
+只看本次新增 blocker；未带基线的旧 pending marker 继续 fail-closed。这样不会替历史
+问题洗白，也不会用无关历史问题回滚一次健康更新。

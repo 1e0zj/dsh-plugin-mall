@@ -61,6 +61,7 @@ import {
   resolveDshHome,
   rollbackPendingSnapshot,
   validateInstalledProfile,
+  validatePendingProfile,
   validateRemoveCompletion,
 } from "./guard.js";
 // github.js imports node builtins only — the host-independence of this CLI is
@@ -502,7 +503,7 @@ async function cmdAdd({ spec, profile, home, acceptWarnings }) {
   //    rolled back immediately; otherwise the marker stays pending and the next
   //    dsh startup (or `guard recover`) commits it once the plugin actually
   //    loads.
-  const validation = validateInstalledProfile(profileDir);
+  const validation = validatePendingProfile(profileDir);
   if (result.exitCode === 0 && validation.ok) {
     console.log(`[guard] installed ${spec} into profile "${profile}".`);
     console.log("Restart dsh to load it. On the next startup — or via `node src/cli.js guard recover` — the pending snapshot is committed once the profile proves loadable; if dsh fails to boot, the same command rolls it back.");
@@ -596,7 +597,7 @@ async function cmdRemove({
 
   let validation;
   try {
-    validation = validateInstalledProfile(profileDir);
+    validation = validatePendingProfile(profileDir);
   } catch (error) {
     rollbackAndThrow(`remove completed but static profile validation threw: ${error.message}`);
   }
@@ -1327,7 +1328,7 @@ async function cmdLaunch({
     }
     let validation;
     try {
-      validation = validateInstalledProfile(profileDir);
+      validation = validatePendingProfile(profileDir, marker);
     } catch (error) {
       throw new Error(`static validation of profile "${profile}" failed — refusing to launch: ${error.message}`);
     }

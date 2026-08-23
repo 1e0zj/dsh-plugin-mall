@@ -24,6 +24,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createRequire } from "node:module";
+import { createHash } from "node:crypto";
 import { JSON_SCHEMA, Type, load } from "js-yaml";
 import { satisfies, validRange } from "semver";
 
@@ -1450,6 +1451,84 @@ export function validateInstalledProfile(profileDir) {
   };
 }
 
+/** Stable identity for one installed-profile blocker across a transaction. */
+function staticBlockerFingerprint(entry) {
+  const canonical = (value) => {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (value !== null && typeof value === "object") {
+      return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])]));
+    }
+    return value;
+  };
+  return createHash("sha256").update(JSON.stringify(canonical(entry))).digest("hex");
+}
+
+function staticBlockerFingerprints(validation) {
+  return validation.issues
+    .filter((entry) => entry.severity === "block")
+    .map(staticBlockerFingerprint);
+}
+
+/**
+ * Validate the live profile relative to the state captured before a pending
+ * transaction. An unchanged blocker that was already present did not come
+ * from this install/remove and must not make the transaction roll back. New
+ * markers carry the baseline; old markers do not, and deliberately retain the
+ * old fail-closed behaviour.
+ */
+export function validatePendingProfile(profileDir, pending = readValidatedPendingSnapshot(profileDir)) {
+  const validation = validateInstalledProfile(profileDir);
+  if (!Array.isArray(pending?.baselineBlockers)) {
+    return { ...validation, allIssues: validation.issues, preexistingIssues: [] };
+  }
+
+  const candidateName = pending.preflight?.candidate?.name ?? pending.candidate?.name;
+  const remaining = new Map();
+  for (const fingerprint of pending.baselineBlockers) {
+    remaining.set(fingerprint, (remaining.get(fingerprint) ?? 0) + 1);
+  }
+  const issues = [];
+  const preexistingIssues = [];
+  for (const entry of validation.issues) {
+    if (entry.severity !== "block") {
+      issues.push(entry);
+      continue;
+    }
+    // Updating the package that owns (or participates in) an old blocker must
+    // prove that blocker was actually fixed. Only unrelated historical issues
+    // receive baseline treatment.
+    const candidateRelated = entry.package === candidateName
+      || (Array.isArray(entry.conflictsWith) && entry.conflictsWith.includes(candidateName));
+    if (candidateRelated) {
+      issues.push(entry);
+      continue;
+    }
+    const fingerprint = staticBlockerFingerprint(entry);
+    const count = remaining.get(fingerprint) ?? 0;
+    if (count > 0) {
+      preexistingIssues.push(entry);
+      remaining.set(fingerprint, count - 1);
+    } else {
+      issues.push(entry);
+    }
+  }
+  const blockers = issues.filter((entry) => entry.severity === "block");
+  const warnings = issues.filter((entry) => entry.severity === "warn");
+  const verdict = blockers.length > 0 ? "blocked" : warnings.length > 0 ? "warning" : "safe";
+  return {
+    ok: blockers.length === 0,
+    verdict,
+    issues,
+    allIssues: validation.issues,
+    preexistingIssues,
+    summary: blockers.length > 0
+      ? `发现 ${blockers.length} 个本次新增阻断问题、${preexistingIssues.length} 个既有阻断问题、${warnings.length} 个警告`
+      : preexistingIssues.length > 0
+        ? `本次变更未新增阻断问题（保留 ${preexistingIssues.length} 个既有阻断问题）`
+        : validation.summary,
+  };
+}
+
 /**
  * Remove leftover `node_modules` entries for packages that are no longer part
  * of the profile's declared dependencies. pnpm hoists each direct dependency
@@ -1998,6 +2077,9 @@ function assertStoredTransactionMatches(pending) {
   if (pending.operation === "remove" && stored.metadata.packageName !== pending.metadata.packageName) {
     throw new Error("pending remove packageName does not match snapshot.json — refusing to act on it (left untouched for manual inspection)");
   }
+  if (JSON.stringify(stored.baselineBlockers) !== JSON.stringify(pending.baselineBlockers)) {
+    throw new Error("pending marker baseline blockers do not match snapshot.json — refusing to act on it (left untouched for manual inspection)");
+  }
 }
 
 /**
@@ -2036,6 +2118,12 @@ function sanitizeSnapshot(marker, home) {
   }
   if (!Array.isArray(marker.dependencies) || marker.dependencies.some((name) => typeof name !== "string" || !NPM_PACKAGE_NAME_RE.test(name))) {
     throw new Error("pending marker has missing or corrupt dependency metadata — refusing to act on it (left untouched for manual inspection)");
+  }
+  if (marker.baselineBlockers !== undefined && (
+    !Array.isArray(marker.baselineBlockers)
+    || marker.baselineBlockers.some((fingerprint) => typeof fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(fingerprint))
+  )) {
+    throw new Error("pending marker has corrupt baseline blocker metadata — refusing to act on it (left untouched for manual inspection)");
   }
   validatePendingTransaction(marker);
   const profileDir = resolve(String(marker.profileDir ?? ""));
@@ -2090,7 +2178,12 @@ export function createProfileSnapshot(profileDir, metadata = {}) {
   } catch {
     /* manifest unreadable — the rest of the snapshot still captures the bytes */
   }
-  const snapshot = { version: SNAPSHOT_VERSION, id, dir, profileDir, createdAt: Date.now(), files, dependencies, operation: normalizedMetadata.operation, metadata: normalizedMetadata };
+  // Static validation after an install must judge what THIS transaction
+  // changed. Without this baseline, an unrelated legacy plugin that already
+  // shadowed host modules made every later update look guilty and forced the
+  // marketplace itself back to its old version on restart.
+  const baselineBlockers = staticBlockerFingerprints(validateInstalledProfile(profileDir));
+  const snapshot = { version: SNAPSHOT_VERSION, id, dir, profileDir, createdAt: Date.now(), files, dependencies, baselineBlockers, operation: normalizedMetadata.operation, metadata: normalizedMetadata };
   writeFileSync(join(dir, "snapshot.json"), JSON.stringify(snapshot, undefined, 2) + "\n");
   return snapshot;
 }
@@ -2127,7 +2220,7 @@ export function markPendingSnapshot(snapshot, record = {}) {
   if (existsSync(markerPath)) {
     throw new Error(`profile already has a pending install marker at ${markerPath} — run \`dsh-plugin-guard guard recover\` (or let dsh startup recovery consume it) before installing again`);
   }
-  const pending = { ...snapshot, ...record, pendingAt: Date.now() };
+  const pending = { ...snapshot, ...record, baselineBlockers: snapshot.baselineBlockers, pendingAt: Date.now() };
   // Reject producer bugs before persisting them. The read/recovery boundary
   // repeats this validation because the marker is attacker-controllable.
   validatePendingTransaction(pending);
@@ -2855,7 +2948,7 @@ export function recoverProfile(profileDir) {
       rebuild: rolled?.rebuild,
     };
   }
-  const validation = validateInstalledProfile(profileDir);
+  const validation = validatePendingProfile(profileDir, pending);
   const candidateName = pending.preflight?.candidate?.name ?? pending.candidate?.name;
   const removeValidation = isRemove
     ? validateRemoveCompletion(pending.profileDir, candidateName)
@@ -3956,6 +4049,58 @@ async function selfTest() {
       if (rec.action !== "committed") throw new Error(`recoverProfile should commit a healthy install, got ${rec.action}`);
       if (readPendingSnapshot(p) !== undefined) throw new Error("recoverProfile commit should clear the marker");
       if (existsSync(snap.dir)) throw new Error("recoverProfile commit should delete the snapshot dir");
+    }
+
+    // A blocker that predates the transaction is still a real profile problem,
+    // but it is not evidence that this update broke the profile. This is the
+    // reported marketplace self-update failure: an unrelated legacy plugin
+    // shadows host modules, so the new mall version used to be rolled back.
+    {
+      const p = join(root, "profiles", "preexisting-blocker");
+      mkdirSync(join(p, "node_modules", "legacy"), { recursive: true });
+      mkdirSync(join(p, "node_modules", "good"), { recursive: true });
+      writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: { legacy: "1.0.0", good: "1.0.0" } }));
+      writeFileSync(join(p, "cordis.patch.yml"), "[]\n");
+      writeFileSync(join(p, "node_modules", "legacy", "package.json"), JSON.stringify({
+        name: "legacy", version: "1.0.0", dependencies: { "@deepseek-ai/dsh-llm": "*" },
+      }));
+      writeFileSync(join(p, "node_modules", "good", "package.json"), JSON.stringify({ name: "good", version: "1.0.0" }));
+      if (validateInstalledProfile(p).issues.filter((entry) => entry.code === "host-module-shadow").length !== 1) {
+        throw new Error("pre-existing blocker fixture prerequisite failed");
+      }
+      const snap = createProfileSnapshot(p, { fixture: true });
+      markPendingSnapshot(snap, { spec: "good@2.0.0", preflight: { candidate: { name: "good", version: "2.0.0", kind: "plain" } } });
+      writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: { legacy: "1.0.0", good: "2.0.0" } }));
+      writeFileSync(join(p, "node_modules", "good", "package.json"), JSON.stringify({ name: "good", version: "2.0.0" }));
+      const relative = validatePendingProfile(p);
+      if (!relative.ok || relative.preexistingIssues.length !== 1 || relative.issues.some((entry) => entry.severity === "block")) {
+        throw new Error(`unchanged pre-existing blocker must not condemn this update: ${JSON.stringify(relative)}`);
+      }
+      const rec = recoverProfile(p);
+      if (rec.action !== "committed") throw new Error(`unchanged pre-existing blocker should commit this update, got ${rec.action}`);
+      if (readJson(join(p, "node_modules", "good", "package.json")).version !== "2.0.0") {
+        throw new Error("committing past a pre-existing blocker must keep the updated candidate");
+      }
+      console.log("PASS pending 基线：既有宿主模块 blocker 不再回滚无关更新");
+
+      const candidateProfile = join(root, "profiles", "candidate-own-blocker");
+      mkdirSync(join(candidateProfile, "node_modules", "legacy"), { recursive: true });
+      writeFileSync(join(candidateProfile, "package.json"), JSON.stringify({ dependencies: { legacy: "1.0.0" } }));
+      writeFileSync(join(candidateProfile, "cordis.patch.yml"), "[]\n");
+      writeFileSync(join(candidateProfile, "node_modules", "legacy", "package.json"), JSON.stringify({
+        name: "legacy", version: "1.0.0", dependencies: { "@deepseek-ai/dsh-llm": "*" },
+      }));
+      const ownSnap = createProfileSnapshot(candidateProfile, { fixture: true });
+      markPendingSnapshot(ownSnap, { spec: "legacy@2.0.0", preflight: { candidate: { name: "legacy", version: "2.0.0", kind: "plain" } } });
+      writeFileSync(join(candidateProfile, "node_modules", "legacy", "package.json"), JSON.stringify({
+        name: "legacy", version: "2.0.0", dependencies: { "@deepseek-ai/dsh-llm": "*" },
+      }));
+      const own = validatePendingProfile(candidateProfile);
+      if (own.ok || !own.issues.some((entry) => entry.code === "host-module-shadow")) {
+        throw new Error("an updated candidate must not inherit an exemption for its own old blocker");
+      }
+      commitPendingSnapshot(candidateProfile);
+      console.log("PASS pending 基线：候选自身的既有 blocker 必须在更新中修复");
     }
 
     // Approval-pause mark, part 1: a paused marker must NEVER commit on

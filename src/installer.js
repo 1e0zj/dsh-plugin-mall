@@ -16,7 +16,7 @@ import { createHash } from "node:crypto";
 import { dump, load } from "js-yaml";
 import { DEFAULT_PROFILE_BUNDLES, PROFILE_TEMPLATES, initProfile, resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
 import { describeBuildScripts, npmNameOf } from "./github.js";
-import { clearPendingApprovalPause, commitPendingSnapshot, createProfileSnapshot, describeRollbackRebuild, markPendingApprovalPause, markPendingSnapshot, mcpEntryAuditForInstall, pausedCandidateBeforeState, pendingApprovalPaused, pnpmGuardEnv, pnpmSpawnPlan, readValidatedPendingSnapshot, rollbackPendingSnapshot, validateInstalledProfile, validateRemoveCompletion } from "./guard.js";
+import { clearPendingApprovalPause, commitPendingSnapshot, createProfileSnapshot, describeRollbackRebuild, markPendingApprovalPause, markPendingSnapshot, mcpEntryAuditForInstall, pausedCandidateBeforeState, pendingApprovalPaused, pnpmGuardEnv, pnpmSpawnPlan, readValidatedPendingSnapshot, rollbackPendingSnapshot, validatePendingProfile, validateRemoveCompletion } from "./guard.js";
 
 // ── spec normalization ──────────────────────────────────────────────────────
 
@@ -2284,7 +2284,7 @@ function runRemoveInner({ profile, packageName, _profileDir, _spawn, _corepack =
       // 退出码 0 不等于卸干净了。落盘校验用的是启动恢复同一套判据：
       // profile 整体仍然自洽，且这个包确实从清单和装配层里消失了。任何一条
       // 不过就还原——一个「装着但坏」的 profile 比一个没卸掉的插件糟得多。
-      const profileCheck = validateInstalledProfile(profileDir);
+      const profileCheck = validatePendingProfile(profileDir);
       const removeCheck = validateRemoveCompletion(profileDir, packageName);
       if (!profileCheck.ok || !removeCheck.ok) {
         const blockers = [...profileCheck.issues, ...removeCheck.issues]
