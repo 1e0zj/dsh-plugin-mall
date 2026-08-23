@@ -838,6 +838,18 @@ guard pid 藏起来，父在握手超时后**杀不掉**它；它最长再等旧
 理论上仍存在（cancel 写入 vs 旧 guard 检查），但顺序上旧 guard 的检查必然
 晚于旧 Host 退出、而重试的新交接在旧 Host 退出之前完成 cancel 写入。
 
+**哨兵自身的竞态**（复审 P1 抓到）：残留清扫按 `restart-ready-<profile>-` 前缀
+匹配，会把**刚写的 .cancel 当残留删掉**——慢 guard 醒来时哨兵已被重试的清扫
+删了，防双继任者的机制自拆。正确语义：.cancel 不是残留，它属于一个可能还
+活着的 guard；清扫必须跳过它（仅 mtime 超过 guard 生命周期上限后才清），
+guard 消费即删。**凡是「写给将来某个时刻被读」的哨兵文件，都不能进普通
+残留清扫的前缀匹配**。
+
+**复审补充（2026-08-23 第二轮）**：tee 的日志流在饱和（write 返回 false）后
+报错，error 路径必须清掉日志侧的 saturated 标志并 resume 源管道——死流永远
+不会再 drain，不清就永久暂停。握手 supervisor 的所有 timer（含轮询 interval）
+必须走同一个 clearTimers，否则终态泄漏 interval、宿主进程无法自然退出。
+
 生态普查补充：awesome 列表里 `anweat/dsh-restart` 最接近，但其 Node 路径同为
 detached 纯日志（无可见窗口/tee），legacy 路径是 PowerShell `taskkill /F /T`
 硬杀——本 feature 无先例可抄；它的 watchdog 用端口探测（`net.connect`）避免
