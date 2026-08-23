@@ -906,6 +906,27 @@ const classicIO = {
 const STATUS_CONTROL_C_EXIT = 3221225786;
 
 /**
+ * Tear down the whole process TREE of a wrapped command that ignored its
+ * Ctrl+C. TerminateProcess (child.kill) does not cascade: dsh's graceful
+ * shutdown can hang on in-flight jobs, and even a killed dsh leaves its
+ * grandchildren (pnpm, job subprocesses) as orphans still attached to the
+ * console — which is exactly the "window will not close" a user sees after
+ * pressing Ctrl+C. taskkill /T /F tears the tree down in one step, the same
+ * escalation the official dsh-subprocess-local applies for console-wide
+ * teardown. The pid is always our own child's integer pid, never a string.
+ */
+function defaultKillProcessTree(pid) {
+  if (process.platform !== "win32") {
+    try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+    return;
+  }
+  const killer = spawn(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", `taskkill /PID ${pid} /T /F >nul 2>&1`], { shell: false, stdio: "ignore", windowsHide: true });
+  killer.once("error", () => {
+    try { process.kill(pid); } catch { /* already gone */ }
+  });
+}
+
+/**
  * Ctrl+C on a console reaches every attached process: the wrapped dsh gets
  * the event directly. This watcher's job is only on the GUARD's side —
  *
@@ -915,23 +936,31 @@ const STATUS_CONTROL_C_EXIT = 3221225786;
  *    code 1 / no signal, which probation would otherwise read as "the
  *    pending install crashed dsh" and roll back a perfectly good install;
  *  - escalate: if the child has not quit on its own within forceGraceMs,
- *    terminate it so the listening port is released; a second Ctrl+C
- *    terminates at once;
+ *    terminate the whole tree so the listening port is released AND the
+ *    console window can actually close; a second Ctrl+C escalates at once;
  *  - SIGHUP (the window's close button): the OS is about to kill the whole
  *    console unconditionally — hold the handler open only so the normal
  *    cleanup path (log close) can finish before that lands.
  */
-function createInterruptWatcher({ forceGraceMs = 5000 } = {}) {
+function createInterruptWatcher({ forceGraceMs = 5000, _killTree = defaultKillProcessTree } = {}) {
   let interrupted = false;
   let child;
   let forceTimer;
   const abortListeners = new Set();
+  const terminate = () => {
+    if (child === undefined) return;
+    try {
+      _killTree(child.pid);
+    } catch {
+      try { child.kill(); } catch { /* already gone */ }
+    }
+  };
   const signal = () => {
     for (const listener of abortListeners) {
       try { listener(); } catch { /* best effort */ }
     }
     if (interrupted) {
-      if (child !== undefined) { try { child.kill(); } catch { /* already gone */ } }
+      terminate();
       return;
     }
     interrupted = true;
@@ -939,9 +968,7 @@ function createInterruptWatcher({ forceGraceMs = 5000 } = {}) {
   };
   function armForceKill() {
     if (forceTimer !== undefined || child === undefined) return;
-    forceTimer = setTimeout(() => {
-      try { child.kill(); } catch { /* already gone */ }
-    }, forceGraceMs);
+    forceTimer = setTimeout(terminate, forceGraceMs);
     if (typeof forceTimer.unref === "function") forceTimer.unref();
   }
   const onHup = () => { /* see the doc comment: let cleanup run, OS decides */ };
@@ -1989,19 +2016,22 @@ async function selfTest() {
     }
 
     // Console Ctrl watcher: the first Ctrl+C only marks the run interrupted;
-    // after forceGraceMs (or a second Ctrl+C) the child is terminated so the
-    // listening port cannot stay hostage. waitForProcessExit honors the flag.
+    // after forceGraceMs (or a second Ctrl+C) the child's whole process TREE
+    // is torn down (a bare kill leaves dsh's grandchildren attached to the
+    // console — the "window will not close" case). waitForProcessExit honors
+    // the flag.
     {
-      const fakeChild = { killCalls: 0, kill() { this.killCalls += 1; } };
-      const watcher = createInterruptWatcher({ forceGraceMs: 25 });
+      const fakeChild = { pid: 31337, killCalls: 0, kill() { this.killCalls += 1; } };
+      const treeKills = [];
+      const watcher = createInterruptWatcher({ forceGraceMs: 25, _killTree: (pid) => treeKills.push(pid) });
       watcher.noteChild(fakeChild);
       process.emit("SIGINT");
       if (!watcher.interrupted()) throw new Error("the first Ctrl+C must mark the watcher interrupted (and not kill yet)");
-      if (fakeChild.killCalls !== 0) throw new Error("the first Ctrl+C must give the child its own chance to exit");
+      if (fakeChild.killCalls !== 0 && treeKills.length !== 0) throw new Error("the first Ctrl+C must give the child its own chance to exit");
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 60));
-      if (fakeChild.killCalls !== 1) throw new Error("the force-deadline must terminate a child that ignored Ctrl+C");
+      if (treeKills.length !== 1 || treeKills[0] !== 31337) throw new Error("the force-deadline must tear down the tree of a child that ignored Ctrl+C");
       process.emit("SIGINT");
-      if (fakeChild.killCalls !== 2) throw new Error("a second Ctrl+C must terminate immediately");
+      if (treeKills.length !== 2) throw new Error("a second Ctrl+C must escalate at once");
       let aborted = false;
       watcher.onAbort(() => { aborted = true; });
       process.emit("SIGBREAK");
