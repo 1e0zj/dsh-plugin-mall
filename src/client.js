@@ -29,6 +29,7 @@ window.__ModuleLoader__.load({
       ".mkt_btnSm{padding:3px 10px;font-size:12px}",
       ".mkt_error{color:var(--dsw-alias-state-error-primary);font-size:12px;line-height:18px}",
       ".mkt_notice{border-left:3px solid var(--dsw-alias-state-error-primary);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-state-error-primary);padding:7px 10px;font-size:12px;line-height:18px;overflow-wrap:anywhere}",
+      ".mkt_noticeInfo{border-left-color:var(--dsw-alias-state-accent-primary);color:inherit}",
       ".mkt_list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;align-items:stretch;min-width:0}",
       "@media (max-width:820px){.mkt_list{grid-template-columns:minmax(0,1fr)}}",
       ".mkt_listHead{grid-column:1/-1;font-size:12px;color:var(--dsw-alias-label-tertiary)}",
@@ -393,6 +394,13 @@ window.__ModuleLoader__.load({
     function ErrorNotice(props) {
       if (!props.message) return null;
       return h("div", { className: "mkt_notice", role: "alert" }, props.message);
+    }
+
+    // 状态性提示（区别于 ErrorNotice 的 role=alert）：「重启已调度」这类
+    // 成功路径的进展信息，页面自动重连后随刷新自然消失。
+    function StatusNotice(props) {
+      if (!props.message) return null;
+      return h("div", { className: "mkt_notice mkt_noticeInfo", role: "status" }, props.message);
     }
 
     function RestartDialog(props) {
@@ -764,6 +772,9 @@ window.__ModuleLoader__.load({
       var _restarting = useState(false);
       var restarting = _restarting[0];
       var setRestarting = _restarting[1];
+      var _restartNote = useState(null);
+      var restartNote = _restartNote[0];
+      var setRestartNote = _restartNote[1];
       var _restartConfirm = useState(false);
       var restartConfirm = _restartConfirm[0];
       var setRestartConfirm = _restartConfirm[1];
@@ -1026,10 +1037,18 @@ window.__ModuleLoader__.load({
         clearRestartPing();
         setRestarting(true);
         setError(null);
+        setRestartNote(null);
         var requestedAt = Date.now();
         var previousHostStartedAt = Number(hostStartedAt);
-        call("restart", {}).then(function () {
+        var scheduledLogPath = null;
+        call("restart", {}).then(function (value) {
           if (restartControlRef.current.mounted !== true) return;
+          // 响应语义是「已调度交接」而不是「重启成功」：新宿主何时接管
+          // 由下面的轮询判断。这里只把输出会出现在哪里告诉用户。
+          scheduledLogPath = value && value.logPath ? String(value.logPath) : null;
+          setRestartNote(value && value.mode === "visible"
+            ? "重启已调度——dsh 正在新的控制台窗口中启动，窗口里 Ctrl+C 可停止；输出同时写入 " + scheduledLogPath
+            : "重启已调度，输出与日志：" + (scheduledLogPath || "<home>/guard/ 下"));
           var tries = 0;
           var ping = setInterval(function () {
             if (restartControlRef.current.mounted !== true) {
@@ -1040,7 +1059,8 @@ window.__ModuleLoader__.load({
             if (tries > 40) {
               clearRestartPing();
               setRestarting(false);
-              reportError("restart", "2 分钟内未检测到 dsh 重启完成，请手动检查 dsh 状态后刷新页面。");
+              reportError("restart", "2 分钟内未检测到 dsh 重启完成，请手动检查 dsh 状态后刷新页面。"
+                + (scheduledLogPath ? "输出与日志：" + scheduledLogPath : ""));
               return;
             }
             // Prefer identity change over wall-clock ordering: NTP may move the
@@ -1063,6 +1083,7 @@ window.__ModuleLoader__.load({
           if (restartControlRef.current.mounted !== true) return;
           clearRestartPing();
           setRestarting(false);
+          setRestartNote(null);
           reportError("restart", e);
         });
       }, [call, clearRestartPing, hostStartedAt, reportError]);
@@ -1128,6 +1149,7 @@ window.__ModuleLoader__.load({
             "只看已验证插件")
         ),
         h(ErrorNotice, { message: error && (error.scope === "search" || error.scope === "restart") ? error.message : null }),
+        restarting ? h(StatusNotice, { message: restartNote }) : null,
         h(InstalledPanel, {
           installed: installed,
           removing: removing,
