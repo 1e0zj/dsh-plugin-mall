@@ -1026,13 +1026,12 @@ export function resolveRestartLaunchPlan({ profile, config = {}, isWindows }) {
 
   const nodePath = process.execPath;
   const originalDshArgs = process.argv.slice(2);
-  // A restart is always requested from a page that is open and that reconnects
-  // to the successor on its own, so dsh's start-up browser handoff would only
-  // add a second window onto the one already showing the result. Suppressing it
-  // is safe HERE and nowhere else: this route is gated on a live browser
-  // session. If the flag is already in the original argv, leave it alone.
-  const suppressOpen = !originalDshArgs.includes("--no-open");
-  const dshArgs = suppressOpen ? [...originalDshArgs, "--no-open"] : [...originalDshArgs];
+  // Restart the exact command the user started. `--no-open` belongs to newer
+  // Web profiles, not to the stable dsh launcher contract; adding it here made
+  // older hosts reject the successor with "unknown option '--no-open'" after
+  // the outgoing process had already exited. A duplicate browser tab is less
+  // harmful than inventing an argv capability the running host never proved.
+  const dshArgs = [...originalDshArgs];
   // The outgoing host names itself so `guard launch` can wait for it to be
   // gone before binding the port — see --await-exit in cli.js.
   const args = [cliPath, "guard", "launch", "--profile", name, "--await-exit", String(process.pid), "--", nodePath, dshEntry, ...dshArgs];
@@ -1045,7 +1044,6 @@ export function resolveRestartLaunchPlan({ profile, config = {}, isWindows }) {
     dshEntry,
     dshArgs,
     profile: name,
-    suppressedBrowserOpen: suppressOpen,
     awaitExitPid: process.pid,
   };
 }
@@ -3350,15 +3348,15 @@ export async function runSelfTests() {
           const dshArgs = plan.args.slice(dashDash + 3); // -- node <dshEntry> …
           check("重启带 --await-exit 且是本进程 pid", plan.args[plan.args.indexOf("--await-exit") + 1] === String(process.pid) && plan.awaitExitPid === process.pid);
           check("--await-exit 排在 `--` 之前（是 guard 的参数，不是 dsh 的）", plan.args.indexOf("--await-exit") < dashDash);
-          check("重启给 dsh 补 --no-open", dshArgs.includes("--no-open") && plan.suppressedBrowserOpen === true);
-          check("原始 dsh 参数原样保留", dshArgs.slice(0, 2).join(" ") === "--profile web");
+          check("重启不注入宿主版本相关参数", dshArgs.join(" ") === "--profile web" && !dshArgs.includes("--no-open"));
+          check("原始 dsh 参数原样保留", dshArgs.join(" ") === "--profile web");
           check("plan 附带可见模式所需的 dshArgs", plan.dshArgs.join(" ") === dshArgs.join(" "));
 
-          // 用户自己已经写了 --no-open 时不重复追加。
+          // 用户自己传给宿主的参数仍逐字保留。
           process.argv = [process.execPath, "/x/bin.js", "--profile", "web", "--no-open"];
           const already = resolveRestartLaunchPlan({ profile: "web", config: { allowRestart: true } });
           const alreadyArgs = already.ok ? already.args.slice(already.args.indexOf("--") + 3) : [];
-          check("已有 --no-open 则不重复追加", already.ok && alreadyArgs.filter((a) => a === "--no-open").length === 1 && already.suppressedBrowserOpen === false);
+          check("用户原有 --no-open 原样保留", already.ok && alreadyArgs.filter((a) => a === "--no-open").length === 1);
         } else {
           // 裸检出里解析不到官方 dsh 入口，plan 只能 fail——说清楚，别假装验过。
           console.log(`  SKIP 重启 argv fixture（${plan.error}）`);
@@ -3546,7 +3544,7 @@ export async function runSelfTests() {
           readyFile: join(fileRoot, "r1.json"),
           cwd: "C:/w",
           command: "C:/node/node.exe",
-          args: ["C:/dsh/index.js", "web", "--no-open"],
+          args: ["C:/dsh/index.js", "web"],
         };
         check("plan payload 校验通过", validateRestartPlanPayload(basePlan).ok === true);
         for (const [override, needle] of [
@@ -3744,7 +3742,7 @@ export async function runSelfTests() {
           nodePath: process.execPath,
           cliPath: join(visibleRoot, "cli.js"),
           dshEntry: join(visibleRoot, "dsh-entry.js"),
-          dshArgs: ["--profile", "web", "--no-open"],
+          dshArgs: ["--profile", "web"],
           profile: "web",
           awaitExitPid: 4242,
         };
