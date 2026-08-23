@@ -1088,9 +1088,17 @@ function appendRestartDiagnostic(logPath, message) {
 // back. Reset only on the failure paths; success exits the process.
 let restartHandoffInFlight = false;
 
-/** The restart goes visible only on an interactive Windows console. */
+/**
+ * The restart goes visible only on an interactive Windows console. Two
+ * spellings of "interactive": the original terminal (stdout is a TTY), or a
+ * dsh that was itself launched by the tee'd visible guard — its stdout is
+ * the tee's PIPE, so the guard marks the chain with
+ * DSH_PLUGIN_MALL_VISIBLE_CONSOLE and the TTY signal survives restarts.
+ */
 export function wantsVisibleConsoleRestart() {
-  return process.platform === "win32" && process.stdout.isTTY === true;
+  if (process.platform !== "win32") return false;
+  if (process.stdout.isTTY === true) return true;
+  return process.env.DSH_PLUGIN_MALL_VISIBLE_CONSOLE === "1";
 }
 
 /**
@@ -3695,14 +3703,22 @@ export async function runSelfTests() {
       const visibleRoot = mkdtempSync(join(tmpdir(), "dsh-mall-restart-visible-"));
       try {
         const realIsTty = process.stdout.isTTY;
+        const realVisibleEnv = process.env.DSH_PLUGIN_MALL_VISIBLE_CONSOLE;
         if (process.platform === "win32") {
           try {
             Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
             check("win32 + 交互 stdout → 走可见控制台", wantsVisibleConsoleRestart() === true);
             Object.defineProperty(process.stdout, "isTTY", { value: undefined, configurable: true });
             check("win32 + 无 TTY → 保持后台路径", wantsVisibleConsoleRestart() === false);
+            // The tee'd guard pipes the successor's stdout: the TTY signal is
+            // gone, the env flag must carry the chain across restarts.
+            process.env.DSH_PLUGIN_MALL_VISIBLE_CONSOLE = "1";
+            check("win32 + tee 链（stdout 为管道）→ 后续重启保持可见", wantsVisibleConsoleRestart() === true);
+            delete process.env.DSH_PLUGIN_MALL_VISIBLE_CONSOLE;
           } finally {
             Object.defineProperty(process.stdout, "isTTY", { value: realIsTty, configurable: true });
+            if (realVisibleEnv === undefined) delete process.env.DSH_PLUGIN_MALL_VISIBLE_CONSOLE;
+            else process.env.DSH_PLUGIN_MALL_VISIBLE_CONSOLE = realVisibleEnv;
           }
         } else {
           check("非 Windows 平台永不走可见控制台", wantsVisibleConsoleRestart() === false);

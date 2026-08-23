@@ -766,7 +766,10 @@ function teeEnv(base) {
  */
 function spawnTeeCommand(command, args, { cwd }) {
   const resolved = process.platform === "win32" ? resolveWindowsCommand(command) : command;
-  const env = teeEnv(process.env);
+  // Mark the chain: the wrapped dsh has a PIPE for stdout (the tee), so the
+  // "interactive terminal" signal is gone even though it lives in a console
+  // window. The env flag lets its own restarts stay visible.
+  const env = { ...teeEnv(process.env), DSH_PLUGIN_MALL_VISIBLE_CONSOLE: "1" };
   const stdio = ["inherit", "pipe", "pipe"];
   if (process.platform === "win32" && /\.(?:cmd|bat)$/i.test(resolved)) {
     const comspec = process.env.ComSpec ?? "cmd.exe";
@@ -1869,6 +1872,20 @@ async function selfTest() {
       await errRunner.close();
       const errLogged = readFileSync(join(teeDir, "restart-err.log"), "utf8");
       if (!errLogged.includes("ERR-OUT") || !errLogged.includes("OUT")) throw new Error("tee must mirror stderr as well as stdout");
+
+      // The tee'd child must carry the visible-chain flag: its own restart
+      // decision depends on it (stdout is a pipe here, the TTY is gone).
+      const chainRunner = createTeeRunner({
+        logPath: join(teeDir, "chain.log"),
+        cwd: root,
+        _stdout: new Writable({ write(chunk, encoding, callback) { callback(); } }),
+      });
+      const chainChild = chainRunner.spawn(process.execPath, ["-e", "console.log(process.env.DSH_PLUGIN_MALL_VISIBLE_CONSOLE ?? 'unset')"]);
+      const chainCleanup = chainRunner.attach(chainChild);
+      await chainRunner.waitFor(chainChild);
+      if (typeof chainCleanup === "function") await chainCleanup();
+      await chainRunner.close();
+      if (!readFileSync(join(teeDir, "chain.log"), "utf8").includes("1")) throw new Error("the tee'd child must inherit DSH_PLUGIN_MALL_VISIBLE_CONSOLE=1");
 
       const consoleChunks = [];
       const captureOut = new Writable({
