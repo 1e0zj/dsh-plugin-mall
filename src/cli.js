@@ -796,13 +796,9 @@ function defaultOpenTeeLog(logPath) {
  * mid-run, only costs the log — the window keeps showing output and the
  * child's exit code is untouched.
  *
- * Backpressure: both source pipes are consumed with async iteration. Chunks
- * from stdout/stderr enter one serialized write chain, and each write waits
- * for BOTH destination callbacks before either source can advance.
- * This avoids a subtle `pause()` race on Linux: a child pipe can emit `end`
- * while unread chunks are still stranded behind a manually-paused `data`
- * listener, so waiting for ChildProcess `close` or Readable `end` still loses
- * the tail when cleanup detaches that listener.
+ * Backpressure: while EITHER target is saturated BOTH source pipes stay
+ * paused (pausing just one would leave the other free to keep filling the
+ * saturated target); each target resumes the pair once it drains.
  */
 function createTeeRunner({ logPath, cwd, _stdout = process.stdout, _openLog = defaultOpenTeeLog }) {
   let logStream;
@@ -813,68 +809,61 @@ function createTeeRunner({ logPath, cwd, _stdout = process.stdout, _openLog = de
     broken = true;
     _stdout.write(`[guard] warning: cannot open restart log ${logPath} (${error.message}) — continuing without it\n`);
   }
+  let consoleSaturated = false;
+  let logSaturated = false;
+  let paused = false;
+  const activeStreams = new Set();
+  const onConsoleDrain = () => { consoleSaturated = false; maybeResume(); };
+  const onLogDrain = () => { logSaturated = false; maybeResume(); };
+  _stdout.on("drain", onConsoleDrain);
   if (logStream !== undefined) {
+    logStream.on("drain", onLogDrain);
     logStream.on("error", (error) => {
       if (broken) return;
       broken = true;
       _stdout.write(`[guard] warning: restart log ${logPath} failed (${error.message}) — continuing without it\n`);
+      // A failed stream never drains. Clear the log-side backpressure or the
+      // paused source pipes stay paused forever and the wrapped dsh hangs.
+      logSaturated = false;
+      maybeResume();
     });
   }
-
-  /** Wait until one Writable has accepted/flushed this chunk. */
-  function writeChunk(stream, chunk, onFailure) {
-    return new Promise((resolveWrite) => {
-      try {
-        stream.write(chunk, (error) => {
-          if (error != null && onFailure !== undefined) onFailure(error);
-          resolveWrite();
-        });
-      } catch (error) {
-        if (onFailure !== undefined) onFailure(error);
-        resolveWrite();
-      }
-    });
+  function maybeResume() {
+    if (!paused || consoleSaturated || logSaturated) return;
+    paused = false;
+    for (const stream of activeStreams) stream.resume();
   }
-
-  async function writeMirrored(chunk) {
-    const writes = [writeChunk(_stdout, chunk)];
-    if (!broken && logStream !== undefined) {
-      writes.push(writeChunk(logStream, chunk, (error) => {
-        if (broken) return;
-        broken = true;
-        _stdout.write(`[guard] warning: restart log ${logPath} failed (${error.message}) — continuing without it\n`);
-      }));
+  function onData(chunk) {
+    const consoleOk = _stdout.write(chunk);
+    const logOk = broken || logStream === undefined ? true : logStream.write(chunk);
+    if (consoleOk && logOk) return;
+    if (!consoleOk) consoleSaturated = true;
+    if (!logOk) logSaturated = true;
+    if (!paused) {
+      paused = true;
+      for (const stream of activeStreams) stream.pause();
     }
-    await Promise.all(writes);
   }
-
-  // stdout and stderr are consumed concurrently, but their writes must not
-  // overtake each other at either destination. Keep one chain for both.
-  let writeChain = Promise.resolve();
-  const enqueue = (chunk) => {
-    const next = writeChain.then(() => writeMirrored(chunk));
-    writeChain = next.catch(() => {});
-    return next;
-  };
-
   let closed = false;
   return {
     get broken() { return broken; },
     spawn(command, args) { return spawnTeeCommand(command, args, { cwd }); },
     attach(child) {
       const streams = [child.stdout, child.stderr].filter((stream) => stream !== null && stream !== undefined);
-      const consumers = streams.map(async (stream) => {
-        try {
-          for await (const chunk of stream) await enqueue(chunk);
-        } catch (error) {
-          _stdout.write(`[guard] warning: could not read wrapped command output (${error.message})\n`);
+      for (const stream of streams) {
+        activeStreams.add(stream);
+        stream.on("data", onData);
+      }
+      return () => {
+        for (const stream of streams) {
+          stream.removeListener("data", onData);
+          activeStreams.delete(stream);
         }
-      });
-      return async () => {
-        await Promise.all(consumers);
-        await writeChain;
+        maybeResume();
       };
     },
+    // tee waits for `close`, not `exit`: the pipes still carry in-flight
+    // output after exit, and ending the log before they drain would lose it.
     waitFor(child) {
       return new Promise((resolvePromise) => {
         child.once("error", (error) => resolvePromise({ error }));
@@ -892,7 +881,9 @@ function createTeeRunner({ logPath, cwd, _stdout = process.stdout, _openLog = de
     async close() {
       if (closed) return;
       closed = true;
+      _stdout.removeListener("drain", onConsoleDrain);
       if (logStream === undefined) return;
+      logStream.removeListener("drain", onLogDrain);
       await new Promise((resolvePromise) => {
         try {
           logStream.end(() => resolvePromise());
@@ -1884,7 +1875,11 @@ async function selfTest() {
       const teeDir = join(root, "tee");
       mkdirSync(teeDir, { recursive: true });
 
-      const generate = "const lines = []; for (let i = 0; i < 20000; i++) lines.push('line-' + i + '-' + 'x'.repeat(20)); process.stdout.write(lines.join('\\n') + '\\n'); process.exit(7);";
+      // Do not call process.exit() after the large write: on Linux that
+      // truncates the CHILD's pipe before the tee can ever read it (the exact
+      // false failure was 146176/628890 bytes in both destinations). Setting
+      // exitCode preserves the nonzero result while Node drains stdout first.
+      const generate = "const lines = []; for (let i = 0; i < 20000; i++) lines.push('line-' + i + '-' + 'x'.repeat(20)); process.stdout.write(lines.join('\\n') + '\\n'); process.exitCode = 7;";
       const expected = `${Array.from({ length: 20000 }, (_, index) => `line-${index}-${"x".repeat(20)}`).join("\n")}\n`;
       const fastChunks = [];
       const fastOut = new Writable({
@@ -1957,12 +1952,8 @@ async function selfTest() {
       // stay paused forever — the wrapped dsh would hang mid-output.
       {
         let errorSink = null;
-        const failedWriteCallbacks = [];
         const evilLog = new EventEmitter();
-        evilLog.write = (chunk, callback) => {
-          failedWriteCallbacks.push(callback);
-          return false; // always saturated until the injected write failure
-        };
+        evilLog.write = () => false; // always saturated, never drains
         const recoverChunks = [];
         const recoverOut = new Writable({
           write(chunk, encoding, callback) { recoverChunks.push(Buffer.from(chunk)); callback(); },
@@ -1985,11 +1976,7 @@ async function selfTest() {
         // THEN does the log fail — the second block can only arrive if the
         // error path released the backpressure and resumed them.
         recoverChild.stdout.once("data", () => {
-          setImmediate(() => {
-            const error = new Error("ENOSPC: log disk full");
-            evilLog.emit("error", error);
-            for (const callback of failedWriteCallbacks.splice(0)) callback(error);
-          });
+          setImmediate(() => { evilLog.emit("error", new Error("ENOSPC: log disk full")); });
         });
         const recoverResult = await recoverRunner.waitFor(recoverChild);
         if (typeof recoverCleanup === "function") await recoverCleanup();
@@ -1999,15 +1986,17 @@ async function selfTest() {
         if (!recoverText.includes("BEFORE-ERROR") || !recoverText.includes("AFTER-ERROR")) throw new Error("a mid-run log failure must resume the paused pipes — output after the error must still arrive");
       }
 
-      // The slow target is a plain EventEmitter, not a Writable: every write
-      // callback is hand-released — the strictest serialized-backpressure
-      // cycle the runner can be put through.
+      // The slow target is a plain EventEmitter, not a Writable: _write is a
+      // serialization point (queued writes never run once the releaser stops),
+      // which would lose TAIL bytes here and misblame the tee. write() always
+      // reports saturated, every drain is hand-released — the strictest
+      // pause/resume cycle the runner can be put through.
       const slowChunks = [];
       const pendingDrains = [];
       const slowOut = new EventEmitter();
-      slowOut.write = (chunk, callback) => {
+      slowOut.write = (chunk) => {
         slowChunks.push(Buffer.from(chunk));
-        pendingDrains.push(callback);
+        pendingDrains.push(() => slowOut.emit("drain"));
         return false;
       };
       const slowRunner = createTeeRunner({ logPath: join(teeDir, "slow.log"), cwd: root, _stdout: slowOut });
