@@ -62,7 +62,7 @@ import {
 // github.js imports node builtins only — the host-independence of this CLI is
 // preserved (it must keep working when the dsh host itself is broken).
 import { npmPackageInfo } from "./github.js";
-import { createRestartHelperReadyMessage } from "./restart-protocol.js";
+import { createRestartHelperReadyMessage, quoteCmdArg } from "./restart-protocol.js";
 
 /**
  * Pin a bare package name to name@latest: pnpm's minimumReleaseAge policy
@@ -600,26 +600,9 @@ async function cmdRemove({
 
 const DEFAULT_GRACE_MS = 10000;
 
-// cmd.exe metacharacters. Rather than "escaping" these for a cmd round trip
-// (cmd's quoting rules are famously inconsistent), the launch wrapper refuses
-// them outright — a dsh invocation never needs them.
-const CMD_METACHAR_RE = /[&|<>^%!\r\n]/;
-
-/**
- * Quote one token for a %ComSpec% /d /s /c command line. Follows the MSVCRT /
- * CommandLineToArgvW rules (backslashes before a quote or the closing quote are
- * doubled, quotes become \") and rejects cmd metacharacters instead of trying
- * to escape them. The command after `--` is never concatenated unquoted.
- */
-function quoteCmdArg(token) {
-  const value = String(token ?? "");
-  if (value.length === 0) return '""';
-  if (CMD_METACHAR_RE.test(value)) {
-    throw new Error(`cannot quote safely for cmd.exe (shell metacharacter present): ${JSON.stringify(value)}`);
-  }
-  const escaped = value.replace(/(\\*)"/g, "$1$1\\\"").replace(/(\\+)$/, "$1$1");
-  return `"${escaped}"`;
-}
+// quoteCmdArg/CMD_METACHAR_RE live in restart-protocol.js: the Web plugin needs
+// the same strict quoting to build the `cmd /c start` line for a visible
+// restart, so the rules must never drift between the two call sites.
 
 /** Case-insensitive env lookup (Windows env keys are case-insensitive). */
 function envValue(name) {

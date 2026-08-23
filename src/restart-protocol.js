@@ -6,6 +6,27 @@ export const RESTART_HELPER_READY_TYPE = "@1e0zj/dsh-plugin-mall:restart-helper-
 export const RESTART_HELPER_PROTOCOL_VERSION = 1;
 export const RESTART_RESPONSE_DRAIN_MS = 1000;
 
+// cmd.exe metacharacters. Rather than "escaping" these for a cmd round trip
+// (cmd's quoting rules are famously inconsistent), the launch wrapper refuses
+// them outright — a dsh invocation never needs them.
+export const CMD_METACHAR_RE = /[&|<>^%!\r\n]/;
+
+/**
+ * Quote one token for a %ComSpec% /d /s /c command line. Follows the MSVCRT /
+ * CommandLineToArgvW rules (backslashes before a quote or the closing quote are
+ * doubled, quotes become \") and rejects cmd metacharacters instead of trying
+ * to escape them. The command after `--` is never concatenated unquoted.
+ */
+export function quoteCmdArg(token) {
+  const value = String(token ?? "");
+  if (value.length === 0) return '""';
+  if (CMD_METACHAR_RE.test(value)) {
+    throw new Error(`cannot quote safely for cmd.exe (shell metacharacter present): ${JSON.stringify(value)}`);
+  }
+  const escaped = value.replace(/(\\*)"/g, "$1$1\\\"").replace(/(\\+)$/, "$1$1");
+  return `"${escaped}"`;
+}
+
 export function createRestartHelperReadyMessage(awaitExitPid) {
   return {
     type: RESTART_HELPER_READY_TYPE,
