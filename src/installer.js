@@ -3216,7 +3216,7 @@ async function runTransactionFixtures() {
       materializeFakePackage(profileDir, "some-plugin", "1.0.0");
       const { spawnFn } = scriptedSpawn([{
         code: 0,
-        out: "\u001b[32mDone\u001b[39m\n",
+        out: "Done\n",
         beforeExit: () => writeFileSync(join(profileDir, "package.json"), "{ broken json"),
       }]);
       const producer = runInstall({ profile: "p", spec: "some-plugin", preflight: preflightStub("some-plugin"), _profileDir: profileDir, _spawn: spawnFn, _describe: describeStub });
@@ -3431,7 +3431,7 @@ async function runTransactionFixtures() {
       let snapshotsWhileRunning = [];
       const { spawnFn } = scriptedSpawn([{
         code: 0,
-        out: "Done\n",
+        out: "\u001b[32mDone\u001b[39m\n",
         // pnpm 真正卸掉：清单与目录都拿走，落盘校验才会通过。
         beforeExit: () => {
           snapshotsWhileRunning = listSnapshots();
@@ -3446,7 +3446,7 @@ async function runTransactionFixtures() {
       const output = producer.readOutput();
       const snapshotsLeft = listSnapshots();
       check(
-        "卸载成功 → marker 与 snapshot 都被提交清理（且快照确实创建过）",
+        "卸载成功 → 日志去色，marker 与 snapshot 都被提交清理（且快照确实创建过）",
         outcome.status === "completed"
           && snapshotsWhileRunning.length === 1
           && !existsSync(pendingMarkerPath(profileDir))
