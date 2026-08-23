@@ -759,10 +759,15 @@ function teeEnv(base) {
 }
 
 /**
- * The visible-console spawn: the child keeps THIS guard's console for stdin
- * (a Ctrl+C in the window reaches it) while stdout/stderr are piped to the
- * tee runner. Never detached, never hidden — the whole point of this mode is
- * the window the user can watch and interrupt.
+ * The visible-console spawn: stdout/stderr are piped to the tee runner, and
+ * stdin is deliberately NOT the console. A live test showed why: dsh (or a
+ * component inside it) calls setRawMode on an inherited TTY stdin, and raw
+ * mode clears ENABLE_PROCESSED_INPUT console-wide — from then on a real
+ * Ctrl+C never becomes a CTRL_C_EVENT and NOTHING on the console (guard
+ * included) can receive it. With stdin ignored, no TTY ever reaches the
+ * child, processed input stays on, and Ctrl+C reaches every attached process
+ * — which is how the guard's interrupt handling works at all. The wrapped
+ * command is a web host; it has no use for window stdin.
  */
 function spawnTeeCommand(command, args, { cwd }) {
   const resolved = process.platform === "win32" ? resolveWindowsCommand(command) : command;
@@ -770,7 +775,7 @@ function spawnTeeCommand(command, args, { cwd }) {
   // "interactive terminal" signal is gone even though it lives in a console
   // window. The env flag lets its own restarts stay visible.
   const env = { ...teeEnv(process.env), DSH_PLUGIN_MALL_VISIBLE_CONSOLE: "1" };
-  const stdio = ["inherit", "pipe", "pipe"];
+  const stdio = ["ignore", "pipe", "pipe"];
   if (process.platform === "win32" && /\.(?:cmd|bat)$/i.test(resolved)) {
     const comspec = process.env.ComSpec ?? "cmd.exe";
     const line = [resolved, ...args].map(quoteCmdArg).join(" ");
@@ -1877,6 +1882,10 @@ async function selfTest() {
       });
       const runner = createTeeRunner({ logPath: join(teeDir, "restart-tee.log"), cwd: root, _stdout: fastOut });
       const child = runner.spawn(process.execPath, ["-e", generate]);
+      // stdin must NOT be the console: an inherited TTY stdin lets the wrapped
+      // dsh flip the console into raw mode, which kills Ctrl+C for EVERYONE
+      // attached (live-verified: consoleMode was 0x0000 in the first test).
+      if (child.stdin !== null) throw new Error("the tee'd child must not own the console stdin");
       const cleanup = runner.attach(child);
       const result = await runner.waitFor(child);
       if (typeof cleanup === "function") await cleanup();
