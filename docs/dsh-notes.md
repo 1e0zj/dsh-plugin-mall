@@ -785,3 +785,60 @@ job 并共用 DecisionPanel，失败直接显示 `detail`，日志保留终端�
 后续独立整理了剩余反馈：RPC 错误按 `search` / `installed` / `tasks` / `restart`
 作用域就近显示为持久 `role=alert`，不再共用页面顶部裸红字；原生 `window.confirm`
 替换为跟随主题的重启对话框，取消按钮默认聚焦，遮罩与 Escape 均为无副作用关闭。
+
+### issue #12: Windows 交互重启的可见控制台 —— 实测结论（2026-08-23）
+
+本 issue 不碰 cordis 框架，官方文档无直接材料；这里记录的是 Node/Windows
+机制的一手实测结论（fixture 测不出、真机才钉得住的部分），避免下次重验。
+
+**`cmd /d /s /c start` 的实测语义**（本机 Node 24.14 / Win11，PoC 实证）：
+
+- `spawn(ComSpec, ["/d","/s","/c",'"' + line + '"'], {windowsVerbatimArguments:true})`
+  与 cli.js 既有的 .cmd shim 模式完全同构：cmd 剥最外一层引号，内层引号原样
+  保留（真 echo fixture 钉死：输出保留内层引号）。带空格路径逐 token
+  quoteCmdArg 后可靠到达。
+- `start`（不带 `/b`）给孙进程分配新控制台；**孙进程的 stdin/stdout/stderr
+  就是那个控制台**（`isTTY === true`，PoC 三个流全部实测）。窗口标题必须给
+  （`start "title" ...`），否则第一个带引号 token 被吃成标题。
+- `start` 不等孙进程：cmd 立即退出，**exit 0 不代表任何成功**；且 start 找不到
+  目标时 cmd 也可能 exit 0（mall-reviewer 实测）——cmd 退出码不可靠，真正兜底
+  是文件握手超时。
+- 经 start 的孙进程与父无 stdio/IPC 关系：IPC 握手通道不存在，交接协议换
+  ready 文件（tmp+rename 原子落盘、删除权单边归父）。
+
+**Ctrl+C / 进程终止**：
+
+- 同控制台所有进程都收 CTRL_C_EVENT：DSH 直接收到，guard 的 watcher 只负责
+  guard 自己不死 + 记住「被打断」+ 5s/二次 Ctrl+C 强杀兜底。
+- **Windows 上被 kill 的子进程 exit 事件通常 `code=1, signal=null`**——
+  现有 `signal === "SIGINT"` 判定在 Windows 失效，会把打断当崩溃回滚好安装。
+  双保险：watcher 标志 + NTSTATUS `0xC000013A`（STATUS_CONTROL_C_EXIT，是否
+  被映射成 signal 依 libuv 版本而定，真机清单待钉）。
+- `child.kill()` 在 Windows 无条件 TerminateProcess，不给清理机会；但进程终止
+  时内核回收全部句柄，LISTEN 端口立即释放、无 TIME_WAIT。
+- 关窗口（CTRL_CLOSE_EVENT→SIGHUP）：OS 给约 5-10s 后无条件杀整组进程，
+  guard 只需 hold 住 handler 让日志 close 走完。
+
+**tee**：
+
+- 子进程 stdout 变 pipe 后 `isTTY=false`，DSH 会掉色：`FORCE_COLOR=1` 缓解
+  （`NO_COLOR` 时不设），已知折衷。
+- 背压实现要点：**两条源管道一起 pause/resume**（只停一条，另一条继续灌向
+  饱和目标）；以 child `close`（非 exit）为 tee 终点；不用 `process.exit()`
+  （异步 TTY 上强退截尾）。
+- fixture 教训：假 stdout 目标不要用 Writable（`_write` 是串行化点，releaser
+  停转后排队中的 write 永不执行，尾部字节丢失、误怪 tee）；用 EventEmitter +
+  write() 同步计数。同理，测背压的子进程不能 `process.exit()`（不等自身
+  stdout 排干）。
+
+**慢 guard × 用户重试的双继任者竞态**（mall-reviewer 指出）：cmd start 把
+guard pid 藏起来，父在握手超时后**杀不掉**它；它最长再等旧 pid 30s。用户重试
+会出现两个继任者抢端口 → 误回滚。缓解：父在握手失败时写 `<readyFile>.cancel`
+哨兵，guard 在等完旧 pid、启动继任者**之前**检查哨兵并自行退出。竞态窗口
+理论上仍存在（cancel 写入 vs 旧 guard 检查），但顺序上旧 guard 的检查必然
+晚于旧 Host 退出、而重试的新交接在旧 Host 退出之前完成 cancel 写入。
+
+生态普查补充：awesome 列表里 `anweat/dsh-restart` 最接近，但其 Node 路径同为
+detached 纯日志（无可见窗口/tee），legacy 路径是 PowerShell `taskkill /F /T`
+硬杀——本 feature 无先例可抄；它的 watchdog 用端口探测（`net.connect`）避免
+pid 过期双启动，思路与本插件的 await-exit + 端口 settle 相映。
