@@ -34,6 +34,7 @@ import {
   realpathSync,
   rmSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -62,7 +63,7 @@ import {
 // github.js imports node builtins only — the host-independence of this CLI is
 // preserved (it must keep working when the dsh host itself is broken).
 import { npmPackageInfo } from "./github.js";
-import { createRestartHelperReadyMessage, quoteCmdArg } from "./restart-protocol.js";
+import { createRestartHelperReadyMessage, quoteCmdArg, RESTART_PLAN_TYPE, validateRestartPlanPayload, writeRestartHelperReadyFile } from "./restart-protocol.js";
 
 /**
  * Pin a bare package name to name@latest: pnpm's minimumReleaseAge policy
@@ -96,6 +97,17 @@ export async function announceRestartHelperReady(awaitExitPid, send = process.se
     }
   });
   return true;
+}
+
+/**
+ * File-channel announcement for the visible-console restart: `cmd /c start`
+ * gives this process no IPC link back to the Web Host, so the same handshake
+ * message is published as a file instead. Unlike announceRestartHelperReady,
+ * a missing channel is impossible here — a failed write rejects and the launch
+ * fails closed rather than letting the Web parent time out blind.
+ */
+export async function announceRestartHandoffViaFile(plan, awaitExitPid) {
+  await writeRestartHelperReadyFile(plan.readyFile, { awaitExitPid, guardPid: process.pid });
 }
 
 // ── small helpers ────────────────────────────────────────────────────────────
@@ -873,6 +885,60 @@ function markerLooksValid(marker, profileDir, home) {
 }
 
 /**
+ * Read and validate a restart plan file, then consume it. The plan is the
+ * visible-restart launch source: `cmd /c start` cannot carry the wrapped
+ * argv, so the Web Host writes it to a nonce-named JSON file and this CLI
+ * reads it back — never through a shell string. A plan that fails validation
+ * (or does not parse) is refused and LEFT ON DISK for diagnosis; only a
+ * successfully loaded plan is deleted. Residue is inert: the file name is
+ * unique per request.
+ */
+function loadRestartPlan(planFile) {
+  let raw;
+  try {
+    raw = readFileSync(planFile, "utf8");
+  } catch (error) {
+    throw new Error(`cannot read restart plan ${planFile}: ${error.message}`);
+  }
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`restart plan ${planFile} is not valid JSON (${error.message}) — file left for inspection`);
+  }
+  const verdict = validateRestartPlanPayload(value);
+  if (!verdict.ok) {
+    throw new Error(`${verdict.error} — in ${planFile} (file left for inspection)`);
+  }
+  try { unlinkSync(planFile); } catch { /* nonce-named residue is inert */ }
+  return verdict.plan;
+}
+
+/**
+ * Resolve what `guard launch` should run from the parsed CLI. Two exclusive
+ * sources: the classic `--profile … -- command argv` form, or a `--plan-file`
+ * that carries all three. Anything overlapping the plan form is a usage error
+ * — two sources for the same fact is how they drift apart.
+ */
+function resolveLaunchInvocation(parsed) {
+  if (parsed.planFile !== undefined) {
+    if (parsed.profile !== undefined || parsed.awaitExit !== undefined || parsed.commandArgv.length !== 0) {
+      throw usageError("--plan-file carries --profile, --await-exit and the wrapped command; do not pass them separately (see --help)");
+    }
+    const plan = loadRestartPlan(parsed.planFile);
+    return { profile: plan.profile, commandArgv: [plan.command, ...plan.args], awaitExitPid: plan.awaitExitPid, plan };
+  }
+  if (parsed.profile === undefined) throw usageError("launch needs --profile <name> (see --help)");
+  if (parsed.commandArgv.length === 0) throw usageError("launch needs a command after `--` (see --help)");
+  let awaitExitPid;
+  if (parsed.awaitExit !== undefined) {
+    awaitExitPid = Number(parsed.awaitExit);
+    if (!Number.isInteger(awaitExitPid) || awaitExitPid <= 0) throw usageError(`--await-exit must be a positive process id, got ${JSON.stringify(parsed.awaitExit)}`);
+  }
+  return { profile: parsed.profile, commandArgv: parsed.commandArgv, awaitExitPid };
+}
+
+/**
  * `guard launch`: start dsh (or any command) wrapped in startup probation for
  * the profile's pending install, if one exists.
  *
@@ -892,8 +958,9 @@ async function cmdLaunch({
   graceMs,
   commandArgv,
   awaitExitPid,
+  plan,
   _waitForExit = waitForProcessExit,
-  _onAwaitExit = announceRestartHelperReady,
+  _onAwaitExit = plan === undefined ? announceRestartHelperReady : (pid) => announceRestartHandoffViaFile(plan, pid),
 }) {
   const profileDir = profileDirOf(home, profile);
   const grace = graceMs ?? DEFAULT_GRACE_MS;
@@ -911,7 +978,9 @@ async function cmdLaunch({
   if (awaitExitPid !== undefined) {
     // This is the exact handoff boundary: arguments and profile are valid, and
     // the helper is about to block on the outgoing Host. The Web parent waits
-    // for this IPC acknowledgement before it allows itself to exit.
+    // for this acknowledgement — over IPC on the background path, or through
+    // the ready file on the visible-console path — before it allows itself to
+    // exit. A failed announcement rejects here and nothing starts.
     await _onAwaitExit(awaitExitPid);
     if (!await _waitForExit(awaitExitPid, AWAIT_EXIT_TIMEOUT_MS)) {
       throw new Error(`process ${awaitExitPid} was still running after ${AWAIT_EXIT_TIMEOUT_MS}ms — refusing to start a second host that would collide with it on the listening port (the old one is still up; nothing was changed)`);
@@ -999,6 +1068,7 @@ Usage:
   node src/cli.js guard add <spec> --profile <name> [--home <dir>] [--accept-warnings]
   node src/cli.js guard remove <package> --profile <name> [--home <dir>]
   node src/cli.js guard launch --profile <name> [--home <dir>] [--grace-ms <ms>] [--await-exit <pid>] -- <command> [args...]
+  node src/cli.js guard launch --plan-file <path> [--home <dir>] [--grace-ms <ms>]
   node src/cli.js guard self-test
 
 Commands:
@@ -1026,7 +1096,11 @@ Commands:
               period rolls the profile back and restarts the exact command once
               with the restored state (never loops). A corrupt or legacy (pre-v2)
               marker fails closed: the command is not launched and nothing is
-              deleted.
+              deleted. --plan-file loads the wrapped command from a restart
+              plan JSON instead of \`--\` (it carries --profile, --await-exit
+              and the command itself; passing those alongside is a usage
+              error) and is consumed on load — an invalid plan is refused and
+              left on disk for inspection.
   self-test   run offline fixtures (no network, no pnpm/dsh).
 
 Exit codes: 0 ok, 1 blocked/rolled back/failed, 2 usage error; launch preserves
@@ -1039,7 +1113,7 @@ function parseArgs(argv) {
   if (args[0] === "guard") args.shift(); // `node cli.js guard recover` / `node cli.js recover`
   let command = args.shift() ?? "help";
   if (command === "--help" || command === "-h") command = "help"; // `cli.js --help`
-  const opts = { home: undefined, profile: undefined, graceMs: undefined, awaitExit: undefined, acceptWarnings: false, positionals: [], commandArgv: [] };
+  const opts = { home: undefined, profile: undefined, graceMs: undefined, awaitExit: undefined, planFile: undefined, acceptWarnings: false, positionals: [], commandArgv: [] };
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
     if (arg === "--") { opts.commandArgv = args.slice(index + 1); break; } // launch: the wrapped command, verbatim
@@ -1053,6 +1127,8 @@ function parseArgs(argv) {
     if (arg.startsWith("--grace-ms=")) { opts.graceMs = arg.slice("--grace-ms=".length); continue; }
     if (arg === "--await-exit") { opts.awaitExit = args[++index]; continue; }
     if (arg.startsWith("--await-exit=")) { opts.awaitExit = arg.slice("--await-exit=".length); continue; }
+    if (arg === "--plan-file") { opts.planFile = args[++index]; continue; }
+    if (arg.startsWith("--plan-file=")) { opts.planFile = arg.slice("--plan-file=".length); continue; }
     if (arg === "--all") { opts.all = true; continue; }
     if (arg.startsWith("-")) throw new Error(`unknown option ${JSON.stringify(arg)}`);
     opts.positionals.push(arg);
@@ -1116,19 +1192,13 @@ async function main(argv) {
         return;
       }
       case "launch": {
-        if (parsed.profile === undefined) throw usageError("launch needs --profile <name> (see --help)");
-        if (parsed.commandArgv.length === 0) throw usageError("launch needs a command after `--` (see --help)");
         let graceMs;
         if (parsed.graceMs !== undefined) {
           graceMs = Number(parsed.graceMs);
           if (!Number.isFinite(graceMs) || graceMs < 0) throw usageError(`--grace-ms must be a non-negative number, got ${JSON.stringify(parsed.graceMs)}`);
         }
-        let awaitExitPid;
-        if (parsed.awaitExit !== undefined) {
-          awaitExitPid = Number(parsed.awaitExit);
-          if (!Number.isInteger(awaitExitPid) || awaitExitPid <= 0) throw usageError(`--await-exit must be a positive process id, got ${JSON.stringify(parsed.awaitExit)}`);
-        }
-        process.exitCode = await cmdLaunch({ profile: parsed.profile, home, graceMs, commandArgv: parsed.commandArgv, awaitExitPid });
+        const invocation = resolveLaunchInvocation(parsed);
+        process.exitCode = await cmdLaunch({ ...invocation, home, graceMs });
         return;
       }
       case "self-test": {
@@ -1212,6 +1282,88 @@ async function selfTest() {
       }
     }
 
+    // --plan-file: the visible-restart launch source. Parsing accepts both
+    // forms; resolution treats the plan as the single source of truth, drinks
+    // it on load, and refuses to mix it with --profile/--await-exit/`--`.
+    {
+      const p7 = parseArgs(["launch", "--plan-file", "C:/r/plan.json"]);
+      if (p7.planFile !== "C:/r/plan.json") throw new Error("parseArgs --plan-file fixture failed");
+      const p8 = parseArgs(["launch", "--plan-file=C:/r/plan.json"]);
+      if (p8.planFile !== "C:/r/plan.json") throw new Error("parseArgs --plan-file= fixture failed");
+
+      const planDir = join(root, "restart-plans");
+      mkdirSync(planDir, { recursive: true });
+      const writePlan = (name, overrides = {}) => {
+        const path = join(planDir, name);
+        writeFileSync(path, JSON.stringify({
+          version: 1,
+          type: RESTART_PLAN_TYPE,
+          profile: "web",
+          awaitExitPid: 4321,
+          logPath: join(planDir, "restart-web.log"),
+          readyFile: join(planDir, "ready.json"),
+          cwd: root,
+          command: process.execPath,
+          args: ["-e", "process.exit(0)"],
+          ...overrides,
+        }));
+        return path;
+      };
+
+      const goodPath = writePlan("good.json");
+      const invocation = resolveLaunchInvocation({ planFile: goodPath, commandArgv: [] });
+      if (invocation.profile !== "web" || invocation.awaitExitPid !== 4321) throw new Error("plan invocation must carry the plan's profile and pid");
+      if (invocation.commandArgv[0] !== process.execPath || invocation.commandArgv[2] !== "process.exit(0)") throw new Error("plan invocation must derive the wrapped command from the plan");
+      if (existsSync(goodPath)) throw new Error("a successfully loaded plan must be consumed (deleted)");
+
+      for (const [name, overrides] of [["bad-args.json", { args: [] }], ["bad-version.json", { version: 2 }]]) {
+        const badPath = writePlan(name, overrides);
+        let refused = false;
+        try {
+          resolveLaunchInvocation({ planFile: badPath, commandArgv: [] });
+        } catch (error) {
+          refused = !(error instanceof UsageError) && /restart plan/.test(error.message);
+        }
+        if (!refused) throw new Error(`an invalid plan (${name}) must fail closed`);
+        if (!existsSync(badPath)) throw new Error(`an invalid plan (${name}) must be left on disk for inspection`);
+      }
+      const notJsonPath = join(planDir, "not-json.json");
+      writeFileSync(notJsonPath, "{ half-written");
+      let notJsonRefused = false;
+      try {
+        resolveLaunchInvocation({ planFile: notJsonPath, commandArgv: [] });
+      } catch (error) {
+        notJsonRefused = /not valid JSON/.test(error.message);
+      }
+      if (!notJsonRefused || !existsSync(notJsonPath)) throw new Error("unparseable plan JSON must be refused and preserved");
+      let missingRefused = false;
+      try {
+        resolveLaunchInvocation({ planFile: join(planDir, "nope.json"), commandArgv: [] });
+      } catch (error) {
+        missingRefused = /cannot read restart plan/.test(error.message);
+      }
+      if (!missingRefused) throw new Error("a missing plan file must fail with a clear error");
+
+      for (const extra of [{ profile: "web" }, { awaitExit: "4321" }, { commandArgv: ["dsh"] }]) {
+        let usageErrorSeen = false;
+        try {
+          resolveLaunchInvocation({ planFile: writePlan("exclusive.json"), commandArgv: [], ...extra });
+        } catch (error) {
+          usageErrorSeen = error instanceof UsageError;
+        }
+        if (!usageErrorSeen) throw new Error(`--plan-file with ${JSON.stringify(Object.keys(extra))} must be a usage error`);
+      }
+      const classic = resolveLaunchInvocation({ profile: "web", commandArgv: ["dsh"], awaitExit: undefined, planFile: undefined });
+      if (classic.profile !== "web" || classic.commandArgv.join(" ") !== "dsh" || classic.plan !== undefined) throw new Error("the classic launch form must resolve unchanged");
+      let classicUsage = false;
+      try {
+        resolveLaunchInvocation({ profile: undefined, commandArgv: [], awaitExit: undefined, planFile: undefined });
+      } catch (error) {
+        classicUsage = error instanceof UsageError;
+      }
+      if (!classicUsage) throw new Error("classic launch without --profile must stay a usage error");
+    }
+
     // `--await-exit`: the successor must not start while the outgoing host is
     // still holding the port. A pid that never goes away is refused outright —
     // starting anyway is what costs the user their install, because the failed
@@ -1259,6 +1411,65 @@ async function selfTest() {
       if (await waitForProcessExit(process.pid, 120, 20)) throw new Error("waitForProcessExit must not report a live process as gone");
       if (!await waitForProcessExit(0x7ffffff0, 500, 20)) throw new Error("waitForProcessExit must report an absent pid as gone");
       if (!await waitForProcessExit(undefined, 500, 20)) throw new Error("waitForProcessExit must not block on a missing pid");
+    }
+
+    // --plan-file launch mode: the handoff announcement moves to the ready
+    // file (there is no IPC channel under `cmd /c start`) while everything
+    // else — waiting for the outgoing pid, running the wrapped command —
+    // behaves exactly like the classic form. An announcement that cannot be
+    // written must reject the launch: the Web parent would otherwise time out
+    // blind while no successor ever started.
+    {
+      const p = join(root, "profiles", "plan-launch");
+      mkdirSync(p, { recursive: true });
+      writeFileSync(join(p, "package.json"), JSON.stringify({ dependencies: {} }));
+      writeFileSync(join(p, "cordis.patch.yml"), "[]\n");
+      const planDir = join(root, "restart-plans-live");
+      mkdirSync(planDir, { recursive: true });
+      const readyOut = join(planDir, "ready-out.json");
+      const plan = {
+        version: 1,
+        type: RESTART_PLAN_TYPE,
+        profile: "plan-launch",
+        awaitExitPid: 8642,
+        logPath: join(planDir, "restart-plan-launch.log"),
+        readyFile: readyOut,
+        cwd: root,
+        command: process.execPath,
+        args: ["-e", "process.exit(0)"],
+      };
+      const code = await cmdLaunch({
+        profile: plan.profile,
+        home: root,
+        commandArgv: [plan.command, ...plan.args],
+        awaitExitPid: plan.awaitExitPid,
+        plan,
+        _waitForExit: async () => true,
+      });
+      if (code !== 0) throw new Error("a plan-file launch must run the wrapped command");
+      if (!existsSync(readyOut)) throw new Error("plan-file launch must publish the ready file before waiting");
+      const readyPayload = JSON.parse(readFileSync(readyOut, "utf8"));
+      if (readyPayload.type !== "@1e0zj/dsh-plugin-mall:restart-helper-ready"
+        || readyPayload.protocol !== 1 || readyPayload.awaitExitPid !== plan.awaitExitPid
+        || readyPayload.guardPid !== process.pid) {
+        throw new Error("the ready file must carry the helper-ready message with this guard's pid");
+      }
+
+      const badPlan = { ...plan, readyFile: join(planDir, "no-such-dir", "ready.json") };
+      let announceFailed = false;
+      try {
+        await cmdLaunch({
+          profile: badPlan.profile,
+          home: root,
+          commandArgv: [badPlan.command, ...badPlan.args],
+          awaitExitPid: badPlan.awaitExitPid,
+          plan: badPlan,
+          _waitForExit: async () => true,
+        });
+      } catch {
+        announceFailed = true;
+      }
+      if (!announceFailed) throw new Error("a ready-file write failure must reject the launch (fail closed)");
     }
 
     // hideChildConsole: inherit the console we have, never create one we do
