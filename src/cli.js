@@ -1265,6 +1265,14 @@ async function cmdLaunch({
       throw new Error(`process ${awaitExitPid} was still running after ${AWAIT_EXIT_TIMEOUT_MS}ms — refusing to start a second host that would collide with it on the listening port (the old one is still up; nothing was changed)`);
     }
     await delay(PORT_SETTLE_MS);
+    // Cancel sentinel: the Web parent cannot kill this guard (cmd /c start
+    // hid the pid), so on a handoff it gave up waiting for it drops
+    // <readyFile>.cancel. A slow guard waking up here must not start a second
+    // successor next to the retry's one — that port collision is exactly what
+    // probation would misread as a bad install.
+    if (plan !== undefined && existsSync(`${plan.readyFile}.cancel`)) {
+      throw new Error("this restart was cancelled by the Web parent (the handoff timed out) — not starting a successor");
+    }
   }
   // Mirrors guard.js pendingPath(): <home>/guard/pending-<profile>.json.
   const markerPath = join(home, "guard", `pending-${profile}.json`);
@@ -1774,6 +1782,24 @@ async function selfTest() {
         announceFailed = true;
       }
       if (!announceFailed) throw new Error("a ready-file write failure must reject the launch (fail closed)");
+
+      // Cancel sentinel: a guard the Web parent gave up on must not start a
+      // successor after its await-exit wait ends — the retry's guard will.
+      writeFileSync(`${readyOut}.cancel`, "cancelled (fixture)\n");
+      let cancelled = false;
+      try {
+        await cmdLaunch({
+          profile: plan.profile,
+          home: root,
+          commandArgv: [plan.command, ...plan.args],
+          awaitExitPid: plan.awaitExitPid,
+          plan,
+          _waitForExit: async () => true,
+        });
+      } catch (error) {
+        cancelled = /cancelled by the Web parent/.test(error.message);
+      }
+      if (!cancelled) throw new Error("a cancelled handoff must refuse to start a successor after the wait");
     }
 
     // hideChildConsole: inherit the console we have, never create one we do

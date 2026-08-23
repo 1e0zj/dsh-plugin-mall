@@ -16,7 +16,7 @@
 import z from "@deepseek-ai/schemastery";
 import { valid as validExactVersion, maxSatisfying } from "semver";
 import { defineTool } from "@deepseek-ai/dsh-tools";
-import { existsSync, readFileSync, realpathSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, openSync, closeSync, writeSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, openSync, closeSync, writeSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -31,7 +31,7 @@ import { ensureProfile, listInstalled, normalizeSpec, runInstall, runRemove, ass
 import { preflightInstall, inspectRemoteCandidate, recoverProfile, describeRollbackRebuild, isAbortError } from "./guard.js";
 import {
   createRestartHelperReadyMessage, RESTART_HELPER_READY_TYPE, RESTART_RESPONSE_DRAIN_MS, superviseRestartHelper,
-  RESTART_PLAN_TYPE, readRestartHelperReadyFile, superviseRestartHelperFile, validateRestartPlanPayload, writeRestartHelperReadyFile,
+  RESTART_PLAN_TYPE, RESTART_PLAN_VERSION, quoteCmdArg, readRestartHelperReadyFile, superviseRestartHelperFile, validateRestartPlanPayload, writeRestartHelperReadyFile,
 } from "./restart-protocol.js";
 
 export const name = "@1e0zj/dsh-plugin-mall";
@@ -1043,6 +1043,7 @@ export function resolveRestartLaunchPlan({ profile, config = {}, isWindows }) {
     args,
     cliPath,
     dshEntry,
+    dshArgs,
     profile: name,
     suppressedBrowserOpen: suppressOpen,
     awaitExitPid: process.pid,
@@ -1076,6 +1077,107 @@ function appendRestartDiagnostic(logPath, message) {
       try { closeSync(fd); } catch { /* already closed */ }
     }
   }
+}
+
+// ── visible-console restart (Windows, interactive terminal) ──────────────────
+
+// One handoff at a time, process-wide: two concurrent restart requests (two
+// tabs, or the dialog racing the panel button) would spawn two guards that
+// both wait for this Host and then both start successors — a port collision
+// that probation would misread as "the pending install crashed dsh" and roll
+// back. Reset only on the failure paths; success exits the process.
+let restartHandoffInFlight = false;
+
+/** The restart goes visible only on an interactive Windows console. */
+export function wantsVisibleConsoleRestart() {
+  return process.platform === "win32" && process.stdout.isTTY === true;
+}
+
+/**
+ * Best-effort sweep of a previous request's plan/ready leftovers in
+ * <home>/guard. Correctness never depends on it: the file names are
+ * per-request unique, so stale files are inert clutter.
+ */
+function sweepStaleRestartHandoffs(guardDir, profile) {
+  let names;
+  try {
+    names = readdirSync(guardDir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (name.startsWith(`restart-plan-${profile}-`) || name.startsWith(`restart-ready-${profile}-`)) {
+      try { rmSync(join(guardDir, name), { force: true }); } catch { /* inert residue */ }
+    }
+  }
+}
+
+/**
+ * Write the launch plan the visible guard will consume (`--plan-file`). The
+ * wrapped dsh argv travels as JSON — never through the cmd command line, where
+ * spaces, quotes and metacharacters would be re-parsed. The plan does NOT
+ * carry the home dir: the guard inherits DSH_HOME through cmd → start and
+ * resolves it itself, one less path to trust.
+ */
+function writeVisibleRestartPlan({ plan, logPath }) {
+  if (typeof logPath !== "string" || logPath.length === 0) {
+    return { ok: false, error: "restart log path unavailable" };
+  }
+  try {
+    const guardDir = dirname(logPath);
+    mkdirSync(guardDir, { recursive: true });
+    sweepStaleRestartHandoffs(guardDir, plan.profile);
+    const nonce = randomBytes(6).toString("hex");
+    const suffix = `${plan.profile}-${plan.awaitExitPid}-${nonce}`;
+    const planPath = join(guardDir, `restart-plan-${suffix}.json`);
+    const readyFile = join(guardDir, `restart-ready-${suffix}.json`);
+    writeFileSync(planPath, `${JSON.stringify({
+      version: RESTART_PLAN_VERSION,
+      type: RESTART_PLAN_TYPE,
+      profile: plan.profile,
+      awaitExitPid: plan.awaitExitPid,
+      logPath,
+      readyFile,
+      cwd: process.cwd(),
+      command: plan.nodePath,
+      args: [plan.dshEntry, ...plan.dshArgs],
+    }, null, 2)}\n`);
+    return { ok: true, planPath, readyFile };
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+}
+
+/**
+ * Launch the visible guard: a new console window via `cmd /d /s /c start`
+ * (never /b — the window is the feature). cmd returns immediately; the guard
+ * runs as a grandchild with no stdio or IPC link back, which is why the
+ * handoff moves to the ready file. Every token on the line is strictly
+ * quoted — a path cmd cannot digest is a construction failure, and the
+ * caller falls back to the background path rather than mangling the command.
+ */
+function spawnVisibleRestartGuard({ plan, planPath, _spawn = spawn }) {
+  let child;
+  try {
+    const line = [
+      "start",
+      quoteCmdArg(`dsh guard - ${plan.profile}`),
+      [plan.nodePath, plan.cliPath, "guard", "launch", "--plan-file", planPath].map(quoteCmdArg).join(" "),
+    ].join(" ");
+    child = _spawn(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", `"${line}"`], {
+      shell: false,
+      detached: true,
+      stdio: "ignore",
+      cwd: process.cwd(),
+      env: process.env,
+      windowsVerbatimArguments: true,
+      windowsHide: false,
+    });
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+  try { child.unref(); } catch { /* ChildProcess-compatible fakes may omit it */ }
+  return { ok: true, child };
 }
 
 // ── in-process job tracker for browser RPC ───────────────────────────────────
@@ -2155,6 +2257,15 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker, signa
       } catch (error) {
         return rpcFail(error);
       }
+      // One handoff at a time, process-wide, checked BEFORE anything else
+      // opens files or resolves plans: two concurrent requests would spawn
+      // two guards that both wait for this Host and then both start a
+      // successor — a port collision probation would misread as a bad
+      // install. Reset only on the failure paths; success exits the process.
+      if (restartHandoffInFlight) {
+        return rpcFail(new Error("a restart handoff is already in progress — the page reconnects on its own once it completes"));
+      }
+      restartHandoffInFlight = true;
       const plan = resolveRestartLaunchPlan({ profile, config });
       if (!plan.ok) {
         let diagnosticPath;
@@ -2163,6 +2274,7 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker, signa
           mkdirSync(dirname(diagnosticPath), { recursive: true });
         } catch { /* invalid profile/home: console remains the diagnostic sink */ }
         appendRestartDiagnostic(diagnosticPath, `restart plan rejected: ${plan.error}; old Host remains running`);
+        restartHandoffInFlight = false;
         return rpcFail(new Error(plan.error));
       }
       // Everything the restart prints goes to a file. `stdio: "ignore"` used to
@@ -2181,29 +2293,86 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker, signa
         console.error(`[dsh-plugin-mall] restart log unavailable (${error.message}); continuing without it`);
         logFd = undefined;
       }
-      let child;
-      try {
-        child = spawn(plan.nodePath, plan.args, {
-          shell: false,
-          detached: true,
-          // fd 3 is an IPC channel used only for the readiness handshake. An
-          // old/incompatible CLI either exits on --await-exit or times out; it
-          // can never make the current Host leave merely by spawning.
-          stdio: ["ignore", logFd ?? "ignore", logFd ?? "ignore", "ipc"],
-          cwd: process.cwd(),
-          windowsHide: true,
-        });
-      } catch (error) {
-        if (logFd !== undefined) closeSync(logFd);
-        appendRestartDiagnostic(logPath, `restart helper could not be spawned: ${error.message}; old Host remains running`);
-        return rpcFail(new Error(`automatic restart helper could not be spawned; the current dsh is still running${logPath ? ` (see ${logPath})` : ""}`));
+      let handoff;
+      let mode = "background";
+      let visiblePlan;
+      if (wantsVisibleConsoleRestart()) {
+        // The interactive path: a visible console window runs the guard, its
+        // output is teed to the window and this log, and the handoff travels
+        // through the ready file (cmd /c start leaves no IPC link). Any
+        // CONSTRUCTION failure here falls back to the background path — a
+        // half-built window must never block the restart itself. A handoff
+        // failure after the spawn does NOT retry: re-spawning while the first
+        // guard might just be slow would create two successors.
+        if (logFd !== undefined) {
+          closeSync(logFd); // the visible guard opens the log itself (tee)
+          logFd = undefined;
+        }
+        visiblePlan = writeVisibleRestartPlan({ plan, logPath });
+        if (visiblePlan.ok) {
+          const spawned = spawnVisibleRestartGuard({ plan, planPath: visiblePlan.planPath });
+          if (spawned.ok) {
+            mode = "visible";
+            handoff = superviseRestartHelperFile({
+              readyFile: visiblePlan.readyFile,
+              awaitExitPid: plan.awaitExitPid,
+              onFailure: (message) => appendRestartDiagnostic(logPath, `${message}; old Host remains running`),
+            });
+            // start makes cmd return immediately and its exit code is
+            // unreliable (a failed start can still exit 0), so this fast-fail
+            // is a bonus, not the mechanism — the handshake timeout is what
+            // actually bounds the wait.
+            spawned.child.once("exit", (code) => {
+              if (code !== 0 && code !== null && handoff.state() === "handshake") {
+                handoff.failFast(`cmd exited with code ${code} before the guard announced itself`);
+              }
+            });
+            spawned.child.once("error", () => {
+              if (handoff.state() === "handshake") {
+                handoff.failFast("cmd failed before the guard announced itself");
+              }
+            });
+          } else {
+            appendRestartDiagnostic(logPath, `visible console unavailable (${spawned.error}); continuing on the background path`);
+            try { rmSync(visiblePlan.planPath, { force: true }); } catch { /* inert residue */ }
+          }
+        } else {
+          appendRestartDiagnostic(logPath, `visible console unavailable (${visiblePlan.error}); continuing on the background path`);
+        }
       }
-      if (logFd !== undefined) closeSync(logFd); // the child holds its own duplicates
 
-      const handoff = superviseRestartHelper(child, {
-        awaitExitPid: plan.awaitExitPid,
-        onFailure: (message) => appendRestartDiagnostic(logPath, `${message}; old Host remains running`),
-      });
+      let child;
+      if (mode === "background") {
+        // A visible→background fallback closed the fd above; reopen it, or
+        // the background helper's output (including any rollback line) would
+        // go nowhere at all.
+        if (logFd === undefined && logPath !== undefined) {
+          try { logFd = openSync(logPath, "a"); } catch { logFd = undefined; }
+        }
+        try {
+          child = spawn(plan.nodePath, plan.args, {
+            shell: false,
+            detached: true,
+            // fd 3 is an IPC channel used only for the readiness handshake. An
+            // old/incompatible CLI either exits on --await-exit or times out; it
+            // can never make the current Host leave merely by spawning.
+            stdio: ["ignore", logFd ?? "ignore", logFd ?? "ignore", "ipc"],
+            cwd: process.cwd(),
+            windowsHide: true,
+          });
+        } catch (error) {
+          if (logFd !== undefined) closeSync(logFd);
+          restartHandoffInFlight = false;
+          appendRestartDiagnostic(logPath, `restart helper could not be spawned: ${error.message}; old Host remains running`);
+          return rpcFail(new Error(`automatic restart helper could not be spawned; the current dsh is still running${logPath ? ` (see ${logPath})` : ""}`));
+        }
+        if (logFd !== undefined) closeSync(logFd); // the child holds its own duplicates
+
+        handoff = superviseRestartHelper(child, {
+          awaitExitPid: plan.awaitExitPid,
+          onFailure: (message) => appendRestartDiagnostic(logPath, `${message}; old Host remains running`),
+        });
+      }
       let disposeHandoffEffect;
       try {
         // Cordis runs this disposer on HMR/config unload. In particular, the
@@ -2215,6 +2384,7 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker, signa
         );
       } catch (error) {
         handoff.dispose();
+        restartHandoffInFlight = false;
         appendRestartDiagnostic(logPath, `restart handoff could not join the plugin lifecycle: ${error.message}; old Host remains running`);
         return rpcFail(new Error("automatic restart was cancelled because the marketplace plugin is unloading; the current dsh is still running"));
       }
@@ -2222,9 +2392,18 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker, signa
       const accepted = await handoff.ready;
       if (!accepted.ok) {
         await disposeHandoffEffect();
+        restartHandoffInFlight = false;
+        if (mode === "visible" && visiblePlan?.ok) {
+          // Cancel sentinel for a guard that may merely be SLOW: we cannot
+          // kill it (cmd /c start hid its pid from us), so before the user
+          // retries, leave a mark the guard checks after its await-exit wait
+          // ends — a second successor next to the retry's one is exactly the
+          // port collision probation misreads as a bad install.
+          try { writeFileSync(`${visiblePlan.readyFile}.cancel`, `cancelled ${new Date().toISOString()}: ${accepted.error}\n`); } catch { /* best effort */ }
+        }
         return rpcFail(new Error(`${accepted.error}; the current dsh is still running${logPath ? ` (see ${logPath})` : ""}`));
       }
-      return rpcOk({ restarting: true, handoffAccepted: true, logPath });
+      return rpcOk({ restarting: true, handoffAccepted: true, logPath, mode });
     }
     case "jobCancel": {
       try {
@@ -3137,6 +3316,7 @@ export async function runSelfTests() {
           check("--await-exit 排在 `--` 之前（是 guard 的参数，不是 dsh 的）", plan.args.indexOf("--await-exit") < dashDash);
           check("重启给 dsh 补 --no-open", dshArgs.includes("--no-open") && plan.suppressedBrowserOpen === true);
           check("原始 dsh 参数原样保留", dshArgs.slice(0, 2).join(" ") === "--profile web");
+          check("plan 附带可见模式所需的 dshArgs", plan.dshArgs.join(" ") === dshArgs.join(" "));
 
           // 用户自己已经写了 --no-open 时不重复追加。
           process.argv = [process.execPath, "/x/bin.js", "--profile", "web", "--no-open"];
@@ -3462,6 +3642,135 @@ export async function runSelfTests() {
       } finally {
         rmSync(fileRoot, { recursive: true, force: true });
       }
+    }
+
+    // Visible-console branch (interactive Windows restart): the plan file
+    // carries the wrapped argv as JSON, the cmd line is built from strictly
+    // quoted fixed tokens only, and construction failures fall back to the
+    // background path. The real window is a manual-verification item; these
+    // pin everything up to the spawn.
+    {
+      const visibleRoot = mkdtempSync(join(tmpdir(), "dsh-mall-restart-visible-"));
+      try {
+        const realIsTty = process.stdout.isTTY;
+        if (process.platform === "win32") {
+          try {
+            Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+            check("win32 + 交互 stdout → 走可见控制台", wantsVisibleConsoleRestart() === true);
+            Object.defineProperty(process.stdout, "isTTY", { value: undefined, configurable: true });
+            check("win32 + 无 TTY → 保持后台路径", wantsVisibleConsoleRestart() === false);
+          } finally {
+            Object.defineProperty(process.stdout, "isTTY", { value: realIsTty, configurable: true });
+          }
+        } else {
+          check("非 Windows 平台永不走可见控制台", wantsVisibleConsoleRestart() === false);
+        }
+
+        const guardDir = join(visibleRoot, "guard");
+        const logPath = join(guardDir, "restart-web.log");
+        mkdirSync(guardDir, { recursive: true });
+        // stale leftovers from a previous request are swept, not mistaken
+        writeFileSync(join(guardDir, "restart-plan-web-111-old.json"), "{}");
+        writeFileSync(join(guardDir, "restart-ready-web-111-old.json"), "{}");
+        const launchPlan = {
+          ok: true,
+          nodePath: process.execPath,
+          cliPath: join(visibleRoot, "cli.js"),
+          dshEntry: join(visibleRoot, "dsh-entry.js"),
+          dshArgs: ["--profile", "web", "--no-open"],
+          profile: "web",
+          awaitExitPid: 4242,
+        };
+        const written = writeVisibleRestartPlan({ plan: launchPlan, logPath });
+        check("可见重启计划写出成功且清扫旧残留", written.ok === true
+          && !existsSync(join(guardDir, "restart-plan-web-111-old.json"))
+          && !existsSync(join(guardDir, "restart-ready-web-111-old.json")));
+        const planPayload = JSON.parse(readFileSync(written.planPath, "utf8"));
+        check(
+          "计划 JSON：wrapped argv 只走 JSON、不走 cmd 行、不带 home",
+          planPayload.type === RESTART_PLAN_TYPE && planPayload.version === RESTART_PLAN_VERSION
+            && planPayload.profile === "web" && planPayload.awaitExitPid === 4242
+            && planPayload.command === process.execPath
+            && planPayload.args.join(" ") === [launchPlan.dshEntry, ...launchPlan.dshArgs].join(" ")
+            && planPayload.logPath === logPath && planPayload.readyFile === written.readyFile
+            && planPayload.home === undefined,
+        );
+
+        let spawned = undefined;
+        const spawnCapture = (command, args, options) => {
+          spawned = { command, args, options };
+          return { unref() {} };
+        };
+        const okSpawn = spawnVisibleRestartGuard({ plan: launchPlan, planPath: written.planPath, _spawn: spawnCapture });
+        const cmdArg = spawned.args[3];
+        check(
+          "cmd 行：/d /s /c verbatim + start 带标题 + 全 token 引用 + 不隐藏 + detached",
+          okSpawn.ok === true
+            && spawned.command === (process.env.ComSpec ?? "cmd.exe")
+            && spawned.args[0] === "/d" && spawned.args[1] === "/s" && spawned.args[2] === "/c"
+            && cmdArg.startsWith('"start "dsh guard - web"')
+            && spawned.options.shell === false && spawned.options.detached === true
+            && spawned.options.windowsVerbatimArguments === true
+            && spawned.options.windowsHide === false
+            && spawned.options.stdio === "ignore",
+        );
+        check(
+          "cmd 行不含任何原始 dsh 参数（只有固定 token 与计划文件路径）",
+          cmdArg.includes("--profile") === false && cmdArg.includes("--no-open") === false
+            && cmdArg.includes("--plan-file"),
+        );
+
+        spawned = undefined; // prove the metacharacter failure never spawns
+        const badPath = spawnVisibleRestartGuard({
+          plan: { ...launchPlan, nodePath: "C:/x&y/node.exe" },
+          planPath: written.planPath,
+          _spawn: spawnCapture,
+        });
+        check("cmd 元字符路径 → 构造失败回退（不 spawn）", badPath.ok === false && spawned === undefined);
+
+        // In-flight guard: a second concurrent request fails fast without
+        // touching spawn — two guards would both await this Host and both
+        // start successors. Checked before plan resolution, so this holds in
+        // a bare checkout (CI) where the plan itself cannot resolve dsh.
+        const realDshHome = process.env.DSH_HOME;
+        const realConsoleError = console.error;
+        restartHandoffInFlight = true;
+        let inFlightResponse;
+        try {
+          process.env.DSH_HOME = visibleRoot;
+          console.error = () => {};
+          inFlightResponse = await rpcDispatch({}, "restart", { profile: "web", session: `sess_${"a".repeat(32)}` }, { defaultProfile: "web", allowRestart: true }, undefined, {});
+        } finally {
+          restartHandoffInFlight = false;
+          console.error = realConsoleError;
+          if (realDshHome === undefined) delete process.env.DSH_HOME;
+          else process.env.DSH_HOME = realDshHome;
+        }
+        check(
+          "已有交接在途 → 第二次请求立即拒绝",
+          inFlightResponse?.ok === false && /already in progress/.test(inFlightResponse.error?.message ?? ""),
+        );
+      } finally {
+        rmSync(visibleRoot, { recursive: true, force: true });
+      }
+    }
+
+    // On Windows pin the /d /s /c verbatim quoting against the real cmd.exe
+    // (echo, no window): the same shell route the visible restart takes.
+    if (process.platform === "win32") {
+      const echoed = await new Promise((resolvePromise) => {
+        let text = "";
+        const child = spawn(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", '"echo "dsh verbatim check""'], {
+          shell: false,
+          stdio: ["ignore", "pipe", "pipe"],
+          windowsVerbatimArguments: true,
+          windowsHide: true,
+        });
+        child.stdout.on("data", (chunk) => { text += chunk; });
+        child.on("close", () => resolvePromise(text));
+        child.on("error", () => resolvePromise(""));
+      });
+      check("cmd /d /s /c verbatim 引用链路（真 echo：外层引号剥、内层保留）", echoed.trim() === "\"dsh verbatim check\"");
     }
 
     // ── 7. Tracker isolation: producer.done rejection handling ───────────────
