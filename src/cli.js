@@ -814,6 +814,10 @@ function createTeeRunner({ logPath, cwd, _stdout = process.stdout, _openLog = de
       if (broken) return;
       broken = true;
       _stdout.write(`[guard] warning: restart log ${logPath} failed (${error.message}) — continuing without it\n`);
+      // A failed stream never drains. Clear the log-side backpressure or the
+      // paused source pipes stay paused forever and the wrapped dsh hangs.
+      logSaturated = false;
+      maybeResume();
     });
   }
   function maybeResume() {
@@ -1269,8 +1273,11 @@ async function cmdLaunch({
     // hid the pid), so on a handoff it gave up waiting for it drops
     // <readyFile>.cancel. A slow guard waking up here must not start a second
     // successor next to the retry's one — that port collision is exactly what
-    // probation would misread as a bad install.
+    // probation would misread as a bad install. The sweep never touches a
+    // fresh sentinel (it may belong to a guard that has not woken yet);
+    // consuming it here deletes it so it does not linger.
     if (plan !== undefined && existsSync(`${plan.readyFile}.cancel`)) {
+      try { unlinkSync(`${plan.readyFile}.cancel`); } catch { /* best effort */ }
       throw new Error("this restart was cancelled by the Web parent (the handoff timed out) — not starting a successor");
     }
   }
@@ -1785,6 +1792,7 @@ async function selfTest() {
 
       // Cancel sentinel: a guard the Web parent gave up on must not start a
       // successor after its await-exit wait ends — the retry's guard will.
+      // Consuming the sentinel deletes it, so it does not linger.
       writeFileSync(`${readyOut}.cancel`, "cancelled (fixture)\n");
       let cancelled = false;
       try {
@@ -1800,6 +1808,7 @@ async function selfTest() {
         cancelled = /cancelled by the Web parent/.test(error.message);
       }
       if (!cancelled) throw new Error("a cancelled handoff must refuse to start a successor after the wait");
+      if (existsSync(`${readyOut}.cancel`)) throw new Error("consuming the cancel sentinel must delete it");
     }
 
     // hideChildConsole: inherit the console we have, never create one we do
@@ -1879,6 +1888,45 @@ async function selfTest() {
       const consoleText = Buffer.concat(consoleChunks).toString("utf8");
       if (brokenResult.code !== 5 || !brokenRunner.broken) throw new Error("a failed log must be console-only and must not affect the child");
       if (!consoleText.includes("STILL-HERE") || !consoleText.includes("disk on fire")) throw new Error("a failed log must warn on the console and keep showing output");
+
+      // A log that fails WHILE SATURATED must release the backpressure: a
+      // dead stream never drains, and the paused source pipes would otherwise
+      // stay paused forever — the wrapped dsh would hang mid-output.
+      {
+        let errorSink = null;
+        const evilLog = new EventEmitter();
+        evilLog.write = () => false; // always saturated, never drains
+        const recoverChunks = [];
+        const recoverOut = new Writable({
+          write(chunk, encoding, callback) { recoverChunks.push(Buffer.from(chunk)); callback(); },
+        });
+        const recoverRunner = createTeeRunner({
+          logPath: join(teeDir, "evil.log"),
+          cwd: root,
+          _stdout: recoverOut,
+          _openLog: () => {
+            errorSink = evilLog;
+            return evilLog;
+          },
+        });
+        const recoverChild = recoverRunner.spawn(process.execPath, ["-e", `
+          process.stdout.write('BEFORE-ERROR\\n');
+          setTimeout(() => { process.stdout.write('AFTER-ERROR\\n'); process.exit(3); }, 700);
+        `]);
+        const recoverCleanup = recoverRunner.attach(recoverChild);
+        // The first data block saturates the log and pauses the pipes; only
+        // THEN does the log fail — the second block can only arrive if the
+        // error path released the backpressure and resumed them.
+        recoverChild.stdout.once("data", () => {
+          setImmediate(() => { evilLog.emit("error", new Error("ENOSPC: log disk full")); });
+        });
+        const recoverResult = await recoverRunner.waitFor(recoverChild);
+        if (typeof recoverCleanup === "function") await recoverCleanup();
+        await recoverRunner.close();
+        const recoverText = Buffer.concat(recoverChunks).toString("utf8");
+        if (recoverResult.code !== 3 || !recoverRunner.broken) throw new Error("a mid-run log failure must not affect the child");
+        if (!recoverText.includes("BEFORE-ERROR") || !recoverText.includes("AFTER-ERROR")) throw new Error("a mid-run log failure must resume the paused pipes — output after the error must still arrive");
+      }
 
       // The slow target is a plain EventEmitter, not a Writable: _write is a
       // serialization point (queued writes never run once the releaser stops),

@@ -16,7 +16,7 @@
 import z from "@deepseek-ai/schemastery";
 import { valid as validExactVersion, maxSatisfying } from "semver";
 import { defineTool } from "@deepseek-ai/dsh-tools";
-import { existsSync, readFileSync, readdirSync, realpathSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, openSync, closeSync, writeSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync, mkdirSync, mkdtempSync, statSync, utimesSync, writeFileSync, rmSync, openSync, closeSync, writeSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -1093,10 +1093,18 @@ export function wantsVisibleConsoleRestart() {
   return process.platform === "win32" && process.stdout.isTTY === true;
 }
 
+// A cancel sentinel outlives the request that wrote it: it belongs to a
+// possibly-still-alive guard that will read it after its await-exit wait
+// ends (up to ~30s) — sweeping it as mere residue is how a retry resurrects
+// a cancelled guard next to the retry's own one. Only a sentinel that is
+// far older than any guard lifetime counts as stale.
+const CANCEL_SENTINEL_TTL_MS = 10 * 60 * 1000;
+
 /**
  * Best-effort sweep of a previous request's plan/ready leftovers in
  * <home>/guard. Correctness never depends on it: the file names are
- * per-request unique, so stale files are inert clutter.
+ * per-request unique, so stale files are inert clutter — EXCEPT cancel
+ * sentinels (see CANCEL_SENTINEL_TTL_MS).
  */
 function sweepStaleRestartHandoffs(guardDir, profile) {
   let names;
@@ -1106,9 +1114,19 @@ function sweepStaleRestartHandoffs(guardDir, profile) {
     return;
   }
   for (const name of names) {
-    if (name.startsWith(`restart-plan-${profile}-`) || name.startsWith(`restart-ready-${profile}-`)) {
-      try { rmSync(join(guardDir, name), { force: true }); } catch { /* inert residue */ }
+    const isPlan = name.startsWith(`restart-plan-${profile}-`);
+    const isReady = name.startsWith(`restart-ready-${profile}-`);
+    if (!isPlan && !isReady) continue;
+    if (isReady && name.endsWith(".cancel")) {
+      try {
+        const stats = statSync(join(guardDir, name));
+        if (Date.now() - stats.mtimeMs > CANCEL_SENTINEL_TTL_MS) {
+          rmSync(join(guardDir, name), { force: true });
+        }
+      } catch { /* unreadable: leave it */ }
+      continue;
     }
+    try { rmSync(join(guardDir, name), { force: true }); } catch { /* inert residue */ }
   }
 }
 
@@ -3669,9 +3687,18 @@ export async function runSelfTests() {
         const guardDir = join(visibleRoot, "guard");
         const logPath = join(guardDir, "restart-web.log");
         mkdirSync(guardDir, { recursive: true });
-        // stale leftovers from a previous request are swept, not mistaken
+        // stale leftovers from a previous request are swept, not mistaken —
+        // but a FRESH cancel sentinel must survive the sweep: it may belong
+        // to a slow guard that has not woken to consume it yet, and deleting
+        // it is how a retry resurrects a cancelled guard beside its own one.
         writeFileSync(join(guardDir, "restart-plan-web-111-old.json"), "{}");
         writeFileSync(join(guardDir, "restart-ready-web-111-old.json"), "{}");
+        const freshCancel = join(guardDir, "restart-ready-web-112-fresh.json.cancel");
+        const staleCancel = join(guardDir, "restart-ready-web-113-stale.json.cancel");
+        writeFileSync(freshCancel, "just written by a failed handoff\n");
+        writeFileSync(staleCancel, "old sentinel, guard long gone\n");
+        const staleTime = new Date(Date.now() - CANCEL_SENTINEL_TTL_MS - 60000);
+        utimesSync(staleCancel, staleTime, staleTime);
         const launchPlan = {
           ok: true,
           nodePath: process.execPath,
@@ -3684,7 +3711,9 @@ export async function runSelfTests() {
         const written = writeVisibleRestartPlan({ plan: launchPlan, logPath });
         check("可见重启计划写出成功且清扫旧残留", written.ok === true
           && !existsSync(join(guardDir, "restart-plan-web-111-old.json"))
-          && !existsSync(join(guardDir, "restart-ready-web-111-old.json")));
+          && !existsSync(join(guardDir, "restart-ready-web-111-old.json"))
+          && existsSync(freshCancel) === true
+          && existsSync(staleCancel) === false);
         const planPayload = JSON.parse(readFileSync(written.planPath, "utf8"));
         check(
           "计划 JSON：wrapped argv 只走 JSON、不走 cmd 行、不带 home",
