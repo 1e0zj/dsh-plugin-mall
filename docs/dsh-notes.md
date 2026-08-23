@@ -868,6 +868,21 @@ dsh 时打 `DSH_PLUGIN_MALL_VISIBLE_CONSOLE=1`（env 经 cmd→start→guard→d
 判定（isTTY）跨 spawn 边界传播，都要显式带状态——stdio 形状在链条里必然
 改变**。
 
+**真机第二轮（同日）：raw mode 杀死整个控制台的 Ctrl+C**。真机重启后窗口
+里按 Ctrl+C 双双无反应；AttachConsole 后 GetConsoleMode 读到 **0x0000**
+（ENABLE_PROCESSED_INPUT 已被关）——物理 ^C 从此只作为字符进输入缓冲，
+**永不产生 CTRL_C_EVENT，控制台上所有进程都收不到**（WriteConsoleInput
+注入 ^C 同样死）。根因：dsh（或其内部组件）对继承到的 TTY stdin 调
+`setRawMode(true)`，而 raw mode 会清掉 processed input，且该模式是
+**控制台级共享**的。修法：tee 给被包裹命令的 stdin 用 `ignore`（web 宿主
+本就不需要窗口 stdin），TTY 永不落到子进程、无人再翻 raw mode，^C 事件
+通道完整。教训：**给子进程传「活的控制台 stdin」前先想清楚——任何一个
+后代开了 raw mode，这个控制台上所有人的 Ctrl+C 语义一起陪葬**；兜底升级
+为 `taskkill /T /F` 整树清除（TerminateProcess 不级联，孤儿附着控制台 =
+窗口关不掉）。另外 dsh 宿主的 SIGINT 是优雅关闭（`fiber.dispose`，等任务
+静止），可能长时间不退——「给一次优雅机会、5 秒后整树强杀」的双层结构
+因此是必须的。
+
 生态普查补充：awesome 列表里 `anweat/dsh-restart` 最接近，但其 Node 路径同为
 detached 纯日志（无可见窗口/tee），legacy 路径是 PowerShell `taskkill /F /T`
 硬杀——本 feature 无先例可抄；它的 watchdog 用端口探测（`net.connect`）避免
