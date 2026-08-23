@@ -293,6 +293,12 @@ export function superviseRestartHelperFile({
       clearTimeout(deadlineTimer);
       deadlineTimer = undefined;
     }
+    // pollTimer included: a terminal state must leave no polling interval
+    // behind, or the Host process can never exit naturally.
+    if (pollTimer !== undefined) {
+      clearInterval(pollTimer);
+      pollTimer = undefined;
+    }
     if (probeTimer !== undefined) {
       clearInterval(probeTimer);
       probeTimer = undefined;

@@ -2334,7 +2334,14 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker, signa
             handoff = superviseRestartHelperFile({
               readyFile: visiblePlan.readyFile,
               awaitExitPid: plan.awaitExitPid,
-              onFailure: (message) => appendRestartDiagnostic(logPath, `${message}; old Host remains running`),
+              onFailure: (message, meta) => {
+                appendRestartDiagnostic(logPath, `${message}; old Host remains running`);
+                // The RPC already answered ok when a post-ready death happens:
+                // the old Host correctly stays, but this handoff is over —
+                // unlock restarts, or one dead helper bricks the button
+                // until a manual restart.
+                if (meta?.afterReady === true) restartHandoffInFlight = false;
+              },
             });
             // start makes cmd return immediately and its exit code is
             // unreliable (a failed start can still exit 0), so this fast-fail
@@ -2388,16 +2395,22 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker, signa
 
         handoff = superviseRestartHelper(child, {
           awaitExitPid: plan.awaitExitPid,
-          onFailure: (message) => appendRestartDiagnostic(logPath, `${message}; old Host remains running`),
+          onFailure: (message, meta) => {
+            appendRestartDiagnostic(logPath, `${message}; old Host remains running`);
+            // Same unlock as the visible path: a helper dying after the RPC
+            // answered must not leave the one-restart-at-a-time latch stuck.
+            if (meta?.afterReady === true) restartHandoffInFlight = false;
+          },
         });
       }
       let disposeHandoffEffect;
       try {
         // Cordis runs this disposer on HMR/config unload. In particular, the
         // process-exit timer can no longer outlive the plugin instance that
-        // created it and kill the Host one second later.
+        // created it and kill the Host one second later. A disposed handoff
+        // is no longer in flight — release the latch (the old Host stays).
         disposeHandoffEffect = ctx.effect(
-          () => handoff.dispose,
+          () => { handoff.dispose(); restartHandoffInFlight = false; },
           "@1e0zj/dsh-plugin-mall: restart handoff",
         );
       } catch (error) {
@@ -3656,6 +3669,20 @@ export async function runSelfTests() {
         check(
           "failFast（cmd 先死）→ 提前失败，不等握手超时",
           fastReady.ok === false && /cmd exited/.test(fastReady.error) && fast.hostExits() === 0,
+        );
+
+        // Every terminal state (success, failure, dispose) must leave no
+        // polling interval behind: a leaked 100ms timer keeps the Host
+        // process from ever exiting naturally.
+        const countTimers = () => process.getActiveResourcesInfo().filter((entry) => entry === "Timeout").length;
+        const timersBefore = countTimers();
+        const leak = mkFileSupervise("leak.json", { handshakeTimeoutMs: 25, pollMs: 2 });
+        const leakReady = await leak.handoff.ready;
+        await pause(60); // any surviving interval would have ticked by now
+        const leaked = countTimers() - timersBefore;
+        check(
+          "握手终态后不残留轮询 interval（进程可自然退出）",
+          leakReady.ok === false && leaked <= 0,
         );
       } finally {
         rmSync(fileRoot, { recursive: true, force: true });
