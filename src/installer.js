@@ -17,6 +17,7 @@ import { dump, load } from "js-yaml";
 import { DEFAULT_PROFILE_BUNDLES, PROFILE_TEMPLATES, initProfile, resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
 import { describeBuildScripts, npmNameOf } from "./github.js";
 import { clearPendingApprovalPause, commitPendingSnapshot, createProfileSnapshot, describeRollbackRebuild, markPendingApprovalPause, markPendingSnapshot, mcpEntryAuditForInstall, pausedCandidateBeforeState, pendingApprovalPaused, pnpmGuardEnv, pnpmSpawnPlan, readValidatedPendingSnapshot, rollbackPendingSnapshot, validatePendingProfile, validateRemoveCompletion } from "./guard.js";
+import { stripTerminalControlSequences } from "./terminal.js";
 
 // ── spec normalization ──────────────────────────────────────────────────────
 
@@ -630,12 +631,20 @@ const NPM_NAME_RE = /^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/i;
  */
 function parseIgnoredBuilds(output) {
   const found = new Map();
+  // pnpm enables colours even though stdout/stderr are pipes on some Windows
+  // setups (observed with pnpm 11).  A reset code after the selector makes the
+  // anchored `@version` parser miss, so `node-pty@1.1.0\x1b[39m` used to be
+  // treated as an invalid package name and the approval pause became an
+  // ordinary failed install. Strip CSI terminal controls again here as a
+  // fail-closed parsing boundary; the stream capture already removes them from
+  // the plain-text job log shown to users.
+  const plainOutput = stripTerminalControlSequences(output);
   // Only pnpm's own notice line is a parsing source. "allowBuilds" also
   // appears in pnpm's advice/error text (never followed by a name list), and
   // matching it fed error echoes into the allow-list, corrupting the YAML.
   const pattern = /(?:Ignored build scripts|onlyBuiltDependencies)\s*:\s*([^\n]+)/gi;
   let match;
-  while ((match = pattern.exec(output)) !== null) {
+  while ((match = pattern.exec(plainOutput)) !== null) {
     for (const raw of match[1].split(",")) {
       const candidate = raw.trim();
       if (candidate.length === 0) continue;
@@ -1661,8 +1670,9 @@ function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, pref
   const collected = [];
   const deltaQueue = [];
   const push = (text) => {
-    collected.push(text);
-    deltaQueue.push(text);
+    const plainText = stripTerminalControlSequences(text);
+    collected.push(plainText);
+    deltaQueue.push(plainText);
   };
 
   const workspacePath = join(profileDir, "pnpm-workspace.yaml");
@@ -2703,7 +2713,10 @@ async function runTransactionFixtures() {
     try {
       materializeFakePackage(profileDir, "some-plugin", "1.0.0");
       materializeFakePackage(profileDir, "node-pty", "1.0.0", { install: "node install.js" });
-      const { spawnFn, calls } = scriptedSpawn([{ code: 0, out: "Packages are cloned\nIgnored build scripts: node-pty@1.0.0\nDone\n" }]);
+      // pnpm 11 on Windows may colour stderr even when it is captured through a
+      // pipe.  In particular, the reset code lands directly after the selector.
+      const colouredIgnoredBuilds = "Packages are cloned\n\u001b[31mIgnored build scripts: node-pty@1.0.0\u001b[39m\nDone\n";
+      const { spawnFn, calls } = scriptedSpawn([{ code: 0, out: colouredIgnoredBuilds }]);
       const producer = runInstall({
         profile: "p",
         spec: "some-plugin",
@@ -2725,7 +2738,7 @@ async function runTransactionFixtures() {
       const output = producer.readOutput();
       const markerBefore = pendingMarkerPath(profileDir);
       check(
-        "退出码 0 + Ignored build scripts（未批准）→ 停在批准闸，返回 proof，不 finalize，暂停保留 marker",
+        "退出码 0 + 彩色 Ignored build scripts（未批准）→ 停在批准闸，返回 proof，不 finalize，暂停保留 marker",
         outcome.status === "failed"
           && Array.isArray(outcome.needsApproval)
           && outcome.needsApproval.some((entry) => entry.name === "node-pty")
@@ -2740,7 +2753,9 @@ async function runTransactionFixtures() {
             && entry.weeklyDownloads === 123)
           && calls.length === 1
           && existsSync(markerBefore)
-          && /paused for build-script approval/.test(output),
+          && /paused for build-script approval/.test(output)
+          && /Ignored build scripts: node-pty@1\.0\.0/.test(output)
+          && !output.includes("\u001b["),
         `status=${outcome.status} calls=${calls.length} marker=${existsSync(markerBefore)}`,
       );
       check(

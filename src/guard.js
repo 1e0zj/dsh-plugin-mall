@@ -27,6 +27,7 @@ import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 import { JSON_SCHEMA, Type, load } from "js-yaml";
 import { satisfies, validRange } from "semver";
+import { stripTerminalControlSequences } from "./terminal.js";
 
 // Official patches (e.g. @deepseek-ai/dsh-base, dsh-web-app) mark raw JS
 // expressions with the scalar tag `!!js`. Construct the loader's own marker —
@@ -1802,7 +1803,7 @@ function spawnCapture(command, args, options, onOutput, { signal, treeKill = fal
     let child;
     const chunks = [];
     const push = (value) => {
-      const text = value.toString();
+      const text = stripTerminalControlSequences(value);
       chunks.push(text);
       onOutput?.(text);
     };
@@ -1910,7 +1911,7 @@ export async function preflightInstall({ profileDir, spec, onOutput, signal }) {
     const result = await spawnCapture(
       plan.command,
       probeAddArgs(spec),
-      { cwd: probeDir, env: process.env, shell: plan.shell },
+      { cwd: probeDir, env: pnpmGuardEnv(process.env), shell: plan.shell },
       onOutput,
       { signal, treeKill: plan.treeKill },
     );
@@ -2305,6 +2306,13 @@ function addedDependencyNames(pending, originalDependencies = pending?.dependenc
 export function pnpmGuardEnv(base = process.env) {
   return {
     ...base,
+    // Browser jobs render plain text rather than a terminal. Prevent pnpm from
+    // emitting colours at the source; output capture also strips CSI controls
+    // defensively in case a child ignores these conventional switches.
+    NO_COLOR: "1",
+    FORCE_COLOR: "0",
+    npm_config_color: "false",
+    NPM_CONFIG_COLOR: "false",
     npm_config_auto_install_peers: "false",
     NPM_CONFIG_AUTO_INSTALL_PEERS: "false",
   };
@@ -4746,6 +4754,21 @@ async function selfTest() {
       if (env.KEEP_ME !== "1") throw new Error("pnpmGuardEnv must preserve the base env");
       if (env.npm_config_auto_install_peers !== "false" || env.NPM_CONFIG_AUTO_INSTALL_PEERS !== "false") {
         throw new Error("pnpmGuardEnv must disable peer auto-install");
+      }
+      if (env.NO_COLOR !== "1" || env.FORCE_COLOR !== "0"
+        || env.npm_config_color !== "false" || env.NPM_CONFIG_COLOR !== "false") {
+        throw new Error("pnpmGuardEnv must disable terminal colours for browser job logs");
+      }
+
+      let streamed = "";
+      const coloured = await spawnCapture(
+        process.execPath,
+        ["-e", "process.stdout.write('\\u001b[96mprobe ok\\u001b[39m\\n')"],
+        { env: process.env, shell: false },
+        (text) => { streamed += text; },
+      );
+      if (coloured.exitCode !== 0 || coloured.output !== "probe ok\n" || streamed !== "probe ok\n") {
+        throw new Error(`spawnCapture must strip terminal controls from captured and streamed logs: ${JSON.stringify({ coloured, streamed })}`);
       }
     }
 
