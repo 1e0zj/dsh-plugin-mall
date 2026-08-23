@@ -840,15 +840,24 @@ guard pid 藏起来，父在握手超时后**杀不掉**它；它最长再等旧
 
 **哨兵自身的竞态**（复审 P1 抓到）：残留清扫按 `restart-ready-<profile>-` 前缀
 匹配，会把**刚写的 .cancel 当残留删掉**——慢 guard 醒来时哨兵已被重试的清扫
-删了，防双继任者的机制自拆。正确语义：.cancel 不是残留，它属于一个可能还
-活着的 guard；清扫必须跳过它（仅 mtime 超过 guard 生命周期上限后才清），
-guard 消费即删。**凡是「写给将来某个时刻被读」的哨兵文件，都不能进普通
-残留清扫的前缀匹配**。
+删了，防双继任者的机制自拆。最终定论（三轮收敛）：.cancel **永不按时间清扫**，
+只由对应 guard 消费删除——被系统/调试器暂停的 guard 没有可见的生命周期上限，
+任何 TTL 都可能删掉活 guard 未消费的哨兵；少量 nonce 小文件残留远比双
+successor 抢端口安全。**凡是「写给将来某个时刻被读」的哨兵文件，都不进
+残留清扫，也不设 TTL——消费即删是唯一出口**。
 
 **复审补充（2026-08-23 第二轮）**：tee 的日志流在饱和（write 返回 false）后
 报错，error 路径必须清掉日志侧的 saturated 标志并 resume 源管道——死流永远
 不会再 drain，不清就永久暂停。握手 supervisor 的所有 timer（含轮询 interval）
 必须走同一个 clearTimers，否则终态泄漏 interval、宿主进程无法自然退出。
+
+**ctx.effect 的注册语义（第三轮 P1 抓到）**：Cordis 的 `ctx.effect(callback)`
+**立即执行 callback、把返回值登记为 disposer**。写成块体
+`() => { handoff.dispose(); ... }` 等于注册时就 dispose——每一次重启当场自灭，
+且 fixture 全绿（现有 fixture 从未走过「成功 spawn + effect 注册」路径）。
+正确写法 `() => () => { ... }`（返回 disposer）。教训有二：**改 effect 注册
+代码时先写一个模拟「立即执行+登记返回值」语义的 fake ctx fixture**；带副作用
+的 lifecycle 接线要抽成可单测的函数，别内联在 RPC case 里。
 
 生态普查补充：awesome 列表里 `anweat/dsh-restart` 最接近，但其 Node 路径同为
 detached 纯日志（无可见窗口/tee），legacy 路径是 PowerShell `taskkill /F /T`

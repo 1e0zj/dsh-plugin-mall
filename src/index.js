@@ -16,7 +16,7 @@
 import z from "@deepseek-ai/schemastery";
 import { valid as validExactVersion, maxSatisfying } from "semver";
 import { defineTool } from "@deepseek-ai/dsh-tools";
-import { existsSync, readFileSync, readdirSync, realpathSync, mkdirSync, mkdtempSync, statSync, utimesSync, writeFileSync, rmSync, openSync, closeSync, writeSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync, mkdirSync, mkdtempSync, utimesSync, writeFileSync, rmSync, openSync, closeSync, writeSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -1093,18 +1093,16 @@ export function wantsVisibleConsoleRestart() {
   return process.platform === "win32" && process.stdout.isTTY === true;
 }
 
-// A cancel sentinel outlives the request that wrote it: it belongs to a
-// possibly-still-alive guard that will read it after its await-exit wait
-// ends (up to ~30s) — sweeping it as mere residue is how a retry resurrects
-// a cancelled guard next to the retry's own one. Only a sentinel that is
-// far older than any guard lifetime counts as stale.
-const CANCEL_SENTINEL_TTL_MS = 10 * 60 * 1000;
-
 /**
  * Best-effort sweep of a previous request's plan/ready leftovers in
  * <home>/guard. Correctness never depends on it: the file names are
  * per-request unique, so stale files are inert clutter — EXCEPT cancel
- * sentinels (see CANCEL_SENTINEL_TTL_MS).
+ * sentinels, which are NEVER swept, however old: a paused/suspended guard
+ * has no visible lifetime ceiling, and deleting a sentinel its guard has
+ * not consumed yet is how a retry resurrects a cancelled guard beside its
+ * own one. A sentinel dies only when its guard consumes it; the price is a
+ * few tiny nonce files left behind when a guard never wakes — cheap next
+ * to two successors colliding on the listening port.
  */
 function sweepStaleRestartHandoffs(guardDir, profile) {
   let names;
@@ -1114,19 +1112,10 @@ function sweepStaleRestartHandoffs(guardDir, profile) {
     return;
   }
   for (const name of names) {
-    const isPlan = name.startsWith(`restart-plan-${profile}-`);
-    const isReady = name.startsWith(`restart-ready-${profile}-`);
-    if (!isPlan && !isReady) continue;
-    if (isReady && name.endsWith(".cancel")) {
-      try {
-        const stats = statSync(join(guardDir, name));
-        if (Date.now() - stats.mtimeMs > CANCEL_SENTINEL_TTL_MS) {
-          rmSync(join(guardDir, name), { force: true });
-        }
-      } catch { /* unreadable: leave it */ }
-      continue;
+    if (name.endsWith(".cancel")) continue;
+    if (name.startsWith(`restart-plan-${profile}-`) || name.startsWith(`restart-ready-${profile}-`)) {
+      try { rmSync(join(guardDir, name), { force: true }); } catch { /* inert residue */ }
     }
-    try { rmSync(join(guardDir, name), { force: true }); } catch { /* inert residue */ }
   }
 }
 
@@ -1164,6 +1153,21 @@ function writeVisibleRestartPlan({ plan, logPath }) {
   } catch (error) {
     return { ok: false, error: error.message };
   }
+}
+
+/**
+ * Join the handoff to the plugin lifecycle. Cordis runs the callback
+ * IMMEDIATELY and registers its RETURN VALUE as the disposer — so the
+ * callback must merely build the disposer, never perform the disposal
+ * (a block body here disposed the handoff at registration time and broke
+ * every restart; pinned by fixture). The disposer also releases the
+ * in-flight latch: a disposed handoff is over, the old Host stays.
+ */
+function registerRestartHandoffEffect(ctx, handoff) {
+  return ctx.effect(
+    () => () => { handoff.dispose(); restartHandoffInFlight = false; },
+    "@1e0zj/dsh-plugin-mall: restart handoff",
+  );
 }
 
 /**
@@ -2405,14 +2409,7 @@ async function rpcDispatch(ctx, endpoint, payload, config, token, tracker, signa
       }
       let disposeHandoffEffect;
       try {
-        // Cordis runs this disposer on HMR/config unload. In particular, the
-        // process-exit timer can no longer outlive the plugin instance that
-        // created it and kill the Host one second later. A disposed handoff
-        // is no longer in flight — release the latch (the old Host stays).
-        disposeHandoffEffect = ctx.effect(
-          () => { handoff.dispose(); restartHandoffInFlight = false; },
-          "@1e0zj/dsh-plugin-mall: restart handoff",
-        );
+        disposeHandoffEffect = registerRestartHandoffEffect(ctx, handoff);
       } catch (error) {
         handoff.dispose();
         restartHandoffInFlight = false;
@@ -3715,16 +3712,16 @@ export async function runSelfTests() {
         const logPath = join(guardDir, "restart-web.log");
         mkdirSync(guardDir, { recursive: true });
         // stale leftovers from a previous request are swept, not mistaken —
-        // but a FRESH cancel sentinel must survive the sweep: it may belong
-        // to a slow guard that has not woken to consume it yet, and deleting
-        // it is how a retry resurrects a cancelled guard beside its own one.
+        // but cancel sentinels are NEVER swept, however old: a paused guard
+        // has no lifetime ceiling, and deleting an unconsumed sentinel is
+        // how a retry resurrects a cancelled guard beside its own one.
         writeFileSync(join(guardDir, "restart-plan-web-111-old.json"), "{}");
         writeFileSync(join(guardDir, "restart-ready-web-111-old.json"), "{}");
         const freshCancel = join(guardDir, "restart-ready-web-112-fresh.json.cancel");
         const staleCancel = join(guardDir, "restart-ready-web-113-stale.json.cancel");
         writeFileSync(freshCancel, "just written by a failed handoff\n");
         writeFileSync(staleCancel, "old sentinel, guard long gone\n");
-        const staleTime = new Date(Date.now() - CANCEL_SENTINEL_TTL_MS - 60000);
+        const staleTime = new Date(Date.now() - 24 * 60 * 60 * 1000);
         utimesSync(staleCancel, staleTime, staleTime);
         const launchPlan = {
           ok: true,
@@ -3736,11 +3733,11 @@ export async function runSelfTests() {
           awaitExitPid: 4242,
         };
         const written = writeVisibleRestartPlan({ plan: launchPlan, logPath });
-        check("可见重启计划写出成功且清扫旧残留", written.ok === true
+        check("可见重启计划写出成功且清扫旧残留（cancel 哨兵永不清扫）", written.ok === true
           && !existsSync(join(guardDir, "restart-plan-web-111-old.json"))
           && !existsSync(join(guardDir, "restart-ready-web-111-old.json"))
           && existsSync(freshCancel) === true
-          && existsSync(staleCancel) === false);
+          && existsSync(staleCancel) === true);
         const planPayload = JSON.parse(readFileSync(written.planPath, "utf8"));
         check(
           "计划 JSON：wrapped argv 只走 JSON、不走 cmd 行、不带 home",
@@ -3806,6 +3803,36 @@ export async function runSelfTests() {
           "已有交接在途 → 第二次请求立即拒绝",
           inFlightResponse?.ok === false && /already in progress/.test(inFlightResponse.error?.message ?? ""),
         );
+
+        // ctx.effect runs the callback IMMEDIATELY and registers its return
+        // value as the disposer — a block body that disposes inline (the
+        // third-round review catch) killed every handoff at registration and
+        // broke restarts entirely. Pin the real registration semantics with
+        // a cordis-faithful fake: registering must not dispose, and the
+        // registered disposer must dispose AND release the latch.
+        {
+          const fakeHandoff = { disposeCalls: 0, dispose() { this.disposeCalls += 1; } };
+          const registered = [];
+          const fakeCtx = {
+            effect(callback) {
+              const disposer = callback();
+              registered.push(disposer);
+              return () => disposer();
+            },
+          };
+          restartHandoffInFlight = true;
+          const unregister = registerRestartHandoffEffect(fakeCtx, fakeHandoff);
+          const registrationClean = fakeHandoff.disposeCalls === 0
+            && typeof registered[0] === "function";
+          registered[0]();
+          const disposalWorks = fakeHandoff.disposeCalls === 1 && restartHandoffInFlight === false;
+          restartHandoffInFlight = false;
+          unregister();
+          check(
+            "ctx.effect 注册语义：注册不 dispose、disposer 才 dispose 并解锁",
+            registrationClean && disposalWorks,
+          );
+        }
       } finally {
         rmSync(visibleRoot, { recursive: true, force: true });
       }
