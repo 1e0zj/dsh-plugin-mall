@@ -883,6 +883,14 @@ dsh 时打 `DSH_PLUGIN_MALL_VISIBLE_CONSOLE=1`（env 经 cmd→start→guard→d
 静止），可能长时间不退——「给一次优雅机会、5 秒后整树强杀」的双层结构
 因此是必须的。
 
+**真机终局（同日第三轮）：stdin=ignore 之后 Ctrl+C 仍不可用**——dsh 内部
+仍有东西在关 processed input（不再需要 TTY stdin 也发生；疑有组件对控制台
+句柄直接 SetConsoleMode，未定位到具体插件）。按用户决定收尾：**Ctrl+C 降
+级为尽力而为，退出手段定为「点 X 关窗」**——CTRL_CLOSE_EVENT 不走输入缓
+冲，不受 processed input 影响，OS 保证杀整组，三轮真机全稳。窗口提示与
+README 文案均已对齐这一真实行为（不再承诺 Ctrl+C）。SIGINT 双层链路
+（优雅→5s 树杀）保留：环境干净时它仍能工作，且不碍事。
+
 生态普查补充：awesome 列表里 `anweat/dsh-restart` 最接近，但其 Node 路径同为
 detached 纯日志（无可见窗口/tee），legacy 路径是 PowerShell `taskkill /F /T`
 硬杀——本 feature 无先例可抄；它的 watchdog 用端口探测（`net.connect`）避免

@@ -1294,7 +1294,7 @@ async function cmdLaunch({
     // for this acknowledgement — over IPC on the background path, or through
     // the ready file on the visible-console path — before it allows itself to
     // exit. A failed announcement rejects here and nothing starts.
-    if (tee !== undefined) tee.say(`[guard] waiting for outgoing dsh (pid ${awaitExitPid}) to exit (Ctrl+C cancels)…`);
+    if (tee !== undefined) tee.say(`[guard] waiting for outgoing dsh (pid ${awaitExitPid}) to exit — close this window to cancel…`);
     await _onAwaitExit(awaitExitPid);
     const gone = await _waitForExit(awaitExitPid, AWAIT_EXIT_TIMEOUT_MS, 100, interrupt === undefined ? undefined : interrupt.interrupted);
     if (!gone) {
@@ -1556,10 +1556,11 @@ async function main(argv) {
     if (launchTee !== undefined) launchTee.say(`error: ${error.message}`, "error");
     console.error(`error: ${error.message}`);
     process.exitCode = error instanceof UsageError ? 2 : 1;
-    // A visible window that vanishes takes its diagnosis with it: hold it for
-    // a beat, cut short by another Ctrl+C.
+    // A visible window that vanishes takes its diagnosis with it: hold it
+    // briefly so the error can be read (a working console signal cuts the
+    // wait short).
     if (launchTee !== undefined) {
-      launchTee.say("[guard] this window stays open for 10s for inspection (Ctrl+C closes it now)…");
+      launchTee.say("[guard] this window closes in 10s so the error above can be read…");
       await waitForSignalOrTimeout(10000, launchInterrupt);
     }
   } finally {
