@@ -1075,9 +1075,7 @@ window.__ModuleLoader__.load({
           // 响应语义是「已调度交接」而不是「重启成功」：新宿主何时接管
           // 由下面的轮询判断。这里只把输出会出现在哪里告诉用户。
           scheduledLogPath = value && value.logPath ? String(value.logPath) : null;
-          setRestartNote(value && value.mode === "visible"
-            ? "重启已调度——dsh 正在新的控制台窗口中启动，窗口里 Ctrl+C 可停止；输出同时写入 " + scheduledLogPath
-            : "重启已调度，输出与日志：" + (scheduledLogPath || "<home>/guard/ 下"));
+          setRestartNote("重启中，输出与日志：" + (scheduledLogPath || "<home>/guard/ 下"));
           var tries = 0;
           var ping = setInterval(function () {
             if (restartControlRef.current.mounted !== true) {
