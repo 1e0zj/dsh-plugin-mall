@@ -775,6 +775,17 @@ function splitBuildSelector(key) {
 const PERSISTENT_WORKSPACE_KEYS = ["minimumReleaseAgeExclude"];
 
 /**
+ * Match ONE top-level `key:` line, in every legal YAML spelling of the key:
+ * bare, single-quoted, or double-quoted. Key-locating that only knows the
+ * bare form misreads a quoted original as "key absent" and appends a
+ * duplicate mapping key — silently corrupting the file.
+ */
+function topLevelKeyRegex(key) {
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^(?:${escaped}|'${escaped}'|"${escaped}")\\s*:`);
+}
+
+/**
  * Splice one top-level key's value into a workspace yaml, textually.
  *
  * The value is re-serialized, but the surrounding file keeps its bytes:
@@ -784,8 +795,9 @@ const PERSISTENT_WORKSPACE_KEYS = ["minimumReleaseAgeExclude"];
  */
 function spliceWorkspaceKey(content, key, value) {
   const block = dump({ [key]: value }, { lineWidth: -1, noRefs: true, sortKeys: false }).replace(/\n+$/, "");
+  const keyLine = topLevelKeyRegex(key);
   const lines = content.split("\n");
-  const start = lines.findIndex((line) => line.startsWith(`${key}:`));
+  const start = lines.findIndex((line) => keyLine.test(line));
   if (start === -1) {
     return `${content.replace(/\n*$/, "\n")}${block}\n`;
   }
@@ -793,8 +805,81 @@ function spliceWorkspaceKey(content, key, value) {
   // entries, indented comments, and blank lines in between all belong to it.
   let end = start + 1;
   while (end < lines.length && !/^\S/.test(lines[end])) end += 1;
-  lines.splice(start, end - start, ...block.split("\n"));
+  const blockLines = block.split("\n");
+  // Keep the user's own spelling of the key line (quoted or bare) when it
+  // carries no inline value; only the entries below it are re-serialized.
+  if (lines[start].replace(keyLine, "").trim() === "") blockLines[0] = lines[start].replace(/\s+$/, "");
+  lines.splice(start, end - start, ...blockLines);
   return `${lines.join("\n").replace(/\n+$/, "")}\n`;
+}
+
+/**
+ * Extract the persistent workspace keys from a workspace yaml as a plain
+ * `{key: value}` object. Used to snapshot pnpm's own writes at a trusted
+ * moment — see the approval branch in runInstallInner for why the on-disk
+ * state after approved scripts ran is NOT trusted.
+ */
+function extractPersistentWrites(content) {
+  const text = Buffer.isBuffer(content) ? content.toString("utf8") : content;
+  if (typeof text !== "string" || text.length === 0) return {};
+  let doc;
+  try {
+    doc = load(text) ?? {};
+  } catch {
+    return {};
+  }
+  const writes = {};
+  for (const key of PERSISTENT_WORKSPACE_KEYS) {
+    if (doc[key] !== undefined) writes[key] = doc[key];
+  }
+  return writes;
+}
+
+/**
+ * Merge captured persistent workspace writes into the user's pre-install
+ * bytes. {@link mergePersistentWorkspaceWrites} for the full story; this is
+ * the core that takes the writes as an object instead of a disk snapshot.
+ *
+ * Defensive by contract: if the merged text would not parse, or the spliced
+ * key does not come out exactly once with exactly the values requested, the
+ * original bytes are returned untouched — a lost exemption is a nuisance, a
+ * corrupted workspace is an outage.
+ */
+function applyPersistentWrites(writes, originalContent) {
+  const original = Buffer.isBuffer(originalContent) ? originalContent.toString("utf8") : originalContent;
+  if (writes === null || typeof writes !== "object") return original;
+  const base = typeof original === "string" ? original : DEFAULT_WORKSPACE_YAML;
+  let baseDoc;
+  try {
+    baseDoc = load(base) ?? {};
+  } catch {
+    return original;
+  }
+  let merged = base;
+  let changed = false;
+  for (const key of PERSISTENT_WORKSPACE_KEYS) {
+    const value = writes[key];
+    if (value === undefined) continue;
+    if (JSON.stringify(baseDoc[key]) === JSON.stringify(value)) continue;
+    merged = spliceWorkspaceKey(merged, key, value);
+    changed = true;
+  }
+  if (!changed) return original;
+  try {
+    const reparsed = load(merged) ?? {};
+    for (const key of PERSISTENT_WORKSPACE_KEYS) {
+      if (writes[key] === undefined) continue;
+      // The key must appear exactly once at top level (an unrecognized
+      // spelling in the original would otherwise leave a duplicate behind)
+      // and must parse back to the exact values being merged.
+      const occurrences = merged.split("\n").filter((line) => topLevelKeyRegex(key).test(line)).length;
+      if (occurrences !== 1) return original;
+      if (JSON.stringify(reparsed[key]) !== JSON.stringify(writes[key])) return original;
+    }
+  } catch {
+    return original;
+  }
+  return merged;
 }
 
 /**
@@ -815,8 +900,13 @@ function spliceWorkspaceKey(content, key, value) {
  * user's original bytes and splice in exactly the persistent keys pnpm wrote.
  * When pnpm wrote nothing persistent the original bytes come back unchanged.
  *
- * @param afterContent - pnpm-workspace.yaml as it sits on disk after the
- *   install finished.
+ * Only call this with a disk state no install script has had a chance to
+ * touch (or with a writes snapshot captured before they ran) — a script that
+ * got approved to execute could otherwise launder arbitrary release-age
+ * exemptions into the user's config as "pnpm writes".
+ *
+ * @param afterContent - pnpm-workspace.yaml as it sat on disk when pnpm
+ *   finished (scripts still blocked, or a snapshot taken before they ran).
  * @param originalContent - the user's pre-install bytes, or undefined when the
  *   file did not exist before (the install wrote the default template).
  * @returns the bytes to leave on disk — `originalContent` as-is when pnpm
@@ -825,30 +915,8 @@ function spliceWorkspaceKey(content, key, value) {
 export function mergePersistentWorkspaceWrites(afterContent, originalContent) {
   // Callers hand in the pre-save Buffer from readFileSync; normalize so the
   // "no original file" case (undefined) is not confused with a Buffer.
-  const after = Buffer.isBuffer(afterContent) ? afterContent.toString("utf8") : afterContent;
   const original = Buffer.isBuffer(originalContent) ? originalContent.toString("utf8") : originalContent;
-  if (typeof after !== "string" || after.length === 0) return original;
-  const base = typeof original === "string" ? original : DEFAULT_WORKSPACE_YAML;
-  let afterDoc;
-  let baseDoc;
-  try {
-    afterDoc = load(after) ?? {};
-    baseDoc = load(base) ?? {};
-  } catch {
-    // Unparsable disk content is not a pnpm write we know how to carry over —
-    // fall back to the plain byte-restore semantics.
-    return original;
-  }
-  let merged = base;
-  let changed = false;
-  for (const key of PERSISTENT_WORKSPACE_KEYS) {
-    const value = afterDoc[key];
-    if (value === undefined) continue;
-    if (JSON.stringify(baseDoc[key]) === JSON.stringify(value)) continue;
-    merged = spliceWorkspaceKey(merged, key, value);
-    changed = true;
-  }
-  return changed ? merged : original;
+  return applyPersistentWrites(extractPersistentWrites(afterContent), original);
 }
 
 /**
@@ -1765,7 +1833,7 @@ function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, pref
   const originalWorkspaceBytes = existsSync(workspacePath) ? readFileSync(workspacePath) : undefined;
   let workspaceRestored = false;
   let workspaceRestoreError;
-  const restoreOriginalWorkspace = ({ preservePnpmWrites = false } = {}) => {
+  const restoreOriginalWorkspace = ({ preservePnpmWrites = false, persistentWrites } = {}) => {
     if (workspaceRestored) return true;
     try {
       // On success the restore is a merge: pnpm's own durable writes to the
@@ -1773,11 +1841,14 @@ function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, pref
       // explicitly pinned fresh release) survive, everything this transaction
       // wrote on top of the user's bytes does not. See
       // mergePersistentWorkspaceWrites for why a plain byte rollback here is
-      // a bug, not hygiene.
+      // a bug, not hygiene. `persistentWrites` overrides the disk read with a
+      // snapshot captured before approved scripts ran.
       let nextBytes = originalWorkspaceBytes;
       if (preservePnpmWrites) {
-        const onDisk = existsSync(workspacePath) ? readFileSync(workspacePath, "utf8") : undefined;
-        nextBytes = mergePersistentWorkspaceWrites(onDisk, originalWorkspaceBytes);
+        const writes = persistentWrites !== undefined
+          ? persistentWrites
+          : extractPersistentWrites(existsSync(workspacePath) ? readFileSync(workspacePath, "utf8") : undefined);
+        nextBytes = applyPersistentWrites(writes, originalWorkspaceBytes);
       }
       if (_restoreWorkspace !== undefined) {
         _restoreWorkspace(workspacePath, nextBytes);
@@ -2057,6 +2128,15 @@ function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, pref
     push("[dsh-plugin-mall] temporarily allowing them in the profile's pnpm-workspace.yaml and retrying once.\n");
 
     workspaceRestored = false; // allow writing temporary approved builds
+    // Snapshot pnpm's persistent writes BEFORE the rebuild runs. The add that
+    // produced them executed with every script blocked, so this delta is
+    // provably pnpm's own. Once the approved postinstall scripts execute they
+    // can write anything into this file — a broad release-age exemption would
+    // otherwise be laundered into the user's config as a "pnpm write" by the
+    // success-restore merge. Only this snapshot is merged afterwards.
+    const preRebuildPersistentWrites = extractPersistentWrites(
+      existsSync(workspacePath) ? readFileSync(workspacePath, "utf8") : undefined,
+    );
     try {
       const currentWs = existsSync(workspacePath) ? readFileSync(workspacePath, "utf8") : DEFAULT_WORKSPACE_YAML;
       const nextWs = enableApprovedBuildSelectors(currentWs, ignored.map((entry) => entry.selector));
@@ -2071,13 +2151,15 @@ function runInstallInner({ profile, spec, allowBuildScripts, approvedProof, pref
     const retryOutcome = await retry.done;
 
     // Restore workspace on EVERY branch (including success) before finalize.
-    // Success restores as a merge: the exemption pnpm recorded for the
-    // approved install's spec survives, the temporary approved-build bytes do
-    // not. Failure paths roll the bytes back wholesale.
+    // Success restores as a merge of the PRE-REBUILD snapshot only: the
+    // exemption pnpm recorded for the approved install's spec survives, the
+    // temporary approved-build bytes do not, and whatever the approved
+    // scripts wrote to the file during the rebuild does not either. Failure
+    // paths roll the bytes back wholesale.
     const retrySucceeded = retryOutcome.spawnError === undefined
       && !endedByCancel(retryOutcome, cancelRequested)
       && retryOutcome.exitCode === 0;
-    if (!restoreOriginalWorkspace(retrySucceeded ? { preservePnpmWrites: true } : {})) {
+    if (!restoreOriginalWorkspace(retrySucceeded ? { preservePnpmWrites: true, persistentWrites: preRebuildPersistentWrites } : {})) {
       return { status: "failed", detail: `approved scripts finished but pnpm-workspace.yaml could not be restored: ${workspaceRestoreError?.message ?? "unknown error"}` };
     }
 
@@ -2687,6 +2769,28 @@ const MERGE_WRITES_FIXTURES = [
     after: undefined,
     check: (d, text) => text === "packages:\n  - .\n",
   },
+  {
+    label: "原键是单引号写法 → 识别并替换，不追加重复键",
+    original: "packages:\n  - .\n'minimumReleaseAgeExclude':\n  - 'a@1.0.0'\n",
+    after: "packages:\n  - .\nminimumReleaseAgeExclude:\n  - 'a@1.0.0 || 9.9.9'\n",
+    check: (d, text) => d.minimumReleaseAgeExclude[0] === "a@1.0.0 || 9.9.9"
+      && text.split("\n").filter((l) => /['\"]?minimumReleaseAgeExclude['\"]?\s*:/.test(l)).length === 1
+      && text.includes("'minimumReleaseAgeExclude':"),
+  },
+  {
+    label: "原键是双引号写法 → 识别并替换，不追加重复键",
+    original: "packages:\n  - .\n\"minimumReleaseAgeExclude\":\n  - 'a@1.0.0'\n",
+    after: "packages:\n  - .\nminimumReleaseAgeExclude:\n  - 'a@2.0.0'\n",
+    check: (d, text) => d.minimumReleaseAgeExclude[0] === "a@2.0.0"
+      && text.split("\n").filter((l) => /['\"]?minimumReleaseAgeExclude['\"]?\s*:/.test(l)).length === 1,
+  },
+  {
+    label: "原文件本就有重复键（已损坏）→ 放弃合并，字节原样返回",
+    original: "packages:\n  - .\nminimumReleaseAgeExclude:\n  - 'a@1.0.0'\nminimumReleaseAgeExclude:\n  - 'b@1.0.0'\n",
+    after: "packages:\n  - .\nminimumReleaseAgeExclude:\n  - 'a@2.0.0'\n",
+    expectUnparsable: true, // js-yaml 4 拒绝重复键——原样返回的损坏文本解析不了是预期
+    check: (d, text) => text === "packages:\n  - .\nminimumReleaseAgeExclude:\n  - 'a@1.0.0'\nminimumReleaseAgeExclude:\n  - 'b@1.0.0'\n",
+  },
 ];
 
 function runMergeWritesFixtures() {
@@ -2696,11 +2800,14 @@ function runMergeWritesFixtures() {
     let out;
     try {
       out = mergePersistentWorkspaceWrites(fx.after, fx.original);
-      ok = out === undefined || typeof out === "string"
-        ? fx.check(out === undefined ? undefined : load(out), out) === true
-        : false;
-      // 任何产出都必须是可解析的 YAML（undefined 除外，那是删除语义）。
-      if (ok && typeof out === "string") load(out);
+      if (out === undefined || typeof out === "string") {
+        // 产出必须可解析（undefined 除外，那是删除语义）——除非用例本身
+        // 钉的就是「输入已损坏 → 原样返回」：原样的损坏文本解析不了。
+        if (typeof out === "string" && !fx.expectUnparsable) load(out);
+        ok = fx.check(fx.expectUnparsable ? undefined : out === undefined ? undefined : load(out), out) === true;
+      } else {
+        ok = false;
+      }
     } catch {
       ok = false;
     }
@@ -3198,6 +3305,64 @@ async function runTransactionFixtures() {
         "退出码非 0（豁免已落盘）→ 字节还原，豁免不保留",
         outcome.status === "failed" && finalWs === initialWs,
         `status=${outcome.status} finalWs=${JSON.stringify(finalWs)}`,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+
+  // 1b4. 批准执行的构建脚本篡改豁免 → 只有 rebuild 前捕获的 pnpm 豁免被
+  // 合并。已批准的 postinstall 在 rebuild 里跑过之后，磁盘上的 workspace
+  // 谁都能写：宽泛豁免若被当「pnpm 持久写入」合并，等于借审批之手把
+  // 供应链冷却期防线拆了。
+  {
+    const { profileDir, cleanup } = makeTempProfile("exemption-laundering");
+    try {
+      const initialWs = "packages:\n  - .\nnodeLinker: hoisted\n";
+      writeFileSync(join(profileDir, "pnpm-workspace.yaml"), initialWs);
+      materializeFakePackage(profileDir, "some-plugin", "1.0.0");
+      materializeFakePackage(profileDir, "node-pty", "1.0.0", { install: "node install.js" });
+      const approvedProof = computeMaterializedProof(profileDir, "some-plugin", [{ name: "node-pty", version: "1.0.0", selector: "node-pty@1.0.0" }]);
+      const wsPath = join(profileDir, "pnpm-workspace.yaml");
+      const writeWs = (exemptions) => {
+        const parsed = load(readFileSync(wsPath, "utf8"));
+        parsed.minimumReleaseAgeExclude = exemptions;
+        writeFileSync(wsPath, dump(parsed, { lineWidth: -1, noRefs: true, sortKeys: false }));
+      };
+      const { spawnFn } = scriptedSpawn([
+        {
+          // 第一次 add：脚本全禁，pnpm 为显式指定的冷却期版本记豁免。
+          code: 0,
+          out: "Ignored build scripts: node-pty@1.0.0\n",
+          beforeExit: () => writeWs(["some-plugin@1.0.0"]),
+        },
+        {
+          // rebuild：node-pty 的 postinstall（已获批准）顺手篡改豁免。
+          code: 0,
+          out: "Done\n",
+          beforeExit: () => writeWs(["some-plugin@1.0.0", "evil-pkg@*"]),
+        },
+      ]);
+      const producer = runInstall({
+        profile: "p",
+        spec: "some-plugin",
+        allowBuildScripts: ["node-pty"],
+        approvedProof,
+        preflight: preflightStub("some-plugin"),
+        _profileDir: profileDir,
+        _spawn: spawnFn,
+        _describe: describeStub,
+      });
+      const outcome = await producer.done;
+      const finalWs = readFileSync(wsPath, "utf8");
+      const finalDoc = load(finalWs);
+      check(
+        "批准脚本在 rebuild 里篡改豁免 → 只有 rebuild 前的 pnpm 豁免被合并，篡改不进用户配置",
+        outcome.status === "completed"
+          && JSON.stringify(finalDoc.minimumReleaseAgeExclude) === JSON.stringify(["some-plugin@1.0.0"])
+          && finalWs.includes("nodeLinker: hoisted")
+          && finalDoc.allowBuilds === undefined,
+        `status=${outcome.status} exemptions=${JSON.stringify(finalDoc.minimumReleaseAgeExclude)}`,
       );
     } finally {
       cleanup();
@@ -4169,7 +4334,9 @@ async function runTransactionFixtures() {
  */
 function runToggleFixtures() {
   let failed = 0;
+  let total = 0;
   const check = (label, ok, extra = "") => {
+    total += 1;
     if (!ok) failed++;
     console.log(`  ${ok ? "PASS" : "FAIL"} ${label}${ok ? "" : `  ${extra}`}`);
   };
@@ -4308,16 +4475,20 @@ function runToggleFixtures() {
     }
   })());
 
-  return failed;
+  return { failed, total };
 }
 
 if (process.argv[1]?.endsWith("installer.js") && process.argv.includes("--self-test")) {
   console.log("启用/停用 patch 层 fixtures:");
-  const toggleFailed = runToggleFixtures();
+  const toggle = runToggleFixtures();
   console.log();
   console.log("allowBuilds 合并 fixtures:");
-  const failed = runAllowBuildsFixtures() + toggleFailed;
-  console.log(`${ALLOW_BUILDS_FIXTURES.length - failed}/${ALLOW_BUILDS_FIXTURES.length} passed`);
+  const failed = runAllowBuildsFixtures() + toggle.failed;
+  // 分母要数全跑过的用例（toggle/neutralize/merge-writes 也在这批里），
+  // 只数 ALLOW_BUILDS_FIXTURES 会把后来加的组漏在「10/10」的假象外。
+  const fixtureTotal = ALLOW_BUILDS_FIXTURES.length + NEUTRALIZE_FIXTURES.length
+    + MERGE_WRITES_FIXTURES.length + toggle.total;
+  console.log(`${fixtureTotal - failed}/${fixtureTotal} passed`);
   // 实装 pnpm add 的参数/环境（纯函数）：peer 自动安装必须关闭，否则
   // marketplace 安装会把 @deepseek-ai 宿主依赖栈拉进 profile；构建脚本必须
   // 严格，否则 pnpm 退出码 0 却跳过构建脚本，批准闸形同虚设。
