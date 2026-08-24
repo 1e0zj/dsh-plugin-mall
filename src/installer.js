@@ -3393,6 +3393,56 @@ async function runTransactionFixtures() {
     }
   }
 
+  // 1b5. 端到端：pnpm 成功记了豁免，但用户的 workspace 用了合并器不认识的
+  // 写法（flow mapping——load 认得、顶格键定位不认得）→ 合并失败必须让
+  // 安装 failed 并回滚 profile，而不是报成功、静默丢豁免把雷留给下一次安装。
+  {
+    const { profileDir, cleanup } = makeTempProfile("exemption-merge-unmergeable");
+    try {
+      const initialWs = "{packages: ['.'], nodeLinker: hoisted, minimumReleaseAgeExclude: [a@1.0.0]}\n";
+      writeFileSync(join(profileDir, "pnpm-workspace.yaml"), initialWs);
+      materializeFakePackage(profileDir, "some-plugin", "1.0.0");
+      const manifestBefore = readFileSync(join(profileDir, "package.json"), "utf8");
+      const wsPath = join(profileDir, "pnpm-workspace.yaml");
+      const { spawnFn } = scriptedSpawn([
+        {
+          code: 0,
+          out: "Done\n",
+          beforeExit: () => {
+            // 模拟 pnpm：显式冷却期版本放行 + 记豁免 + 把依赖写进 manifest。
+            // pnpm 读写的是被 neutralize 重排过的 block 风格文件。
+            const parsed = load(readFileSync(wsPath, "utf8"));
+            parsed.minimumReleaseAgeExclude = ["a@2.0.0"];
+            writeFileSync(wsPath, dump(parsed, { lineWidth: -1, noRefs: true, sortKeys: false }));
+            const pkg = JSON.parse(readFileSync(join(profileDir, "package.json"), "utf8"));
+            pkg.dependencies = { ...(pkg.dependencies ?? {}), "some-plugin": "1.0.0" };
+            writeFileSync(join(profileDir, "package.json"), JSON.stringify(pkg, null, 2) + "\n");
+          },
+        },
+      ]);
+      const outcome = await runInstall({
+        profile: "p",
+        spec: "some-plugin",
+        preflight: preflightStub("some-plugin"),
+        _profileDir: profileDir,
+        _spawn: spawnFn,
+        _describe: describeStub,
+      }).done;
+      const finalWs = readFileSync(wsPath, "utf8");
+      check(
+        "pnpm 记豁免但 workspace 写法无法安全合并 → failed + 明说原因 + profile 原样 + marker 清除",
+        outcome.status === "failed"
+          && /cannot merge the release-age exemption/.test(outcome.detail ?? "")
+          && finalWs === initialWs
+          && readFileSync(join(profileDir, "package.json"), "utf8") === manifestBefore
+          && !existsSync(pendingMarkerPath(profileDir)),
+        `status=${outcome.status} detail=${JSON.stringify(outcome.detail)} finalWs=${JSON.stringify(finalWs)}`,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+
   // 1c. 攻击防御：批准后修改 postinstall / 文件内容 → retry 时 proof 校验失败，绝不重试并回滚
   {
     const { profileDir, cleanup } = makeTempProfile("attack-tampered-proof");
