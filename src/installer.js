@@ -840,20 +840,27 @@ function extractPersistentWrites(content) {
  * bytes. {@link mergePersistentWorkspaceWrites} for the full story; this is
  * the core that takes the writes as an object instead of a disk snapshot.
  *
- * Defensive by contract: if the merged text would not parse, or the spliced
- * key does not come out exactly once with exactly the values requested, the
- * original bytes are returned untouched — a lost exemption is a nuisance, a
- * corrupted workspace is an outage.
+ * Failing loudly by contract: when pnpm DID record something to merge but the
+ * merged text would not parse, or the spliced key does not come out exactly
+ * once with exactly the values requested, this THROWS. The caller
+ * (restoreOriginalWorkspace) turns that into a failed install with rollback.
+ * Silently returning the original bytes instead would report success while
+ * dropping the exemption — re-arming the lockfile policy against the very
+ * version this install just put on disk, which is the exact incident this
+ * merge exists to prevent. "Completed" must imply the exemption state is
+ * consistent with the lockfile.
  */
 function applyPersistentWrites(writes, originalContent) {
   const original = Buffer.isBuffer(originalContent) ? originalContent.toString("utf8") : originalContent;
-  if (writes === null || typeof writes !== "object") return original;
+  if (writes === null || typeof writes !== "object") {
+    throw new Error("persistent workspace writes must be an object");
+  }
   const base = typeof original === "string" ? original : DEFAULT_WORKSPACE_YAML;
   let baseDoc;
   try {
     baseDoc = load(base) ?? {};
-  } catch {
-    return original;
+  } catch (error) {
+    throw new Error(`cannot merge the release-age exemption pnpm recorded: pnpm-workspace.yaml does not parse (${error.message})`);
   }
   let merged = base;
   let changed = false;
@@ -873,11 +880,11 @@ function applyPersistentWrites(writes, originalContent) {
       // spelling in the original would otherwise leave a duplicate behind)
       // and must parse back to the exact values being merged.
       const occurrences = merged.split("\n").filter((line) => topLevelKeyRegex(key).test(line)).length;
-      if (occurrences !== 1) return original;
-      if (JSON.stringify(reparsed[key]) !== JSON.stringify(writes[key])) return original;
+      if (occurrences !== 1) throw new Error("the key does not appear exactly once after the merge");
+      if (JSON.stringify(reparsed[key]) !== JSON.stringify(writes[key])) throw new Error("the merged value does not round-trip");
     }
-  } catch {
-    return original;
+  } catch (error) {
+    throw new Error(`cannot merge the release-age exemption pnpm recorded into pnpm-workspace.yaml (${error.message}) — the file uses a YAML spelling this merge does not recognize; simplify the minimumReleaseAgeExclude entry and retry`);
   }
   return merged;
 }
@@ -898,7 +905,10 @@ function applyPersistentWrites(writes, originalContent) {
  *
  * So restoring on success is a merge, not a byte rollback: start from the
  * user's original bytes and splice in exactly the persistent keys pnpm wrote.
- * When pnpm wrote nothing persistent the original bytes come back unchanged.
+ * When pnpm wrote nothing persistent the original bytes come back unchanged;
+ * when pnpm wrote something that cannot be merged safely this throws (see
+ * applyPersistentWrites) so the install fails and rolls back instead of
+ * reporting success with a dropped exemption.
  *
  * Only call this with a disk state no install script has had a chance to
  * touch (or with a writes snapshot captured before they ran) — a script that
@@ -2785,31 +2795,45 @@ const MERGE_WRITES_FIXTURES = [
       && text.split("\n").filter((l) => /['\"]?minimumReleaseAgeExclude['\"]?\s*:/.test(l)).length === 1,
   },
   {
-    label: "原文件本就有重复键（已损坏）→ 放弃合并，字节原样返回",
+    label: "原文件本就有重复键（已损坏）→ 拒绝合并并抛错，绝不静默丢豁免",
     original: "packages:\n  - .\nminimumReleaseAgeExclude:\n  - 'a@1.0.0'\nminimumReleaseAgeExclude:\n  - 'b@1.0.0'\n",
     after: "packages:\n  - .\nminimumReleaseAgeExclude:\n  - 'a@2.0.0'\n",
-    expectUnparsable: true, // js-yaml 4 拒绝重复键——原样返回的损坏文本解析不了是预期
-    check: (d, text) => text === "packages:\n  - .\nminimumReleaseAgeExclude:\n  - 'a@1.0.0'\nminimumReleaseAgeExclude:\n  - 'b@1.0.0'\n",
+    expectThrow: /cannot merge the release-age exemption/,
+    check: () => false,
+  },
+  {
+    label: "豁免键用 alias 引用别处（复杂写法）→ 展开替换，语义等价、锚点不动",
+    original: "exemptions: &ex\n  - 'a@1.0.0'\npackages:\n  - .\nminimumReleaseAgeExclude: *ex\n",
+    after: "packages:\n  - .\nminimumReleaseAgeExclude:\n  - 'a@2.0.0'\n",
+    check: (d, text) => JSON.stringify(d.minimumReleaseAgeExclude) === JSON.stringify(["a@2.0.0"])
+      && text.includes("exemptions: &ex"),
+  },
+  {
+    label: "原文件 alias 指向不存在的锚点（解析失败）→ 抛错而非静默丢豁免",
+    original: "packages:\n  - .\nminimumReleaseAgeExclude: *missing\n",
+    after: "packages:\n  - .\nminimumReleaseAgeExclude:\n  - 'a@2.0.0'\n",
+    expectThrow: /does not parse/,
+    check: () => false,
   },
 ];
 
 function runMergeWritesFixtures() {
   let failed = 0;
   for (const fx of MERGE_WRITES_FIXTURES) {
-    let ok;
+    let ok = false;
     let out;
     try {
       out = mergePersistentWorkspaceWrites(fx.after, fx.original);
-      if (out === undefined || typeof out === "string") {
-        // 产出必须可解析（undefined 除外，那是删除语义）——除非用例本身
-        // 钉的就是「输入已损坏 → 原样返回」：原样的损坏文本解析不了。
-        if (typeof out === "string" && !fx.expectUnparsable) load(out);
-        ok = fx.check(fx.expectUnparsable ? undefined : out === undefined ? undefined : load(out), out) === true;
-      } else {
-        ok = false;
+      if (fx.expectThrow !== undefined) {
+        ok = false; // 该抛的没抛
+      } else if (out === undefined || typeof out === "string") {
+        // 产出必须可解析（undefined 除外，那是删除语义）。
+        if (typeof out === "string") load(out);
+        ok = fx.check(out === undefined ? undefined : load(out), out) === true;
       }
-    } catch {
-      ok = false;
+    } catch (error) {
+      ok = fx.expectThrow !== undefined && fx.expectThrow.test(error?.message ?? "");
+      if (!ok) console.log(`       抛错: ${error?.message}`);
     }
     if (!ok) failed++;
     console.log(`  ${ok ? "PASS" : "FAIL"} merge-writes: ${fx.label}`);
