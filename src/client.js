@@ -157,6 +157,28 @@ window.__ModuleLoader__.load({
       throw new Error("Secure browser randomness is unavailable; plugin marketplace actions are disabled");
     }
 
+    // 与 src/index.js 的 BROWSER_SESSION_RE 保持一致：sessionStorage 里的值
+    // 和任何存储一样是不可信输入，读出来必须重新过格式校验。
+    var BROWSER_SESSION_RE = /^sess_(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
+    var SESSION_NONCE_KEY = "@1e0zj/dsh-plugin-mall:session";
+    // nonce 存 sessionStorage（tab 级）：更新插件市场自身会替换正在运行的
+    // 市场包，组装树随之重放、整个市场 UI 重挂载——useRef 里的 nonce 归零，
+    // 而审批 token 只发给签发时的同一个 session，于是 needsApproval 暂停的
+    // 任务在重挂载后永远拿不回 token，用户点「允许」必报 initial install。
+    // 复用 tab 级 nonce 让重挂载仍是同一 session。必须 sessionStorage 而不是
+    // localStorage：新 tab 要各自生成自己的 nonce，跨 tab 共享会把「token
+    // 不泄露给其他 session」的门拆掉。存储被禁时退回纯内存生成，行为同
+    // 旧版（token 至少本次挂载内可用）。
+    function readOrCreateBrowserSession() {
+      try {
+        var stored = window.sessionStorage.getItem(SESSION_NONCE_KEY);
+        if (typeof stored === "string" && BROWSER_SESSION_RE.test(stored)) return stored;
+      } catch (e) { /* storage unavailable — fall through to in-memory */ }
+      var nonce = generateSessionNonce();
+      try { window.sessionStorage.setItem(SESSION_NONCE_KEY, nonce); } catch (e) { /* same */ }
+      return nonce;
+    }
+
     // ── job polling ─────────────────────────────────────────────────────────
     // onPreflightSettled：预检 job（kind=dsh-plugin-preflight）落定时回调，
     // 携带 (spec, report)。safe 由调用方直接续装；有风险由调用方出内联卡片。
@@ -789,7 +811,7 @@ window.__ModuleLoader__.load({
       // Opaque one-shot approval tokens issued from needsApproval outcomes (spec -> token).
       // Cleared on success, unrelated failure, cancel, modal close, or spec change.
       // No boolean warning-consent map is kept.
-      var sessionNonce = useRef(generateSessionNonce()).current;
+      var sessionNonce = useRef(readOrCreateBrowserSession()).current;
       var approvalTokensRef = useRef({});
       var restartControlRef = useRef({ mounted: true, ping: null });
       var clearRestartPing = useCallback(function () {

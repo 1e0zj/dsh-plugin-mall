@@ -3217,6 +3217,27 @@ export async function runSelfTests() {
     check("tracker 复制 producer 签发的 approvalToken（同 session 可见）",
       snapSameSession.approvalToken === trackerTok);
 
+    // 「重挂载」的后端前提：前端把 nonce 存进 sessionStorage 后，重挂载的
+    // UI 用同一个 session 再来。token 必须仍从 job 可恢复；另一个 tab 的
+    // nonce 即使拿到 token 字符串也消费不掉，且归属失败的尝试不许把正主
+    // 的 token 烧掉（报 session mismatch 而不是 already consumed）。
+    const remountSnap = sessionTracker.get(sessionJobId, "session-alpha").snapshot;
+    check("重挂载（同 nonce 复用）后 token 仍可从 job 恢复", remountSnap.approvalToken === trackerTok);
+    const wrongOwnerConsume = consumeApprovalToken({
+      token: trackerTok,
+      profile: "web",
+      profileDir,
+      spec: "foo-script",
+      preflightReport: cleanPreflightReport,
+      surface: "browser",
+      owner: "session-beta",
+    });
+    check("异 session 即使拿到 token 字符串也消费失败（session mismatch）",
+      wrongOwnerConsume.valid === false && /session mismatch/.test(wrongOwnerConsume.reason),
+      `reason=${wrongOwnerConsume.reason}`);
+    check("归属失败的尝试没有烧掉 token（仍以 session mismatch 而非 already consumed 报错，正主 token 完好）",
+      /session mismatch/.test(wrongOwnerConsume.reason) && sessionTracker.get(sessionJobId, "session-alpha").snapshot.approvalToken === trackerTok);
+
     let cancelRefused = false;
     try {
       sessionTracker.cancel(sessionJobId, "session-beta");
