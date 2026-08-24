@@ -157,6 +157,36 @@ window.__ModuleLoader__.load({
       throw new Error("Secure browser randomness is unavailable; plugin marketplace actions are disabled");
     }
 
+    // 与 src/index.js 的 BROWSER_SESSION_RE 保持一致：window 上的值同样是
+    // 不可信输入（别的脚本能写），读出来必须重新过格式校验。
+    var BROWSER_SESSION_RE = /^sess_(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
+    var SESSION_NONCE_PROP = "__dshPluginMallSession";
+    // nonce 挂在 window 上（进程内，不落任何存储）。
+    //
+    // 要解决的：更新插件市场自身会替换正在运行的市场包，组装树随之重放、
+    // 整个市场 UI 重挂载——useRef 里的 nonce 归零，而审批 token 只发给签发
+    // 时的同一个 session，于是 needsApproval 暂停的任务在重挂载后永远拿不回
+    // token，用户点「允许」必报 initial install。重挂载是 React 层的（页面
+    // 没有重新加载），window 对象自始至终是同一个，进程内值正好覆盖它。
+    //
+    // 不用 sessionStorage：它在 window.open(同源) 和浏览器「复制标签页」时
+    // 会被复制给新标签页。jobs 镜像里本就带着 approvalToken，nonce 再一起
+    // 复制过去，新标签页就同时拿到了 token 和它的归属身份——后端会认成同一
+    // 个 session，跨 tab 隔离（47db0c4）就此失效。window 上的值不随标签页
+    // 复制，新标签页天然是新身份。
+    //
+    // 代价：页面刷新（F5）后 nonce 重新生成，刷新前签发的 token 作废。这是
+    // 对的边界——刷新是用户主动重来，暂停的任务重启 dsh 即可撤回；而重挂载
+    // 是用户没做任何事的情况下被系统掀了桌子，那才是必须兜住的。
+    function readOrCreateBrowserSession(host) {
+      var scope = host || window;
+      var current = scope[SESSION_NONCE_PROP];
+      if (typeof current === "string" && BROWSER_SESSION_RE.test(current)) return current;
+      var nonce = generateSessionNonce();
+      scope[SESSION_NONCE_PROP] = nonce;
+      return nonce;
+    }
+
     // ── job polling ─────────────────────────────────────────────────────────
     // onPreflightSettled：预检 job（kind=dsh-plugin-preflight）落定时回调，
     // 携带 (spec, report)。safe 由调用方直接续装；有风险由调用方出内联卡片。
@@ -789,7 +819,7 @@ window.__ModuleLoader__.load({
       // Opaque one-shot approval tokens issued from needsApproval outcomes (spec -> token).
       // Cleared on success, unrelated failure, cancel, modal close, or spec change.
       // No boolean warning-consent map is kept.
-      var sessionNonce = useRef(generateSessionNonce()).current;
+      var sessionNonce = useRef(readOrCreateBrowserSession()).current;
       var approvalTokensRef = useRef({});
       var restartControlRef = useRef({ mounted: true, ping: null });
       var clearRestartPing = useCallback(function () {
@@ -1045,9 +1075,7 @@ window.__ModuleLoader__.load({
           // 响应语义是「已调度交接」而不是「重启成功」：新宿主何时接管
           // 由下面的轮询判断。这里只把输出会出现在哪里告诉用户。
           scheduledLogPath = value && value.logPath ? String(value.logPath) : null;
-          setRestartNote(value && value.mode === "visible"
-            ? "重启已调度——dsh 正在新的控制台窗口中启动，窗口里 Ctrl+C 可停止；输出同时写入 " + scheduledLogPath
-            : "重启已调度，输出与日志：" + (scheduledLogPath || "<home>/guard/ 下"));
+          setRestartNote("重启中，输出与日志：" + (scheduledLogPath || "<home>/guard/ 下"));
           var tries = 0;
           var ping = setInterval(function () {
             if (restartControlRef.current.mounted !== true) {

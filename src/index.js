@@ -3217,6 +3217,98 @@ export async function runSelfTests() {
     check("tracker 复制 producer 签发的 approvalToken（同 session 可见）",
       snapSameSession.approvalToken === trackerTok);
 
+    // 异 session 即使拿到 token 字符串也消费不掉，且归属失败的尝试不许把
+    // 正主的 token 烧掉（报 session mismatch，不是 already consumed）。
+    // jobs 镜像里带着 token，复制标签页能拿到那串字符——挡住它的正是归属。
+    const wrongOwnerConsume = consumeApprovalToken({
+      token: trackerTok,
+      profile: "web",
+      profileDir,
+      spec: "foo-script",
+      preflightReport: cleanPreflightReport,
+      surface: "browser",
+      owner: "session-beta",
+    });
+    check("异 session 即使拿到 token 字符串也消费失败（session mismatch）",
+      wrongOwnerConsume.valid === false && /session mismatch/.test(wrongOwnerConsume.reason),
+      `reason=${wrongOwnerConsume.reason}`);
+    check("归属失败的尝试没有烧掉 token（正主仍可取回）",
+      sessionTracker.get(sessionJobId, "session-alpha").snapshot.approvalToken === trackerTok);
+
+    // ── 前端 session 身份（client.js 的真实源码，跑在受控假环境里）────────
+    //
+    // 这段测的是浏览器那半边：nonce 怎么生成、什么时候复用、什么时候必须
+    // 换新。它从 src/client.js 里把函数定义原样抠出来执行——不是在这里重写
+    // 一份等价逻辑，否则改坏了 client.js 测试照样绿。
+    //
+    // 钉住的四件事，每一件都对应一个真实故障：
+    //   1. 重挂载复用 → 不复用就是 initial install 死锁（本次修的 bug）；
+    //   2. 新 window 必换新 → 换不了就是跨 tab 冒用别人的审批身份；
+    //   3. 非法值必换新 → 别的脚本写坏了不能就这么发给后端；
+    //   4. 全程不碰任何存储 → sessionStorage 会随「复制标签页」被复制，
+    //      而 jobs 镜像里就带着 token，一起复制过去等于连身份带凭证都送出。
+    {
+      const clientSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "client.js"), "utf8");
+      // 从 `function name(` 起按花括号配平截取，拿到完整定义。
+      const extractFunction = (name) => {
+        const start = clientSource.indexOf(`function ${name}(`);
+        if (start === -1) throw new Error(`client.js 里找不到 function ${name}`);
+        let depth = 0;
+        let seenBrace = false;
+        for (let i = start; i < clientSource.length; i++) {
+          const ch = clientSource[i];
+          if (ch === "{") { depth++; seenBrace = true; } else if (ch === "}") depth--;
+          if (seenBrace && depth === 0) return clientSource.slice(start, i + 1);
+        }
+        throw new Error(`function ${name} 的花括号不配平`);
+      };
+      const reLine = clientSource.split("\n").find((line) => line.includes("var BROWSER_SESSION_RE ="));
+      const propLine = clientSource.split("\n").find((line) => line.includes("var SESSION_NONCE_PROP ="));
+      if (reLine === undefined || propLine === undefined) throw new Error("client.js 里找不到 session 常量定义");
+      const snippet = [
+        reLine.trim(),
+        propLine.trim(),
+        extractFunction("generateSessionNonce"),
+        extractFunction("readOrCreateBrowserSession"),
+        "return { readOrCreateBrowserSession: readOrCreateBrowserSession, SESSION_NONCE_PROP: SESSION_NONCE_PROP, BROWSER_SESSION_RE: BROWSER_SESSION_RE };",
+      ].join("\n");
+      // window 传 undefined：函数只该碰传进来的 scope，碰全局 window 就 ReferenceError。
+      const front = new Function("window", snippet)(undefined);
+
+      // 假标签页：带一个会记账的 sessionStorage，用来证明它一次都没被碰过。
+      let storageTouches = 0;
+      const makeTab = () => ({
+        sessionStorage: {
+          getItem: () => { storageTouches++; return null; },
+          setItem: () => { storageTouches++; },
+        },
+      });
+
+      const tabA = makeTab();
+      const first = front.readOrCreateBrowserSession(tabA);
+      check("前端 session：首次挂载生成合法 nonce 并挂在 window 上",
+        front.BROWSER_SESSION_RE.test(first) && tabA[front.SESSION_NONCE_PROP] === first, `nonce=${first}`);
+
+      const remounted = front.readOrCreateBrowserSession(tabA);
+      check("前端 session：同一页面重挂载复用同一个 nonce（token 因此仍归本人）",
+        remounted === first);
+
+      const tabB = makeTab();
+      const otherTab = front.readOrCreateBrowserSession(tabB);
+      check("前端 session：新 window（新 tab / 复制标签页）拿到的是另一个 nonce",
+        front.BROWSER_SESSION_RE.test(otherTab) && otherTab !== first);
+
+      const tampered = makeTab();
+      tampered[front.SESSION_NONCE_PROP] = "sess_not-a-valid-nonce";
+      const replaced = front.readOrCreateBrowserSession(tampered);
+      check("前端 session：window 上的值格式非法 → 丢弃并重新生成",
+        front.BROWSER_SESSION_RE.test(replaced) && replaced !== "sess_not-a-valid-nonce"
+          && tampered[front.SESSION_NONCE_PROP] === replaced);
+
+      check("前端 session：全程不读写任何存储（sessionStorage 会随复制标签页一起复制，jobs 镜像里带着 token）",
+        storageTouches === 0, `touches=${storageTouches}`);
+    }
+
     let cancelRefused = false;
     try {
       sessionTracker.cancel(sessionJobId, "session-beta");
