@@ -128,6 +128,44 @@ pnpm --dir <profile> add "github:omdsh-dev/dsh-at-file" --ignore-scripts
 > `dsh-plugin-guard recover` does repair this.
 
 
+## Update stuck at the install-script approval card? (updates *to* 0.4.15)
+
+Symptom: updating the marketplace itself pauses at "安装期代码需要确认", and
+clicking 允许 fails with `allowBuildScripts cannot be specified on initial
+install`. Clicking again does not help.
+
+Who hits it: only profiles that have **never approved a dependency with install
+scripts** (in practice `node-pty`, pulled in transitively). If your profile's
+`pnpm-workspace.yaml` already carries `allowBuilds: {node-pty: true}` — most
+profiles that have installed anything do — the approval card never appears and
+the update just works.
+
+Cause: pnpm installs the new marketplace package before the approval gate, which
+swaps the running plugin on disk; dsh replays the assembly tree and the whole
+marketplace UI remounts, losing the browser session the approval token was
+issued to. The token is then unrecoverable, so the retry arrives without it.
+
+Recovery — restart dsh (startup recovery rolls the paused install back), then
+either update from the CLI:
+
+```bash
+# <profile> = web, guard-test, ...
+dsh plugin --profile <profile> add @1e0zj/dsh-plugin-mall@0.4.15
+```
+
+or pre-approve the build scripts once and update from the page as usual:
+
+```yaml
+# <profile>/pnpm-workspace.yaml
+allowBuilds:
+  'node-pty@1.1.0': true
+```
+
+> Fixed from 0.4.15 onward — the session identity now survives a remount. The
+> fix cannot rescue the hop *to* 0.4.15 itself: during that update both the
+> page's pre-swap code and the running dsh process are still the old version.
+
+
 ## Agent tools
 
 | Tool | What it does |
@@ -280,6 +318,40 @@ pnpm --dir <profile> add "github:omdsh-dev/dsh-at-file" --ignore-scripts
 > 就是后者——兜底一次也不会触发，恢复只会 fail-closed。main 上已修：兜底改钉
 > lockfile 解析出的版本（或 commit）。0.3.3 已修复——那个版本的
 > `dsh-plugin-guard recover` 确实能修这个故障。
+
+
+## 更新卡在批准卡上？（更新**到** 0.4.15 时可能遇到）
+
+症状：更新市场自己，停在「安装期代码需要确认」，点「允许」报
+`allowBuildScripts cannot be specified on initial install`，再点还是这样。
+
+谁会遇到：只有**从未批准过带安装脚本的依赖**的 profile（实际就是传递依赖
+`node-pty`）。如果你的 `pnpm-workspace.yaml` 里已经有
+`allowBuilds: {node-pty: true}`——装过东西的 profile 基本都有——批准卡根本
+不会出现，更新一次过。
+
+原因：pnpm 在批准闸之前就把新版市场装进了 node_modules，正在运行的插件实体
+被替换，dsh 随之重放装配树、整个市场 UI 重挂载，签发审批 token 时的那个浏览器
+session 一起没了。token 从此取不回来，重试自然是「没带 token」。
+
+出路——重启 dsh（启动恢复会把暂停的安装撤回），然后二选一。命令行更新：
+
+```bash
+# <profile> = web、guard-test……
+dsh plugin --profile <profile> add @1e0zj/dsh-plugin-mall@0.4.15
+```
+
+或者先把构建脚本批准一次，再照常从页面更新：
+
+```yaml
+# <profile>/pnpm-workspace.yaml
+allowBuilds:
+  'node-pty@1.1.0': true
+```
+
+> 0.4.15 起已修复——session 身份现在扛得住重挂载。但这个修复救不了「更新到
+> 0.4.15」这一跳本身：那次更新时，页面上 swap 之前的代码和正在跑的 dsh 进程
+> 都还是旧版。
 
 
 ## 工作原理
