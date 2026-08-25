@@ -3309,6 +3309,62 @@ export async function runSelfTests() {
         storageTouches === 0, `touches=${storageTouches}`);
     }
 
+    // 已装列表「更新至 X」的防连点判据。同样从 src/client.js 原样抠出来跑
+    // ——它在浏览器里是 React 闭包，测不到；提成纯函数就是为了能在这里钉住。
+    //
+    // 钉住的两件事，各对应一个真实的洞：
+    //   1. 按包名判定 —— 按 spec 判定会在服务端解析之后丢失目标；
+    //   2. 锁到 job 终态 —— 只锁 RPC 往返的话，jobId 一返回按钮就复活，而那
+    //      时 pnpm 还一步都没跑。
+    {
+      const clientSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "client.js"), "utf8");
+      const begin = clientSource.indexOf("// ── 更新按钮的防连点判据 ─");
+      const end = clientSource.indexOf("// ── 更新按钮的防连点判据结束 ─");
+      if (begin === -1 || end === -1 || end < begin) throw new Error("client.js 里找不到「更新按钮的防连点判据」整段");
+      // 整段抠，不是逐个函数挑：依赖（isJobActive、specPackageName）就在段内，
+      // 往段里加函数会自动被测到，搬出段外则当场 ReferenceError。
+      const front = new Function([
+        clientSource.slice(begin, end),
+        "return { specPackageName, updateChainBusy };",
+      ].join("\n"))();
+
+      const busy = (patch, name) => front.updateChainBusy(
+        Object.assign({ updating: {}, installing: {}, card: null, jobs: {} }, patch), name);
+      const running = (spec) => ({ spec, status: "running" });
+
+      check("更新防连点：裸包名折算", front.specPackageName("foo") === "foo");
+      check("更新防连点：带版本折算", front.specPackageName("foo@1.2.3") === "foo");
+      check("更新防连点：scoped 折算", front.specPackageName("@a/b@9.9.9") === "@a/b");
+      check("更新防连点：非 npm 形态返回 null", front.specPackageName("github:o/r") === null);
+
+      check("更新防连点：点击到 job 建立之间靠同步 ref 挡住（第二次点击）",
+        busy({ updating: { foo: true } }, "foo") === true);
+      check("更新防连点：预检 job 在跑时锁着",
+        busy({ jobs: { a: running("foo@1.2.3") } }, "foo") === true);
+      check("更新防连点：预检落终态、安装 RPC 在途的空档也锁着",
+        busy({ installing: { "foo@1.2.3": true }, jobs: { a: { spec: "foo@1.2.3", status: "completed" } } }, "foo") === true);
+      check("更新防连点：安装 job 在跑时锁着（RPC 早返回了，pnpm 才刚开始）",
+        busy({ jobs: { a: running("foo@1.2.3") } }, "foo") === true);
+      check("更新防连点：stopping 也算在跑",
+        busy({ jobs: { a: { spec: "foo@1.2.3", status: "stopping" } } }, "foo") === true);
+      check("更新防连点：停在批准卡片上（failed + needsApproval）算未了结",
+        busy({ jobs: { a: { spec: "foo@1.2.3", status: "failed", needsApproval: [{ name: "x" }] } } }, "foo") === true);
+      check("更新防连点：停在风险卡片上时锁着（决定还没做，再起一条就是两条链）",
+        busy({ card: { spec: "foo@1.2.3" } }, "foo") === true);
+
+      check("更新防连点：job 落终态后解锁，用户可以重试",
+        busy({ jobs: { a: { spec: "foo@1.2.3", status: "failed" } } }, "foo") === false);
+      check("更新防连点：completed 后解锁",
+        busy({ jobs: { a: { spec: "foo@1.2.3", status: "completed" } } }, "foo") === false);
+      check("更新防连点：别的包在跑不锁本行",
+        busy({ jobs: { a: running("bar@1.0.0") } }, "foo") === false);
+      check("更新防连点：风险卡片停在别的包上不锁本行",
+        busy({ card: { spec: "bar@1.0.0" } }, "foo") === false);
+      check("更新防连点：什么都没在途 → 不锁", busy({}, "foo") === false);
+      check("更新防连点：包名为 null 时不误判",
+        busy({ jobs: { a: running("foo@1.2.3") } }, null) === false);
+    }
+
     let cancelRefused = false;
     try {
       sessionTracker.cancel(sessionJobId, "session-beta");
