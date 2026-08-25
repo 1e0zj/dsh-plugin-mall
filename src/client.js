@@ -128,9 +128,65 @@ window.__ModuleLoader__.load({
       return String(e && e.message ? e.message : e);
     }
 
+    // ── 更新按钮的防连点判据 ────────────────────────────────────────────────
+    //
+    // 纯函数，不碰 React；index.js 的 --self-test 把这一整段从本文件里原样抠
+    // 出来跑（同下面 session nonce 那段的做法），所以改坏了这里测试会红。
+    // 往段里加函数会自动被测到，把函数搬出去则当场 ReferenceError。
+
     function isJobActive(status) {
       return status === "running" || status === "stopping";
     }
+
+    // spec → npm 包名。**按包名、不按 spec** 是这段的关键：同一条更新链在不同
+    // 阶段的 spec 并不一样（点的是 foo@1.2.3，服务端防抢注解析后 track 存下的
+    // 可能是别的形态），按 spec 盯就会在解析之后丢失目标。
+    // 与服务端 npmNameOf（github.js）同一套形状；非 npm 形态返回 null。
+    function specPackageName(spec) {
+      if (typeof spec !== "string" || spec.length === 0) return null;
+      if (spec.charAt(0) === "@") {
+        var scoped = /^(@[^/@\s]+\/[^/@\s]+?)(?:@[^/\s]+)?$/.exec(spec);
+        return scoped === null ? null : scoped[1];
+      }
+      var bare = /^([^@/\s:]+)(?:@[^/\s]+)?$/.exec(spec);
+      return bare === null ? null : bare[1];
+    }
+
+    // 这个包上有没有一条没了结的更新链。三段接力，中间不能断：
+    //
+    //   updating   点击 → 预检 job 建立。这段 jobs 里还什么都没有，只有同步
+    //              的 ref 挡得住同一拍里的第二次点击。
+    //   installing 预检落终态 → 安装 job 建立。预检那条已经不 active 了，
+    //              安装那条还没 track 上，中间这一拍靠它顶住。
+    //   jobs       job 全程。**RPC 返回只意味着 job 建好了，pnpm 还没开始跑**
+    //              ——锁必须持续到 job 落终态，不是到 RPC 返回。
+    //              needsApproval 的 status 是 failed，但那是等用户决定的暂停，
+    //              事务没结束，算未了结。
+    //   card       预检出了风险卡片，停在那里等用户读完再决定。这期间任务是
+    //              终态，但决定还没做，再起一条链就是两条链抢同一个事务。
+    //
+    // sources 里递进来的必须是 ref.current 这类当下的值：判定发生在点击那一
+    // 刻，上一次渲染的快照没有意义。
+    function updateChainBusy(sources, name) {
+      if (name === null || name === undefined) return false;
+      if ((sources.updating || {})[name] === true) return true;
+      var installing = sources.installing || {};
+      for (var spec in installing) {
+        if (installing[spec] === true && specPackageName(spec) === name) return true;
+      }
+      var card = sources.card;
+      if (card && specPackageName(card.spec) === name) return true;
+      var jobs = sources.jobs || {};
+      for (var id in jobs) {
+        var job = jobs[id];
+        if (!job || typeof job.spec !== "string") continue;
+        if (specPackageName(job.spec) !== name) continue;
+        if (isJobActive(job.status)) return true;
+        if (Array.isArray(job.needsApproval) && job.needsApproval.length > 0) return true;
+      }
+      return false;
+    }
+    // ── 更新按钮的防连点判据结束 ────────────────────────────────────────────
 
     function kindLabel(kind) {
       if (kind === "bundle") return "宿主插件层";
@@ -344,7 +400,8 @@ window.__ModuleLoader__.load({
         }
         commit(next);
       }, [commit]);
-      return { jobs: jobs, track: track, drop: drop, setStatus: setStatus, restore: restore };
+      // jobsRef 一并交出去：防连点的判定读的是当下的值，不是渲染快照。
+      return { jobs: jobs, jobsRef: jobsRef, track: track, drop: drop, setStatus: setStatus, restore: restore };
     }
 
     // ── plugin verification badge ───────────────────────────────────────────
@@ -715,6 +772,7 @@ window.__ModuleLoader__.load({
               var togglable = entry !== undefined && dep.name !== MARKET_PACKAGE;
               var enabled = entry === undefined ? true : entry.enabled !== false;
               var toggling = (props.toggling || {})[dep.name] === true;
+              var updating = props.isUpdating(dep.name);
               return h("div", { key: dep.name, className: "mkt_depRow" },
                 h("span", { className: "mkt_desc" + (enabled ? "" : " mkt_depOff") }, dep.name + "@" + dep.version),
                 h("span", { className: "mkt_depActions" },
@@ -728,8 +786,11 @@ window.__ModuleLoader__.load({
                   }, h("span", { className: "mkt_switchKnob" })) : null,
                   upd && upd.hasUpdate ? h("button", {
                     className: "mkt_btn mkt_btnSm",
-                    onClick: function () { props.onInstallSpec(dep.name + "@" + upd.latest); },
-                  }, "更新至 " + upd.latest) : null,
+                    // 和 doUpdate 里的守卫读同一个判据，两边不会漂移——不一致
+                    // 就会出现「按钮看着能点，点了什么也不发生」。
+                    disabled: updating,
+                    onClick: function () { props.onUpdate(dep.name, dep.name + "@" + upd.latest); },
+                  }, updating ? "更新中…" : "更新至 " + upd.latest) : null,
                   h("button", {
                     className: "mkt_btn mkt_btnDanger mkt_btnSm",
                     disabled: busy,
@@ -815,6 +876,19 @@ window.__ModuleLoader__.load({
       var _preflight = useState(null);
       var preflight = _preflight[0];
       var setPreflight = _preflight[1];
+
+      // 更新按钮防连点用的三份当下值（见 updateChainBusy）。ref 而不是 state：
+      // 判定发生在点击那一刻，而 setState 到重渲染之间还有一拍能点。ref 不触发
+      // 渲染，所以每次改动配一次 bumpBusy，让按钮当场变样。
+      var updatingRef = useRef({});   // 包名 -> true，点击到预检 job 建立之间
+      var installingRef = useRef({}); // spec  -> true，安装 RPC 在途
+      var preflightRef = useRef(null);
+      preflightRef.current = preflight; // 渲染期同步，同 resultsRef 的写法
+      var _busyTick = useState(0);
+      var setBusyTick = _busyTick[1];
+      var bumpBusy = useCallback(function () {
+        setBusyTick(function (n) { return n + 1; });
+      }, []);
 
       // Opaque one-shot approval tokens issued from needsApproval outcomes (spec -> token).
       // Cleared on success, unrelated failure, cancel, modal close, or spec change.
@@ -983,6 +1057,17 @@ window.__ModuleLoader__.load({
       var polling = useJobPolling(call, onJobSettled, onApprovalToken, onPreflightSettled);
       var track = polling.track;
       var jobs = polling.jobs;
+      var jobsRef = polling.jobsRef;
+
+      // 按钮的 disabled 和 handler 里的守卫都读这一个函数，两边不会漂移。
+      var updateBusy = useCallback(function (packageName) {
+        return updateChainBusy({
+          updating: updatingRef.current,
+          installing: installingRef.current,
+          card: preflightRef.current,
+          jobs: jobsRef.current,
+        }, packageName);
+      }, [jobsRef]);
       var dropJob = polling.drop;
       var setJobStatus = polling.setStatus;
 
@@ -1000,6 +1085,10 @@ window.__ModuleLoader__.load({
       }, []);
 
       var doRawInstall = useCallback(function (spec, extra, carryFromId) {
+        // ref 与 state 同时置位：state 负责触发渲染，ref 才是判定读的那一份
+        // （见 updateChainBusy）。这一段是预检 job 已落终态、安装 job 还没
+        // track 上的空档，中间断一拍更新按钮就会复活。
+        installingRef.current[spec] = true;
         setInstalling(function (prev) {
           var next = Object.assign({}, prev, { [spec]: true });
           return next;
@@ -1012,6 +1101,7 @@ window.__ModuleLoader__.load({
           delete approvalTokensRef.current[spec];
           reportError("tasks", e);
         }).finally(function () {
+          delete installingRef.current[spec];
           setInstalling(function (prev) {
             var next = Object.assign({}, prev);
             delete next[spec];
@@ -1048,19 +1138,43 @@ window.__ModuleLoader__.load({
 
       // 点安装 = 立刻起一个预检 job，面板马上有东西看、日志实时流。
       // 结论由轮询经 onPreflightSettled 交回上面的 handler，这里不等待。
-      var preflightAndInstall = useCallback(function (spec) {
+      // onStarted：RPC 落定（不论成败）时回调一次。更新按钮用它把「点击 →
+      // job 建立」这一段的锁交给 job，市场卡片不传，行为一字未变。
+      var preflightAndInstall = useCallback(function (spec, onStarted) {
         delete approvalTokensRef.current[spec];
         setError(null);
         call("preflight", { spec: spec }).then(function (value) {
           track(value.jobId, value.spec || spec);
         }).catch(function (e) {
           reportError("tasks", e);
+        }).finally(function () {
+          if (typeof onStarted === "function") onStarted();
         });
       }, [call, reportError, track]);
 
       var doInstall = useCallback(function (repo) {
         preflightAndInstall("github:" + repo);
       }, [preflightAndInstall]);
+
+      // 已装列表的「更新至 X」。此前它是那一行里唯一没有 disabled 的按钮，
+      // 而起链要走联网的 registry 解析，那几秒里 jobs 还是空的、按钮还是可点
+      // 的——连点几下就是几条预检+安装链，profile 事务队列会把它们排队串行
+      // 跑完，同一个版本被反复装好几遍。
+      //
+      // 守卫按包名（updateChainBusy 的注释说明了为什么不能按 spec），同步的
+      // ref 挡住同一拍里的第二次点击；RPC 返回只解开 updating 那一段，之后由
+      // 对应的 job 接管，锁一直持续到 job 落终态。
+      var doUpdate = useCallback(function (packageName, spec) {
+        if (updateBusy(packageName)) return;
+        updatingRef.current[packageName] = true;
+        bumpBusy();
+        preflightAndInstall(spec, function () {
+          // preflight RPC 已返回：jobs 里已经有条目接手，这里才允许松手。
+          // 顺序反过来会闪出一拍「谁都不认为它在忙」的可点窗口。
+          delete updatingRef.current[packageName];
+          bumpBusy();
+        });
+      }, [preflightAndInstall, updateBusy, bumpBusy]);
 
       var doRestart = useCallback(function () {
         clearRestartPing();
@@ -1185,7 +1299,8 @@ window.__ModuleLoader__.load({
           toggling: toggling,
           onToggle: doToggle,
           onUninstall: doUninstall,
-          onInstallSpec: preflightAndInstall,
+          onUpdate: doUpdate,
+          isUpdating: updateBusy,
           error: error && error.scope === "installed" ? error.message : null,
         }),
         h(JobsPanel, {
