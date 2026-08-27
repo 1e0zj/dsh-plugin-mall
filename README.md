@@ -15,7 +15,7 @@ Curated lists only show what has been reviewed and merged. This marketplace is o
 - **Anti-squatting** — an install prefers the npm tarball only when the registry entry's `repository` URL points back to the same GitHub repo; anything else falls back to the explicit `github:` spec.
 - **npm-first installs** — registry tarballs are smaller than whole-repo GitHub downloads and come with integrity checks. Lookups follow the registry pnpm actually installs from (profile `.npmrc` → `pnpm config get registry` → npmjs), so a mirror user keeps npm-first instead of silently falling back to whole-repo clones.
 - **Update management** — installed plugins are compared against the registry `latest`; one-click update per plugin.
-- **Conflict guard** — every install runs an isolated preflight first: the candidate is installed with scripts disabled into a throwaway directory and scanned against the live profile for loader-id collisions, double mounts, host-module shadowing and version/OS/peer ranges. A patch layer is not read entry by entry but composed the way the loader applies it — the profile is assembled with and without the candidate's layer, in the position dsh would apply it, and the two trees are diffed. That composition is checked against the loader's own `applyEntryPatches` on every test run, over fixed shapes and 300 generated patch combinations, so "what dsh would boot" is not a guess. What gets reported is what would actually change: disabling, re-enabling or replacing the config of someone else's rows warns and names them, past ten such rows the candidate is a rival composition rather than an addition and is blocked, and a bundle that is itself another front door (own `bin`, terminal peers, no browser half) is blocked once it switches rows on or off or rewrites a protection row — the fingerprint corroborates, it never blocks on its own. A hard conflict is blocked, warnings require explicit confirmation. The profile's load-bearing files are snapshotted before `pnpm` touches them and restored on failure. A pending install is resolved on the next start, however you start it: this plugin runs recovery as it loads, which only happens because dsh booted far enough to compose the profile. Starting through `guard launch` adds a grace window on top, so a plugin that boots and then crashes seconds later is rolled back and restarted once (see [Startup protection](#startup-protection-guard-cli)).
+- **Conflict guard** — every install runs an isolated preflight first: the candidate is installed with scripts disabled into a throwaway directory and scanned against the live profile for loader-id collisions, double mounts, host-module shadowing and version/OS/peer ranges. A patch layer is not read entry by entry but composed the way the loader applies it — the profile is assembled with and without the candidate's layer, in the position dsh would apply it, and the two trees are diffed. That composition is checked against the loader's own `applyEntryPatches` on every test run, over fixed shapes and 300 generated patch combinations, so "what dsh would boot" is not a guess. What gets reported is what would actually change: disabling, re-enabling or replacing the config of someone else's rows warns and names them, past ten such rows the candidate is a rival composition rather than an addition and is blocked, and a bundle that is itself another front door (own `bin`, terminal peers, no browser half) is blocked once it switches rows on or off or rewrites a protection row — the fingerprint corroborates, it never blocks on its own. A hard conflict is blocked, warnings require explicit confirmation. The profile's load-bearing files are snapshotted before `pnpm` touches them and restored on failure. A pending install is resolved on the next start, however you start it: this plugin runs recovery as it loads. That proof is narrower than it sounds — it means the loader reached the marketplace's position, not that the whole tree composed ([#24](https://github.com/1e0zj/dsh-plugin-mall/issues/24)). Starting through `guard launch` adds a grace window on top, covering both a plugin that crashes seconds later and an import/apply failure in an entry after the marketplace (see [Startup protection](#startup-protection-guard-cli)).
 - **Resilience** — rate-limit circuit breaker, GitHub's 1000-result search window handled gracefully, `corepack enable pnpm` self-heal when pnpm is missing, one-click dsh restart (loopback-only, `allowRestart: false` to disable). The outgoing Host exits only after the on-disk helper explicitly acknowledges the current handoff protocol and stays alive through a stability window; a missing, stale or incompatible helper leaves the existing Web service running. The successor then waits for the outgoing host to be gone before it binds — starting into an occupied port would read as "the pending plugin crashed dsh" and roll back an install that was fine. On Windows started from an interactive terminal, the restart runs in a **visible console window** (`cmd /c start`; the wrapped argv travels as a JSON plan file, never through the cmd command line): output is teed to the window and to the log, and **closing the window terminates the whole guard/dsh tree** (the close event bypasses console input processing entirely, so it always works). Ctrl+C in the window is honored best-effort — live testing showed a component inside dsh can flip the console into raw mode, after which no process on that console receives Ctrl+C at all; closing the window is the reliable stop. Service/scheduled-task/TTY-less Windows and every other platform keep the fully background behavior — no stray console, no re-opened browser (the page that asked is still there and reconnects on its own); whatever the restart prints lands in `<home>/guard/restart-<profile>.log`.
 
 ## Install
@@ -57,6 +57,10 @@ Restart dsh after installing.
 
 ## Startup protection (guard CLI)
 
+> **Known issue — every version since v0.3.4, including v0.4.17 ([#24](https://github.com/1e0zj/dsh-plugin-mall/issues/24)):** a plain `dsh web` start may commit and delete the pending snapshot as soon as the marketplace plugin loads, before later loader entries have finished loading. Downgrading is not a workaround — you would have to go back before v0.3.4 and give up every fix since. If a later entry fails, automatic rollback is no longer available. Until #24 is fixed, use `guard launch` for the first restart after every marketplace install or update. The marketplace's **"Restart dsh" button already uses the guarded restart path** (it spawns `guard launch --await-exit`), so restarting from the UI is safe.
+>
+> If the log already shows `startup recovery: committed` and the start then fails, `guard recover` usually has no snapshot left to restore — repair `cordis.patch.yml` by hand, or restore a profile backup.
+
 The last line of defense is at **startup**. The package ships a standalone, host-independent CLI (bin `dsh-plugin-guard`, also runnable by path):
 
 ```powershell
@@ -79,16 +83,23 @@ node <profile>/node_modules/@1e0zj/dsh-plugin-mall/src/cli.js guard launch --pro
 ```
 
 **A plain `dsh web` already resolves pending installs.** The marketplace plugin runs
-recovery when it loads: reaching that point proves dsh booted far enough to compose
-the profile, so the pending marker is committed — or rolled back, either because the
-profile fails validation or because the install was left paused at the build-script
-approval gate (an unapproved install is never committed, however healthy it looks).
-Without this a single install would wedge the profile — every later install and
-uninstall refuses while a marker is outstanding.
+recovery when it loads, so the pending marker is committed — or rolled back, either
+because the profile fails validation or because the install was left paused at the
+build-script approval gate (an unapproved install is never committed, however healthy
+it looks). Without this a single install would wedge the profile — every later install
+and uninstall refuses while a marker is outstanding.
 
-**`guard launch` is still strictly better**, because it also covers what a plain
-start cannot: a plugin that boots fine and then crashes seconds later. It checks the
-profile's pending-install marker before starting the command after `--`:
+**What a plain start actually proves is narrower than it looks:** reaching the
+marketplace's own `apply` only means the loader got *as far as the position the
+marketplace occupies* — it does not mean the whole plugin tree composed. Entries
+after it may still fail to import or apply, and by then the snapshot is already
+gone (that is [#24](https://github.com/1e0zj/dsh-plugin-mall/issues/24)).
+
+**`guard launch` is still strictly better**, and for two reasons rather than one:
+it covers a plugin that boots fine and then crashes seconds later, **and** it covers
+an import/apply failure in a loader entry that comes after the marketplace — the
+case a plain start commits straight through. It checks the profile's pending-install
+marker before starting the command after `--`:
 
 - **No pending install** — the command runs as-is, inheriting the terminal, and its exit code is preserved.
 - **Clearly broken on disk** — the profile is rolled back to its pre-install snapshot *before* launch, then the command starts on the restored state.
@@ -191,7 +202,7 @@ allowBuilds:
 - **防抢注**：仅当 npm registry 条目的 `repository` 指回同一 GitHub 仓库时才用 npm 安装，否则回退 `github:` 源
 - **npm 优先安装**：registry tarball 比整仓库下载更小且带完整性校验；查询用的 registry 跟随 pnpm 实际安装源（profile `.npmrc` → `pnpm config get registry` → npmjs），换了镜像也不会退化成整仓库克隆
 - **更新管理**：已装插件与 registry `latest` 比对，逐个一键更新
-- **冲突防护**：每次安装先跑隔离预检——候选包在一次性目录里以禁用脚本的方式装好后，对照 live profile 扫描 loader-id 冲突、重复挂载、宿主模块遮蔽和版本/OS/peer 范围。补丁不是逐条读，而是**按 loader 的方式组装**——把候选包的层放进 dsh 会放的位置，装前装后各组装一棵树再逐行比对。这套组装每次跑测试都会和 loader 自己的 `applyEntryPatches` 对拍（固定形状 + 300 组随机生成的补丁组合），所以「dsh 会装出什么树」不是猜的。报出来的是真正会变的东西：停用、重新启用、或替换别人整块 config，都点名是哪几条 id 并警告；超过十条就不是叠加而是另一套组合，直接拦截；候选包本身就是另一套门面（自带 bin、依赖终端栈、没有浏览器半边）时，只要它停用/启用了行、或改了沙箱审批这类保护行，就直接拦截——指纹只做佐证，单凭它不拦。硬冲突直接拦截，警告需显式确认。安装前给 profile 的承重文件拍快照、失败即回滚；pending 安装在下次启动时自动了结，**不挑启动方式**：本插件加载时就跑恢复，而能加载本身就证明 dsh 已经组装好 profile、活到了这一步。经 `guard launch` 启动则多一层观察期——插件启动几秒后才崩的情况也能回滚并原样重启一次（见下方「启动保护」）。
+- **冲突防护**：每次安装先跑隔离预检——候选包在一次性目录里以禁用脚本的方式装好后，对照 live profile 扫描 loader-id 冲突、重复挂载、宿主模块遮蔽和版本/OS/peer 范围。补丁不是逐条读，而是**按 loader 的方式组装**——把候选包的层放进 dsh 会放的位置，装前装后各组装一棵树再逐行比对。这套组装每次跑测试都会和 loader 自己的 `applyEntryPatches` 对拍（固定形状 + 300 组随机生成的补丁组合），所以「dsh 会装出什么树」不是猜的。报出来的是真正会变的东西：停用、重新启用、或替换别人整块 config，都点名是哪几条 id 并警告；超过十条就不是叠加而是另一套组合，直接拦截；候选包本身就是另一套门面（自带 bin、依赖终端栈、没有浏览器半边）时，只要它停用/启用了行、或改了沙箱审批这类保护行，就直接拦截——指纹只做佐证，单凭它不拦。硬冲突直接拦截，警告需显式确认。安装前给 profile 的承重文件拍快照、失败即回滚；pending 安装在下次启动时自动了结，**不挑启动方式**：本插件加载时就跑恢复。但这份证明比听上去窄——它只说明 loader 执行到了市场所在的位置，不代表整棵树组装成功（[#24](https://github.com/1e0zj/dsh-plugin-mall/issues/24)）。经 `guard launch` 启动则多一层观察期，既覆盖「启动几秒后才崩」，也覆盖「排在市场后面的 entry 加载失败」（见下方「启动保护」）。
 - **工程韧性**：限流熔断、GitHub 5xx/超时退避重试（504 瞬时故障不再直达用户）、GitHub 1000 条搜索上限优雅处理、pnpm 缺失时 `corepack` 自愈、一键重启 dsh（仅 loopback，可 `allowRestart: false` 关闭）。旧 Host 只有在磁盘上的 helper 明确回报当前交接协议、并活过稳定窗口后才退出；helper 缺失、过旧或协议不兼容时，现有 Web 服务继续运行。之后 successor 会**等旧进程真正退出**再绑端口——抢在端口没释放时启动，会被判成「新装的插件把 dsh 搞崩了」，把一次本来正常的安装回滚掉。交互式 Windows 终端下，重启跑在一个**可见的控制台窗口**里（`cmd /c start` 拉起；被重启命令的 argv 走 JSON 计划文件，绝不经过 cmd 命令行）：输出同时打到窗口和日志，**关闭窗口即终止整组 guard/dsh 进程树**（关窗事件不走控制台输入处理，永远有效）；窗口里的 Ctrl+C 尽力而为——真机实测 dsh 内部组件可能把控制台翻成 raw mode，此后该控制台上任何进程都收不到 Ctrl+C，关窗才是可靠的停止方式；服务/计划任务/无 TTY 的 Windows 与其他平台维持全后台行为——不留控制台窗口、也不再重开浏览器：发起重启的那个页面还在，会自己重连；重启过程的输出写进 `<home>/guard/restart-<profile>.log`（后台模式想停 dsh 用任务管理器结束 node 进程）
 
 ## 安装
@@ -256,6 +267,10 @@ dsh plugin --profile web add link:C:\path\to\dsh-plugin-mall
 
 ## 启动保护（guard CLI）
 
+> **已知问题——0.3.4 起的所有版本，包括 0.4.17（[#24](https://github.com/1e0zj/dsh-plugin-mall/issues/24)）：** 普通 `dsh web` 会在插件市场自身加载时就提前提交并删除 pending snapshot，此时后续的 loader entry 可能还没加载。降级不是规避手段——要退到 0.3.4 之前，等于放弃此后的全部修复。若后续加载失败，自动回滚点已经丢失。在 #24 修复前，**每次从市场安装或更新后，第一次重启请使用 `guard launch`**；市场里的**「重启 dsh」按钮已经走带保护的重启路径**（它拉起的就是 `guard launch --await-exit`），从界面上点重启是安全的。
+>
+> 如果日志已经出现 `startup recovery: committed`、随后启动失败，那么 `guard recover` 通常已经没有 snapshot 可用了——需要手工修复 `cordis.patch.yml`，或恢复 profile 备份。
+
 最后一道防线在**启动**时。包自带一个独立于宿主的 CLI（bin 名 `dsh-plugin-guard`，也可按路径直接跑）：
 
 ```powershell
@@ -277,14 +292,19 @@ node <profile>/node_modules/@1e0zj/dsh-plugin-mall/src/cli.js guard add <spec> -
 node <profile>/node_modules/@1e0zj/dsh-plugin-mall/src/cli.js guard launch --profile web -- dsh web
 ```
 
-**普通的 `dsh web` 就会了结 pending 安装。** 本插件加载时即执行恢复——能加载
-本身就证明 dsh 已经组装好 profile、启动到了这一步，于是提交 pending 标记；两种
-情况改为回滚：profile 校验不过，或者那次安装停在构建脚本批准闸而未获批准
-（没批准的安装绝不提交，哪怕它看起来一切正常）。没有这一步的话，装完一个插件
-就会把 profile 卡住：只要标记还在，之后所有安装和卸载都会被拒绝。
+**普通的 `dsh web` 就会了结 pending 安装。** 本插件加载时即执行恢复，于是提交
+pending 标记；两种情况改为回滚：profile 校验不过，或者那次安装停在构建脚本批准
+闸而未获批准（没批准的安装绝不提交，哪怕它看起来一切正常）。没有这一步的话，
+装完一个插件就会把 profile 卡住：只要标记还在，之后所有安装和卸载都会被拒绝。
 
-**`guard launch` 仍然更强**，因为它覆盖普通启动覆盖不了的情况：插件启动正常、
-几秒后才崩。它在启动 `--` 之后的命令前检查该 profile 的 pending 安装标记：
+**但普通启动能证明的事比看上去窄：** 走到插件市场自己的 `apply`，只说明 loader
+**执行到了市场所在的位置**，不代表整棵 plugin tree 组装成功。排在它后面的 entry
+仍然可能 import 或 apply 失败，而那时快照已经没了——这就是
+[#24](https://github.com/1e0zj/dsh-plugin-mall/issues/24)。
+
+**`guard launch` 仍然更强**，而且强在两处而不是一处：既覆盖「插件启动正常、几秒
+后才崩」，也覆盖「排在市场后面的 loader entry import/apply 失败」——后者普通启动
+会直接提交过去。它在启动 `--` 之后的命令前检查该 profile 的 pending 安装标记：
 
 - **无 pending 安装** —— 命令原样运行（继承终端），透传退出码；
 - **静态校验明显过不了** —— 启动*之前*先把 profile 回滚到安装前快照，再在恢复后的状态上启动；
