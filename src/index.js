@@ -3329,7 +3329,7 @@ export async function runSelfTests() {
       ].join("\n"))();
 
       const busy = (patch, name) => front.updateChainBusy(
-        Object.assign({ updating: {}, installing: {}, card: null, jobs: {} }, patch), name);
+        Object.assign({ updating: {}, installing: {}, cards: {}, jobs: {} }, patch), name);
       const running = (spec) => ({ spec, status: "running" });
 
       check("更新防连点：裸包名折算", front.specPackageName("foo") === "foo");
@@ -3350,7 +3350,15 @@ export async function runSelfTests() {
       check("更新防连点：停在批准卡片上（failed + needsApproval）算未了结",
         busy({ jobs: { a: { spec: "foo@1.2.3", status: "failed", needsApproval: [{ name: "x" }] } } }, "foo") === true);
       check("更新防连点：停在风险卡片上时锁着（决定还没做，再起一条就是两条链）",
-        busy({ card: { spec: "foo@1.2.3" } }, "foo") === true);
+        busy({ cards: { j1: { spec: "foo@1.2.3" } } }, "foo") === true);
+      // 单槽位时代的真实卡死：第二张卡片顶掉第一张，被顶掉那条再没有入口能
+      // 做决定，job 却一直未了结——那一行的更新按钮永远点不亮。
+      check("更新防连点：多张卡片同时停着，各锁各的包（批量更新的必然形状）",
+        busy({ cards: { j1: { spec: "foo@1.2.3" }, j2: { spec: "bar@2.0.0" } } }, "foo") === true
+          && busy({ cards: { j1: { spec: "foo@1.2.3" }, j2: { spec: "bar@2.0.0" } } }, "bar") === true);
+      check("更新防连点：撤掉其中一张不影响另一张的锁",
+        busy({ cards: { j2: { spec: "bar@2.0.0" } } }, "foo") === false
+          && busy({ cards: { j2: { spec: "bar@2.0.0" } } }, "bar") === true);
 
       check("更新防连点：job 落终态后解锁，用户可以重试",
         busy({ jobs: { a: { spec: "foo@1.2.3", status: "failed" } } }, "foo") === false);
@@ -3359,7 +3367,7 @@ export async function runSelfTests() {
       check("更新防连点：别的包在跑不锁本行",
         busy({ jobs: { a: running("bar@1.0.0") } }, "foo") === false);
       check("更新防连点：风险卡片停在别的包上不锁本行",
-        busy({ card: { spec: "bar@1.0.0" } }, "foo") === false);
+        busy({ cards: { j1: { spec: "bar@1.0.0" } } }, "foo") === false);
       check("更新防连点：什么都没在途 → 不锁", busy({}, "foo") === false);
       check("更新防连点：包名为 null 时不误判",
         busy({ jobs: { a: running("foo@1.2.3") } }, null) === false);
