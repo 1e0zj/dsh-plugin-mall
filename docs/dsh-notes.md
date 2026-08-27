@@ -917,3 +917,48 @@ pid 过期双启动，思路与本插件的 await-exit + 端口 settle 相映。
 真实 blocker，不能删除检查。正确的事务语义是：快照时记录 blocker 基线，提交/回滚
 只看本次新增 blocker；未带基线的旧 pending marker 继续 fail-closed。这样不会替历史
 问题洗白，也不会用无关历史问题回滚一次健康更新。
+
+### 2026-08-27 技术探查：有没有「整棵 plugin tree ready」的信号（issue #24）
+
+检索了官方 `docs/` 的全部 107 篇中文文档（tree API 列目录 + 批量拉取全文 grep），
+命中并读完 `cordis-api/fiber.zh.md`、`cordis-api/events.zh.md`；`internal/status`
+另在 `event-producer-consumer.zh.md` 出现，fiber 状态机另见
+`cordis-tutorial/06-composition-and-hmr.zh.md`、`user/develop/framework/index.zh.md`。
+
+**结论：官方文档里没有「整棵 plugin tree 已装配完成」的公开信号。** 文档层面只有
+per-fiber 的 `fiber.await()`（「进入稳定状态后的此 fiber」）和 `internal/status`
+（fiber 状态转换事件）。没有树级别的 ready 事件。
+
+实现层面 `dsh-app-boot` 的 `boot()` 是这样收尾的：
+
+```js
+stage = "plugin tree failed to load";
+await mountRootInclude(...);
+await ctx.get("loader")?.await();
+await assertEntriesActivated(ctx, binName);   // 逐个 entry 检查 fiber.state === FIBER_ACTIVE
+```
+
+`boot()` 的文档注释写着 "return only after the whole tree settles"，所以**树是否装配
+成功这个事实只存在于 boot 的调用栈里**，插件够不到。
+
+**`loader.await()` 看起来像那个信号，实测证明不能用。** 在一个排在探针之后的 entry
+故意 import 失败的 profile 上（独立 DSH_HOME，真实启动）：
+
+```
+[PROBE] await#立即      RESOLVED +1079ms
+[PROBE] await#microtask RESOLVED +1079ms
+[PROBE] await#tick0     RESOLVED +1079ms
+[PROBE] await#300ms     RESOLVED +1079ms
+Error: dsh: plugin tree failed to load: failed to import loader entry later-entry
+```
+
+四个时点全部 resolve，**恰恰在要防的场景下失效**，所以不是「调用太早」能解释的：
+四次 await 的是同一个内部状态，而那个状态在 entry 失败之前就被判定成了完成。
+从树内部观察自己所在的树，时机必然偏早。
+
+对照组（全树成功）行为正常，且顺序正确——`RESOLVED` 出现在后续 entry 的 apply
+**之后**、`dsh web: listening` 之前，挂 `.then()` 不阻塞后续 entry 加载。也就是说
+它在成功路径上是对的，只在失败路径上骗人；这比完全不能用更危险。
+
+**因此 #24 不能靠树内信号解决**，要转向「两次启动之间用持久化标记识别上一次
+probation 未完成」的事务设计——即把 `guard launch` 的外部观察，换成跨启动的标记传递。
