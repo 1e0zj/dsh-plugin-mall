@@ -960,5 +960,50 @@ Error: dsh: plugin tree failed to load: failed to import loader entry later-entr
 **之后**、`dsh web: listening` 之前，挂 `.then()` 不阻塞后续 entry 加载。也就是说
 它在成功路径上是对的，只在失败路径上骗人；这比完全不能用更危险。
 
-**因此 #24 不能靠树内信号解决**，要转向「两次启动之间用持久化标记识别上一次
-probation 未完成」的事务设计——即把 `guard launch` 的外部观察，换成跨启动的标记传递。
+> ⚠️ **上面这条结论错了，别照它下判断（2026-08-27 同日更正）。**
+> 错在只查了 `loader.await()` 就收手，**漏查了 marketplace 的父级 Include fiber**。
+> 可靠边界是存在的，见下一节。
+
+### 2026-08-27 更正：可靠边界是最外层的 `cordis:include` fiber
+
+不是 `loader.await()`，是 marketplace 所属的**最外层 `cordis:include` fiber**：
+
+```js
+let boundary = ctx.fiber.parent?.fiber;
+while (boundary?.parent?.fiber?.entry) boundary = boundary.parent.fiber;
+if (boundary?.entry?.options?.name !== "cordis:include") {
+  // 无法确认启动边界：fail closed，不 commit
+}
+void boundary.await().then(commitPendingProbation, keepPendingForRecovery);
+```
+
+为什么成立：Include 的初始化会等待其整棵子树 `root.update()`；任一子 entry 的
+import 或 apply 失败都会向上传到 Include fiber；Include fiber 只有全部子 entry
+成功后才进入 active。marketplace 只是异步挂上去等，`apply()` 立即返回，不阻塞
+后续 entry。
+
+四个场景实测（独立 DSH_HOME、真实启动，**同一进程里并排对照** `loader.await()`）：
+
+| 场景 | fiber 链路 | Include fiber | `loader.await()` 对照 | dsh boot |
+|---|---|---|---|---|
+| 全树成功 | probe → include | RESOLVED +949ms | RESOLVED +951ms | listening |
+| 后续 entry import 失败 | probe → include | **REJECTED** +1066ms | RESOLVED +1067ms ✗ | exit 1 |
+| 后续 entry apply 抛错 | probe → include | **REJECTED** +1027ms | RESOLVED +1028ms ✗ | exit 1 |
+| 嵌套 group，失败 entry 在 group 外 | probe → **group** → include | **REJECTED** +566ms | RESOLVED +566ms ✗ | exit 1 |
+
+最后一行的链路 `probe-include -> @deepseek-ai/cordis-plugin-group -> cordis:include`
+证明 boundary 查找里那个 while 循环确实在越过 group 往上找。
+
+**`loader.await()` 为什么会误报**：事务回滚先把失败的 entry 移出树，`loader.await()`
+随后看到的是一棵空树，于是判定完成。而已经持有的 Include fiber 不受影响，仍然
+抛出原始失败。这也解释了上一节里「四个时点全部同时 resolve」的现象。
+
+**但 #24 不能只把 `recoverProfile()` 搬进 `.then()`**，还要持久化 probation 状态：
+① 首次启动看到 pending 就记下「本次 probation 已开始」；② Include fiber 成功后
+重新校验事务身份再 commit；③ Include fiber 失败或进程中途退出则保留 marker/snapshot；
+④ 下一次启动识别出上次 probation 未完成并回滚；⑤ approval pause、profile 无法确认
+这些既有的 fail-closed 语义保持不变。
+
+还有一个必须单测的尾巴：第二次启动在 marketplace 里执行回滚时，旧的 Include 配置
+可能已经读进内存，当前进程不一定还能继续成功。要明确采用「回滚后受控终止并再次
+启动」还是可靠的重新装配机制——**不能把「文件已恢复」等同于「本次启动已经恢复」**。
