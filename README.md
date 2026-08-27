@@ -57,7 +57,7 @@ Restart dsh after installing.
 
 ## Startup protection (guard CLI)
 
-> **Known issue — v0.4.17 is affected ([#24](https://github.com/1e0zj/dsh-plugin-mall/issues/24)):** a plain `dsh web` start may commit and delete the pending snapshot as soon as the marketplace plugin loads, before later loader entries have finished loading. If a later entry fails, automatic rollback is no longer available. Until #24 is fixed, use `guard launch` for the first restart after every marketplace install or update. The marketplace's **"Restart dsh" button already uses the guarded restart path** (it spawns `guard launch --await-exit`), so restarting from the UI is safe.
+> **Known issue — every version since v0.3.4, including v0.4.17 ([#24](https://github.com/1e0zj/dsh-plugin-mall/issues/24)):** a plain `dsh web` start may commit and delete the pending snapshot as soon as the marketplace plugin loads, before later loader entries have finished loading. Downgrading is not a workaround — you would have to go back before v0.3.4 and give up every fix since. If a later entry fails, automatic rollback is no longer available. Until #24 is fixed, use `guard launch` for the first restart after every marketplace install or update. The marketplace's **"Restart dsh" button already uses the guarded restart path** (it spawns `guard launch --await-exit`), so restarting from the UI is safe.
 >
 > If the log already shows `startup recovery: committed` and the start then fails, `guard recover` usually has no snapshot left to restore — repair `cordis.patch.yml` by hand, or restore a profile backup.
 
@@ -267,7 +267,7 @@ dsh plugin --profile web add link:C:\path\to\dsh-plugin-mall
 
 ## 启动保护（guard CLI）
 
-> **已知问题——0.4.17 确认受影响（[#24](https://github.com/1e0zj/dsh-plugin-mall/issues/24)）：** 普通 `dsh web` 会在插件市场自身加载时就提前提交并删除 pending snapshot，此时后续的 loader entry 可能还没加载。若后续加载失败，自动回滚点已经丢失。在 #24 修复前，**每次从市场安装或更新后，第一次重启请使用 `guard launch`**；市场里的**「重启 dsh」按钮已经走带保护的重启路径**（它拉起的就是 `guard launch --await-exit`），从界面上点重启是安全的。
+> **已知问题——0.3.4 起的所有版本，包括 0.4.17（[#24](https://github.com/1e0zj/dsh-plugin-mall/issues/24)）：** 普通 `dsh web` 会在插件市场自身加载时就提前提交并删除 pending snapshot，此时后续的 loader entry 可能还没加载。降级不是规避手段——要退到 0.3.4 之前，等于放弃此后的全部修复。若后续加载失败，自动回滚点已经丢失。在 #24 修复前，**每次从市场安装或更新后，第一次重启请使用 `guard launch`**；市场里的**「重启 dsh」按钮已经走带保护的重启路径**（它拉起的就是 `guard launch --await-exit`），从界面上点重启是安全的。
 >
 > 如果日志已经出现 `startup recovery: committed`、随后启动失败，那么 `guard recover` 通常已经没有 snapshot 可用了——需要手工修复 `cordis.patch.yml`，或恢复 profile 备份。
 
