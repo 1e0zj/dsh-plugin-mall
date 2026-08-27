@@ -162,8 +162,12 @@ window.__ModuleLoader__.load({
     //              ——锁必须持续到 job 落终态，不是到 RPC 返回。
     //              needsApproval 的 status 是 failed，但那是等用户决定的暂停，
     //              事务没结束，算未了结。
-    //   card       预检出了风险卡片，停在那里等用户读完再决定。这期间任务是
+    //   cards      预检出了风险卡片，停在那里等用户读完再决定。这期间任务是
     //              终态，但决定还没做，再起一条链就是两条链抢同一个事务。
+    //              **按 jobId 存字典、不是单槽位**：同时可以停着好几张卡片
+    //              （批量更新必然如此，手动连点两个包也够）。单槽位时后来的
+    //              会顶掉前一张，被顶掉那条从此没有任何入口能做决定，job 却
+    //              一直是未了结状态——那一行的更新按钮再也点不亮。
     //
     // sources 里递进来的必须是 ref.current 这类当下的值：判定发生在点击那一
     // 刻，上一次渲染的快照没有意义。
@@ -174,8 +178,11 @@ window.__ModuleLoader__.load({
       for (var spec in installing) {
         if (installing[spec] === true && specPackageName(spec) === name) return true;
       }
-      var card = sources.card;
-      if (card && specPackageName(card.spec) === name) return true;
+      var cards = sources.cards || {};
+      for (var cardId in cards) {
+        var card = cards[cardId];
+        if (card && specPackageName(card.spec) === name) return true;
+      }
       var jobs = sources.jobs || {};
       for (var id in jobs) {
         var job = jobs[id];
@@ -664,7 +671,7 @@ window.__ModuleLoader__.load({
       if (ids.length === 0 && !props.error) return null;
       var hasSettled = ids.some(function (id) {
         var job = props.jobs[id];
-        var hasDecision = (props.preflight && props.preflight.jobId === id)
+        var hasDecision = props.preflights[id] !== undefined
           || (job.needsApproval && job.needsApproval.length > 0);
         return !isJobActive(job.status) && !hasDecision;
       });
@@ -677,7 +684,7 @@ window.__ModuleLoader__.load({
         ids.map(function (id) {
           var job = props.jobs[id];
           var done = job.status === "completed" || job.status === "failed" || job.status === "killed";
-          var preflightDecision = props.preflight && props.preflight.jobId === id ? props.preflight : null;
+          var preflightDecision = props.preflights[id] || null;
           var awaitingDecision = preflightDecision !== null || (job.needsApproval && job.needsApproval.length > 0);
           return h("div", { key: id, className: "mkt_job" },
             // 不再显示 market-N 这种内部 id——对用户没有意义，反而让人以为
@@ -697,12 +704,12 @@ window.__ModuleLoader__.load({
               ? h(ApprovalRequest, {
                 spec: job.spec,
                 needsApproval: job.needsApproval,
-                busy: props.approving === job.spec,
+                busy: props.specBusy(job.spec),
                 onApprove: function (names) {
                   // 不先 drop：旧条目由重试任务的 track(carryFromId) 原子接管
                   // （撤条目 + 日志接续一拍完成）。install RPC 现在只做本地校验、
                   // 立刻返回新 job id，但保留这个次序仍然是它最稳的形态——
-                  // 万一 RPC 失败，旧条目和日志还在。等待期间按钮由 approving
+                  // 万一 RPC 失败，旧条目和日志还在。等待期间按钮由 specBusy
                   // 态显示「继续中…」。
                   props.onApprove(job.spec, names, job.approvalToken, id);
                 },
@@ -712,9 +719,9 @@ window.__ModuleLoader__.load({
                 ? h(PreflightCard, {
                   spec: preflightDecision.spec,
                   report: preflightDecision.report,
-                  busy: props.preflightBusy === true,
-                  onConfirm: props.onConfirmPreflight,
-                  onClose: props.onClosePreflight,
+                  busy: props.specBusy(preflightDecision.spec),
+                  onConfirm: function () { props.onConfirmPreflight(id); },
+                  onClose: function () { props.onClosePreflight(id); },
                 })
                 : job.detail ? h("div", { className: job.status === "failed" ? "mkt_error" : "mkt_desc" }, job.detail) : null,
             // 预检完成不提示重启——它没有改动任何东西，接下来才是安装。
@@ -873,17 +880,27 @@ window.__ModuleLoader__.load({
       var _hostStartedAt = useState(0);
       var hostStartedAt = _hostStartedAt[0];
       var setHostStartedAt = _hostStartedAt[1];
-      var _preflight = useState(null);
-      var preflight = _preflight[0];
-      var setPreflight = _preflight[1];
+      // jobId -> { spec, report, jobId }。字典而不是单个：见 updateChainBusy
+      // 的 cards 一节——同时可以有好几张待决策的风险卡片。
+      var _preflights = useState({});
+      var preflights = _preflights[0];
+      var setPreflights = _preflights[1];
+      var dropPreflight = useCallback(function (jobId) {
+        setPreflights(function (prev) {
+          if (!(jobId in prev)) return prev;
+          var next = Object.assign({}, prev);
+          delete next[jobId];
+          return next;
+        });
+      }, []);
 
       // 更新按钮防连点用的三份当下值（见 updateChainBusy）。ref 而不是 state：
       // 判定发生在点击那一刻，而 setState 到重渲染之间还有一拍能点。ref 不触发
       // 渲染，所以每次改动配一次 bumpBusy，让按钮当场变样。
       var updatingRef = useRef({});   // 包名 -> true，点击到预检 job 建立之间
       var installingRef = useRef({}); // spec  -> true，安装 RPC 在途
-      var preflightRef = useRef(null);
-      preflightRef.current = preflight; // 渲染期同步，同 resultsRef 的写法
+      var preflightsRef = useRef({});
+      preflightsRef.current = preflights; // 渲染期同步，同 resultsRef 的写法
       var _busyTick = useState(0);
       var setBusyTick = _busyTick[1];
       var bumpBusy = useCallback(function () {
@@ -1064,7 +1081,7 @@ window.__ModuleLoader__.load({
         return updateChainBusy({
           updating: updatingRef.current,
           installing: installingRef.current,
-          card: preflightRef.current,
+          cards: preflightsRef.current,
           jobs: jobsRef.current,
         }, packageName);
       }, [jobsRef]);
@@ -1131,7 +1148,12 @@ window.__ModuleLoader__.load({
             // 安全：接过预检的日志、撤掉预检条目，面板上只剩这一个任务。
             doRawInstall(spec, {}, jobId);
           } else {
-            setPreflight({ spec: spec, report: report, jobId: jobId });
+            // 按 jobId 落格，不覆盖别的包停着的卡片。
+            setPreflights(function (prev) {
+              var next = Object.assign({}, prev);
+              next[jobId] = { spec: spec, report: report, jobId: jobId };
+              return next;
+            });
           }
         };
       }, [doRawInstall, reportError]);
@@ -1306,12 +1328,15 @@ window.__ModuleLoader__.load({
         h(JobsPanel, {
           jobs: jobs,
           error: error && error.scope === "tasks" ? error.message : null,
-          preflight: preflight,
-          preflightBusy: preflight ? installing[preflight.spec] === true : false,
+          preflights: preflights,
+          // 这张卡片/这条批准请求对应的 install RPC 在不在途。原来是「取
+          // installing 里的第一个 spec」的单值，同时两条链在途时只有一条显示
+          // 得对；按 spec 问就没有这个假设了。
+          specBusy: function (spec) { return installing[spec] === true; },
           onClear: function () {
             Object.keys(jobs).forEach(function (id) {
               var job = jobs[id];
-              var hasDecision = job && ((preflight && preflight.jobId === id)
+              var hasDecision = job && (preflights[id] !== undefined
                 || (job.needsApproval && job.needsApproval.length > 0));
               if (!job || isJobActive(job.status) || hasDecision) return;
               var token = job && job.approvalToken ? job.approvalToken : (job && job.spec ? approvalTokensRef.current[job.spec] : undefined);
@@ -1330,33 +1355,34 @@ window.__ModuleLoader__.load({
             });
           },
           onApprove: doApprove,
-          onConfirmPreflight: function () {
-            if (!preflight) return;
-            var spec = preflight.spec;
-            var carry = preflight.jobId;
-            var report = preflight.report;
-            setPreflight(null);
+          onConfirmPreflight: function (jobId) {
+            var decision = preflights[jobId];
+            if (!decision) return;
+            dropPreflight(jobId);
             // consentDigest 来自预检 job 的 extras，装的时候与当前报告比对：
             // 用户点「继续」到安装真正开跑之间候选包或 profile 变了，
             // 布尔同意不得沿用，要重新看新的警告。
-            doRawInstall(spec, { acceptWarnings: true, acceptedReportDigest: report.consentDigest }, carry);
+            doRawInstall(decision.spec, { acceptWarnings: true, acceptedReportDigest: decision.report.consentDigest }, jobId);
           },
-          onClosePreflight: function () {
-            if (preflight && preflight.spec) delete approvalTokensRef.current[preflight.spec];
-            setPreflight(null);
+          onClosePreflight: function (jobId) {
+            var decision = preflights[jobId];
+            if (decision && decision.spec) delete approvalTokensRef.current[decision.spec];
+            dropPreflight(jobId);
           },
           onDismiss: function (id) {
             var job = jobs[id];
             var token = job && job.approvalToken ? job.approvalToken : (job && job.spec ? approvalTokensRef.current[job.spec] : undefined);
             if (job && job.spec) delete approvalTokensRef.current[job.spec];
             call("jobDismiss", { jobId: id, token: token }).catch(function () {});
+            // job 条目撤了，挂在它上面的卡片没有宿主了。不一并撤的话
+            // updateChainBusy 的 cards 分支会一直锁着那个包名。
+            dropPreflight(id);
             dropJob(id);
           },
           onDrop: dropJob,
           onRestart: function () { setRestartConfirm(true); },
           restarting: restarting,
           hostStartedAt: hostStartedAt,
-          approving: Object.keys(installing).filter(function (s) { return installing[s]; })[0],
         }),
         h("div", { className: "mkt_list" },
           results == null
